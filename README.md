@@ -92,7 +92,7 @@ Every service also owns its own `outbox` and `inbox` tables.
 This system does **not** provide exactly-once delivery — that is impossible over an unreliable
 network (the Two Generals Problem). It provides at-least-once delivery with idempotent consumers,
 giving effectively-once *processing*. The distinction is deliberate and is explained in
-[`learning.md` Part 6.4](learning.md).
+[`progress.md`](progress.md).
 
 ## Stack
 
@@ -124,10 +124,9 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 
 One-command startup lands with M0's compose stack.
 
-## Learning notes
+## Engineering log
 
-[**`learning.md`**](learning.md) is the companion document: distributed systems from first
-principles — transactions and ACID, the dual-write problem, why 2PC is rejected, sagas,
-compensating transactions, outbox/inbox, delivery guarantees, isolation levels and deadlock,
-DLQs, observability and chaos engineering — plus a per-session log of what was built, what broke,
-and why. Written to be read start to finish by someone with no distributed systems background.
+[**`progress.md`**](progress.md) records the milestone status, the key design decisions and the
+reasoning behind each (orchestration over choreography, why idempotency rests on a Postgres
+constraint rather than a Redis lock, why "exactly-once" is not claimed), the five correctness
+invariants, and a per-milestone log of what was built and what broke.
