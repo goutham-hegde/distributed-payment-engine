@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      Parent aggregator for the distributed payment engine.
+
+      We inherit from spring-boot-starter-parent purely to get its <dependencyManagement>
+      (so module POMs can omit versions) and its plugin configuration. This POM itself
+      produces no artifact beyond the reactor ordering.
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.1</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.dpe</groupId>
+    <artifactId>distributed-payment-engine</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>distributed-payment-engine</name>
+    <description>Fault-tolerant distributed payment engine: SAGA orchestration, transactional outbox, idempotent consumers</description>
+
+    <modules>
+        <module>common-events</module>
+        <module>account-service</module>
+        <module>payment-orchestrator</module>
+        <module>payment-gateway</module>
+    </modules>
+
+    <properties>
+        <java.version>21</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Our own shared contract module, so services can depend on it without a version. -->
+            <dependency>
+                <groupId>com.dpe</groupId>
+                <artifactId>common-events</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!--
+                  Declared here but NOT bound: only the three executable services enable it.
+                  Running it on the parent or on common-events would try to repackage a
+                  non-application jar.
+                -->
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+
+</project>

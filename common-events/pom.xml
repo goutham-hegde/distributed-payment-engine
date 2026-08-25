@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dpe</groupId>
+        <artifactId>distributed-payment-engine</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>common-events</artifactId>
+    <name>common-events</name>
+    <description>
+        Shared command/event contracts and topic names.
+
+        NOTE: sharing DTOs across microservices is a known coupling smell - a change here
+        forces a rebuild of every service. It is a deliberate tradeoff for a 3-service solo
+        project; the production evolution is a Schema Registry with Avro and per-service
+        generated classes. See docs/adr/0003-shared-contracts.md.
+    </description>
+
+    <!-- Intentionally dependency-free: plain records and constants only. -->
+
+</project>

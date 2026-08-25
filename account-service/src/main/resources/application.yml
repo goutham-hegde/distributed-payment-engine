@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: account-service
+
+  datasource:
+    # Env-driven with localhost defaults, so the same jar runs from your IDE and from Compose.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/accounts_db}
+    username: ${DB_USER:accounts}
+    password: ${DB_PASSWORD:accounts}
+    hikari:
+      # Deliberately small. A connection pool larger than the DB can serve just moves the
+      # queue from your app into Postgres, where it is harder to see. Revisit at M8 with
+      # real load-test numbers rather than guessing now.
+      maximum-pool-size: 10
+      pool-name: account-pool
+
+  jpa:
+    # Flyway owns the schema. Hibernate must never alter it - 'validate' makes a drift between
+    # entities and migrations fail loudly at boot instead of silently corrupting data.
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: ${SERVER_PORT:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.dpe: DEBUG
