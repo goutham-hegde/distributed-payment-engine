@@ -1,0 +1,118 @@
+# M0 stack: PostgreSQL plus the three services.
+#
+# Redpanda arrives at M2, Redis at M4, Prometheus/Grafana/Jaeger at M6 - each
+# container shows up in the commit that first needs it, so nothing here is
+# unexplained.
+#
+# Run from the repo root:  docker compose -f infra/docker-compose.yml up -d
+
+name: dpe
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: dpe-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs only on first init of the volume. `docker compose down -v` to re-run it.
+      - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/10-init-databases.sh:ro
+    healthcheck:
+      # `depends_on` alone waits only for the container to exist. Postgres accepts
+      # TCP connections seconds before it can serve queries, so without this the
+      # services crash-loop on startup and it looks like a Flyway bug.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  payment-orchestrator:
+    build: &build-ctx
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        MODULE: payment-orchestrator
+    container_name: dpe-orchestrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &jvm-env
+      # Explicit heap cap. Three JVMs at default sizing will each claim a quarter
+      # of the container's visible RAM and this machine cannot afford that.
+      JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+UseSerialGC"
+      DB_URL: jdbc:postgresql://postgres:5432/payments_db
+      DB_USER: payments
+      DB_PASSWORD: payments
+      SERVER_PORT: "8081"
+    ports:
+      - "8081:8081"
+    healthcheck: &health
+      test: ["CMD-SHELL", "wget -qO- http://localhost:$${SERVER_PORT}/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  account-service:
+    build:
+      <<: *build-ctx
+      args:
+        MODULE: account-service
+    container_name: dpe-account
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *jvm-env
+      DB_URL: jdbc:postgresql://postgres:5432/accounts_db
+      DB_USER: accounts
+      DB_PASSWORD: accounts
+      SERVER_PORT: "8082"
+    ports:
+      - "8082:8082"
+    healthcheck: *health
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  payment-gateway:
+    build:
+      <<: *build-ctx
+      args:
+        MODULE: payment-gateway
+    container_name: dpe-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *jvm-env
+      DB_URL: jdbc:postgresql://postgres:5432/gateway_db
+      DB_USER: gateway
+      DB_PASSWORD: gateway
+      SERVER_PORT: "8083"
+    ports:
+      - "8083:8083"
+    healthcheck: *health
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  pgdata:

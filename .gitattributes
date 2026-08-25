@@ -1,2 +1,11 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
+
+# Scripts and container files run on Linux. If git checks them out with CRLF on a
+# Windows clone, the kernel fails to find the interpreter ("bad interpreter: No
+# such file or directory") and every container that runs them breaks.
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.sql       text eol=lf
+Dockerfile  text eol=lf

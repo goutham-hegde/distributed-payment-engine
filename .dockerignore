@@ -1,0 +1,17 @@
+# Keep the build context small and reproducible: never ship host build output,
+# local tooling state, or working notes into the image.
+target/
+**/target/
+.git/
+.idea/
+.vscode/
+*.iml
+
+infra/
+chaos/
+loadtest/
+k8s/
+docs/
+scripts/
+README.md
+progress.md

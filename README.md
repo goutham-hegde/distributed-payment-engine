@@ -117,12 +117,27 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 
 ## Build
 
+Requires Docker. Nothing else — the Maven wrapper is committed, and k6/psql run as containers.
+
+```bash
+docker compose -f infra/docker-compose.yml up -d --build
+```
+
+Brings up PostgreSQL and all three services. Health checks gate startup, so the command returns
+only once everything is actually serving:
+
+```bash
+curl -s localhost:8081/actuator/health   # payment-orchestrator
+curl -s localhost:8082/actuator/health   # account-service
+curl -s localhost:8083/actuator/health   # payment-gateway
+```
+
+To build or test without Docker Compose:
+
 ```bash
 ./mvnw -B -ntp compile     # no Maven install needed — wrapper included
 ./mvnw -B -ntp verify      # full build + tests (requires Docker for Testcontainers)
 ```
-
-One-command startup lands with M0's compose stack.
 
 ## Engineering log
 

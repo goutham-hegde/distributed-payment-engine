@@ -157,7 +157,41 @@ Compose rather than left to default sizing.
 
 `./mvnw -B -ntp compile` — BUILD SUCCESS, all 5 modules, 36s.
 
+**Compose stack**
+
+One `docker compose up -d --build` brings up PostgreSQL and all three services. A single
+multi-stage `Dockerfile` builds every service, selected by a `MODULE` build argument; a BuildKit
+cache mount on `~/.m2` means the three images share one dependency download and rebuilds are
+fast. Runtime images carry a JRE and a jar only — no Maven, no JDK, no source — and run as an
+unprivileged user.
+
+Only PostgreSQL is in the stack at this point. Redpanda arrives at M2, Redis at M4, and
+Prometheus/Grafana/Jaeger at M6, so every container is introduced by the commit that first needs
+it.
+
+Two details worth recording:
+
+- **`depends_on` is not enough.** It waits for a container to exist, not to be ready, and
+  PostgreSQL accepts TCP connections several seconds before it can serve queries. Without
+  `condition: service_healthy` against a `pg_isready` probe, the services crash-loop at startup
+  and it looks like a Flyway problem.
+- **Database-per-service needed more than ownership.** The first version created a database and a
+  role per service and assumed that was isolation. It was not: PostgreSQL grants `CONNECT` on
+  every database to `PUBLIC` by default, so any of the three roles could connect to any database
+  and read it. Verified by connecting as `accounts` to `payments_db` — it succeeded. The fix is
+  `REVOKE CONNECT ON DATABASE <db> FROM PUBLIC` followed by an explicit grant to the owner. The
+  isolation matrix is now a clean diagonal, asserted rather than assumed.
+
+**Verified**
+
+```
+./mvnw -B -ntp compile                    BUILD SUCCESS, 5 modules, 36s
+docker compose up -d --build              all 4 containers healthy in ~20s
+/actuator/health x3                       UP, db UP
+cross-database connection matrix          6/6 denied, 3/3 own-database connected
+```
+
 **Next**
 
-Compose stack (PostgreSQL + Redpanda + Redis) and all three services reporting a healthy
-`/actuator/health`, then M1: the ledger core.
+M1: the ledger core — double-entry schema, `SELECT ... FOR UPDATE`, deadlock-safe lock ordering,
+and the invariant verification script.
