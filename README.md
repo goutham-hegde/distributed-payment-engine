@@ -6,7 +6,7 @@ guarantee hold under failure:
 > **Money is never created and never destroyed. Only moved.**
 
 > [!NOTE]
-> **Status: in progress — M0 of 10 complete.** This README describes the target system; the
+> **Status: in progress — M0 of 10 complete.** `docker compose up` brings up Postgres and all three services healthy. This README describes the target system; the
 > milestone table below is the honest state of what is actually built. Nothing is claimed here
 > that isn't in the commit history.
 
@@ -103,7 +103,7 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 
 | # | Milestone | Status |
 |---|---|---|
-| M0 | Environment + multi-module skeleton | ✅ build green |
+| M0 | Environment + multi-module skeleton + Compose stack | ✅ **done** |
 | M1 | Ledger core — double-entry, `FOR UPDATE`, deadlock ordering | ⬜ |
 | M2 | Transactional outbox + Kafka + inbox dedup | ⬜ |
 | M3 | SAGA orchestration + compensation + timeouts | ⬜ |
