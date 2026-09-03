@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Recorded by scripts/verify-invariants.sh at the start of a test run.
+scripts/.i3-baseline

@@ -8,8 +8,8 @@ and what broke along the way. Newest entries at the bottom.
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Environment + multi-module skeleton | ✅ **done** |
-| M1 | Ledger core — double-entry, `SELECT FOR UPDATE`, deadlock-safe lock ordering | ⬜ next |
-| M2 | Transactional outbox + Kafka publishing + inbox dedup | ⬜ |
+| M1 | Ledger core — double-entry, `SELECT FOR UPDATE`, deadlock-safe lock ordering | ✅ **done** |
+| M2 | Transactional outbox + Kafka publishing + inbox dedup | ⬜ next |
 | M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ⬜ |
 | M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ⬜ |
 | M5 | JWT authentication and per-account authorization | ⬜ |
@@ -66,9 +66,36 @@ Balances are derived from immutable, append-only entries that sum to zero, rathe
 mutable numbers. This makes money creation *structurally detectable* — a bug breaks a global sum
 that a script can verify in milliseconds — and gives a complete audit trail for free.
 
-`accounts.balance` is also stored as a denormalized column for fast reads and row locking, updated
-in the same transaction as the entries. Invariant I2 exists specifically to assert the two never
-drift apart.
+`accounts.balance_minor` is also stored as a denormalized column for fast reads and row locking,
+updated in the same transaction as the entries. Invariant I2 exists specifically to assert the two
+never drift apart.
+
+### Money is an integer count of minor units
+
+Amounts are `BIGINT` paise, never a floating-point type: 0.1 + 0.2 is not 0.3 in binary floating
+point, and a ledger that cannot represent its own amounts exactly cannot be reconciled.
+`BigDecimal` is exact as well but carries scale and equality pitfalls that an integer count of the
+smallest indivisible unit simply does not have.
+
+The cost is that every boundary must name its unit, so the fields are `amountMinor` and
+`balance_minor` rather than `amount` and `balance`. A factor-of-100 error is among the most
+expensive money bugs there is, and the field name is the cheapest available defence.
+
+### Where money enters a closed ledger
+
+If every posting sums to zero, the first rupee has no way in: crediting a newly opened account is
+a credit with no matching debit, which is money from nothing and I1 broken on the first request.
+
+The answer is the one every real ledger uses — a single **issuance account** (equity, in
+accounting terms). Money enters by being debited from it, so its balance is negative and its
+magnitude is exactly the total issued. That is a liability, not an overdraft, which is why I5 is
+stated as *no CUSTOMER account may go negative* and the CHECK constraint reads
+`balance_minor >= 0 OR account_type = 'SYSTEM'`. Exactly one such account may exist, enforced by a
+partial unique index rather than by convention.
+
+Funding an account goes through the ordinary transfer path rather than writing a balance
+directly. There is deliberately no privileged code path that can move a balance without a
+counterpart — such a path would be able to create money, and no invariant would notice.
 
 ### Redpanda for local development, Apache Kafka available on demand
 
@@ -85,12 +112,20 @@ These five conditions define "correct" for this system. A script asserts all of 
 chaos scenario and load-test run ends by calling it.
 
 ```
-I1  SUM(ledger_entries.amount) = 0                    global double-entry balance
-I2  accounts.balance = SUM(its ledger_entries)        denormalized column agrees with truth
+I1  SUM(ledger_entries.amount_minor) = 0              global double-entry balance
+I2  accounts.balance_minor = SUM(its entries)         denormalized column agrees with truth
 I3  SUM(balances) + SUM(active holds) is constant     conservation across a run
 I4  no saga non-terminal after quiescence             nothing stuck, no stranded money
-I5  no account balance < 0                            no overdraft under concurrency
+I5  no CUSTOMER account balance_minor < 0             no overdraft under concurrency
 ```
+
+`scripts/verify-invariants.sh` asserts these against a running stack and exits non-zero on any
+violation. I4 reports as skipped until the saga tables exist, and I3 needs a baseline recorded at
+the start of a run — both are stated explicitly rather than passing silently, because a check that
+did not run must never look like a check that passed.
+
+I5 is scoped to customer accounts. See "Where money enters a closed ledger" below for why exactly
+one account is exempt.
 
 ---
 
@@ -195,3 +230,120 @@ cross-database connection matrix          6/6 denied, 3/3 own-database connected
 
 M1: the ledger core — double-entry schema, `SELECT ... FOR UPDATE`, deadlock-safe lock ordering,
 and the invariant verification script.
+
+---
+
+### M1 — Ledger core · 2026-09-03
+
+**Goal**
+
+A single service that moves money correctly under concurrency: double-entry postings, pessimistic
+row locking, deadlock-safe lock ordering, and a script that proves the five invariants hold.
+
+**Decisions**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Money representation | `BIGINT` minor units (paise) | Exact by construction; no rounding mode or `BigDecimal` scale traps. Cheapest thing to lock and sum. |
+| Ledger entry amounts | Signed — debits negative, credits positive | Makes I1 a plain `SUM()` rather than a `CASE` expression that could itself be written wrongly. |
+| Concurrency control | Pessimistic `SELECT ... FOR UPDATE` | Account rows are genuinely hot. Optimistic retries thrash under contention; `SERIALIZABLE` needs retry handling for serialization failures. |
+| Optimistic `@Version` column | Deliberately absent | It would mask a missing `FOR UPDATE` rather than expose it, and exposing that is what the concurrency tests are for. |
+| Deadlock avoidance | Sort account ids, lock the lower first | Turns deadlock from *detected* into *structurally impossible*. Ordering depends only on identity, never on which side is sending. |
+| Locked reads | Two single-row queries, not one `IN (...)` | Lock acquisition order for an `IN` list is not guaranteed even with `ORDER BY`, which silently reintroduces the cycle. |
+| `holds` table | Deferred to M3 | A hold is meaningless until something reserves funds and later commits or releases them. Each table arrives with the commit that needs it. |
+| Uniqueness of a posting | `UNIQUE (transfer_id, account_id, entry_type)` | Blocks a double-posted leg while still permitting the opposite-direction reversal that compensation will need in M3. |
+
+**Built**
+
+`V1__ledger_core.sql` creates `accounts` and `ledger_entries`. Every rule is a constraint rather
+than an application check — non-negative customer balances, sign matching entry type, non-zero
+amounts, one leg per account per transfer, one issuance account. A check-then-act sequence in
+application code has a race window between the check and the act; a constraint evaluated at write
+time does not.
+
+`TransferService.transfer` is the core: validate, lock both accounts in sorted id order, re-derive
+which locked account is the sender, check the balance *after* the lock is held, then write two
+entries and two balance deltas in a single transaction.
+
+Two REST endpoints, RFC 9457 problem responses, and status codes chosen to say something true
+about retryability, because from M3 the saga reads them to choose between retrying and
+compensating: 404 not found, 422 insufficient funds (a business "no", the compensation trigger),
+400 malformed, 409 constraint violation.
+
+`scripts/verify-invariants.sh` asserts the invariants against a running stack using the same SQL
+as the test-suite assertions, so what the tests prove and what the chaos suite will prove cannot
+drift apart.
+
+**What broke**
+
+1. **Issuance was rejected as an overdraft.** The affordability check was applied to every source
+   account, the issuance account included. Since it starts at zero and is *designed* to go
+   negative, opening the first funded account was impossible: `POST /accounts` with an opening
+   balance returned `422 insufficient funds in 00000000-...-0001: balance=0 requested=100000`.
+   The fix was to mirror the CHECK constraint in the service — the affordability rule applies to
+   customer accounts only. One rule stated consistently in two places, rather than two rules
+   contradicting each other.
+
+   The more useful half of this: **fourteen tests were green when this bug shipped.** Test
+   fixtures seed accounts with raw SQL, deliberately bypassing the service so the setup cannot be
+   corrupted by the code under test. That is the right call, but it meant no test ever routed an
+   issuance through the transfer path. Wherever a fixture takes a shortcut past production code is
+   exactly where "all tests pass" stops meaning "the system works". `AccountIssuanceTest` now
+   covers that path.
+
+2. **`PostgreSQLContainer` is no longer generic.** Testcontainers 2.x moved the class to
+   `org.testcontainers.postgresql` and dropped the self-type. Every existing example's
+   `new PostgreSQLContainer<>("postgres:16-alpine")` fails with *"cannot use '<>' with non-generic
+   class"*.
+
+3. **`HttpStatus.UNPROCESSABLE_ENTITY` is deprecated in Spring Framework 7.** RFC 9110 renamed 422
+   to "Unprocessable Content"; the constant is now `UNPROCESSABLE_CONTENT`. Same status code.
+   `PAYLOAD_TOO_LARGE` → `CONTENT_TOO_LARGE` likewise.
+
+4. **A wrong assumption, corrected by testing it.** A partial unique index was initially written
+   as `ON accounts ((true)) WHERE account_type = 'SYSTEM'`, then changed on the belief that
+   Postgres rejects constant index expressions. It does not — PG 16 accepts it. Indexing
+   `account_type` is still clearer, but the stated reason was wrong, and it was worth ten seconds
+   in psql to find that out rather than carrying a false fact forward.
+
+**Verified**
+
+```
+./mvnw -B -ntp verify                    BUILD SUCCESS, 5 modules
+                                         AccountIssuanceTest              5/5
+                                         LedgerConstraintTest             7/7
+                                         TransferServiceConcurrencyTest   7/7
+                                         Tests run: 19, Failures: 0, Errors: 0
+
+docker compose up -d --build             dpe-account healthy; Flyway applied V1;
+                                         ddl-auto=validate accepted every entity mapping
+
+POST /accounts alice opening=100000      201, id returned
+POST /accounts bob   opening=50000       201, id returned
+POST /transfers 30000 alice -> bob       200  alice=70000  bob=80000
+POST /transfers  5000 bob   -> alice     200  bob=75000    alice=75000
+POST /transfers 999999 alice -> bob      422  insufficient funds, balance=75000
+
+SELECT ... FROM accounts                 alice 75000, bob 75000, system -150000
+SELECT COUNT(*), SUM(amount_minor)       8 entries, sum = 0
+
+./scripts/verify-invariants.sh           I1 PASS  I2 PASS  I3 PASS  I4 SKIP  I5 PASS   exit 0
+```
+
+The verification script was also tested against a deliberately corrupted ledger — an unbalanced
+credit inserted straight into the table — and correctly reported `I1 FAIL` and `I2 FAIL` with exit
+code 1 before the row was removed. A checker that has never failed is not yet a checker. I3
+correctly stayed green throughout that test, because the fabricated money was in an entry rather
+than a balance, which is precisely the seam between those checks.
+
+The concurrency tests are the substance of this milestone. They run against real PostgreSQL rather
+than an in-memory database, because every mechanism involved — `FOR UPDATE` blocking semantics,
+deadlock detection, CHECK and UNIQUE behaviour, the READ COMMITTED default — is database-specific,
+and a test that passes against H2 while production is wrong is worse than no test. Threads are
+released by a latch so they genuinely contend; without it the first thread finishes before the
+last is scheduled, the lock is never contested, and a completely broken implementation passes.
+
+**Next**
+
+M2: the transactional outbox. Business state and the outbox row written in one local transaction,
+a relay claiming rows with `FOR UPDATE SKIP LOCKED`, and an inbox table for consumer idempotency.
