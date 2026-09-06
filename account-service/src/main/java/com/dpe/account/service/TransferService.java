@@ -1,7 +1,10 @@
 package com.dpe.account.service;
 import java.util.*;
+import com.dpe.account.outbox.OutboxWriter;
 import com.dpe.account.repository.AccountRepository;
 import com.dpe.account.repository.LedgerEntryRepository;
+import com.dpe.events.FundsTransferred;
+import com.dpe.events.Topics;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import com.dpe.account.domain.Account;
@@ -10,53 +13,45 @@ import com.dpe.account.domain.AccountType;
 /**
  * Moves money between two accounts in this service, atomically.
  *
- * <p>This is the heart of M1 and it is deliberately left unimplemented. Everything around it -
- * schema, entities, locked-read query, DTOs, controller, tests - is scaffolding. The method
- * below is the part an interviewer will actually probe.
- *
- * <h2>The contract</h2>
+ * <h2>What {@link #transfer} does, and why in this order</h2>
  *
  * <ol>
- *   <li><b>Validate first, before touching any row.</b> Reject a non-positive amount, a
- *       self-transfer ({@code from.equals(to)}), and later a currency mismatch. A self-transfer
- *       matters more than it looks: it degenerates the lock ordering below into locking the same
- *       row twice, and it would post a debit and a credit that cancel - a no-op that pollutes
- *       the ledger.</li>
+ *   <li><b>Validates before touching any row.</b> A non-positive amount, a self-transfer, and a
+ *       currency mismatch are all rejected up front. The self-transfer check matters more than it
+ *       looks: it would degenerate the lock ordering below into locking the same row twice, and
+ *       would post a debit and a credit that cancel - a no-op that pollutes the ledger.</li>
  *
- *   <li><b>Lock both accounts in a deterministic global order.</b> Sort the two ids (they are
- *       {@link java.util.UUID}, which is {@link Comparable}) and call
- *       {@link AccountRepository#findByIdForUpdate} on the lower one first, then the higher.
+ *   <li><b>Locks both accounts in a deterministic global order.</b> The two ids are sorted and
+ *       {@link AccountRepository#findByIdForUpdate} is called on the lower one first.
  *       <p>Not "lock the debit side first" - that is a per-transfer order, not a global one, and
- *       two opposing transfers between the same pair will still deadlock. The order must depend
- *       only on the identities, never on the role an account plays in this particular transfer.
- *       <p>Do this in two separate calls. A batch {@code IN (...)} fetch does not guarantee lock
- *       acquisition order and silently reintroduces the cycle.</li>
+ *       two opposing transfers between the same pair would still deadlock. The order depends only
+ *       on the identities, never on the role an account plays in this particular transfer.
+ *       <p>Two separate calls, not a batch {@code IN (...)} fetch, which does not guarantee lock
+ *       acquisition order and would silently reintroduce the cycle.</li>
  *
- *   <li><b>Check the balance only after the lock is held.</b> A check performed before the lock
- *       is a read of a value another transaction may already be changing. Throw
- *       {@link InsufficientFundsException} if the debit side cannot cover the amount.</li>
+ *   <li><b>Checks the balance only once the lock is held.</b> A check performed before the lock
+ *       reads a value another transaction may already be changing.</li>
  *
- *   <li><b>Write both ledger entries and both balance updates in this one transaction.</b>
- *       Use {@link com.dpe.account.domain.LedgerEntry#debit} and
- *       {@link com.dpe.account.domain.LedgerEntry#credit} (they apply the signs for you) and
- *       {@link com.dpe.account.domain.Account#applyDelta} with the same signed values. Two
- *       entries summing to zero, two balances moving in opposite directions, one commit. If any
- *       part fails, all of it must roll back - that is what keeps invariants I1 and I2 true.</li>
+ *   <li><b>Writes both ledger entries, both balance updates, and the outbox message in this one
+ *       transaction.</b> Two entries summing to zero, two balances moving in opposite directions,
+ *       one message describing it, one commit. If any part fails all of it rolls back - that is
+ *       what keeps invariants I1 and I2 true, and what makes the message impossible to publish
+ *       about a transfer that did not happen (M2, {@code learning.md} 4.1).</li>
  *
- *   <li><b>Return a {@link TransferResult}</b> built from the balances you just wrote, not from
- *       a fresh read.</li>
+ *   <li><b>Returns a {@link TransferResult}</b> built from the balances just written, not from a
+ *       fresh read.</li>
  * </ol>
  *
- * <h2>Things the database will catch if you get it wrong</h2>
+ * <h2>Things the database will catch if this gets it wrong</h2>
  *
  * <ul>
  *   <li>{@code accounts_balance_non_negative} - a missed balance check becomes a constraint
  *       violation, never an overdraft (invariant I5).</li>
  *   <li>{@code ledger_entries_sign_matches_type} - a debit that increases a balance is rejected.</li>
  *   <li>{@code ledger_entries_one_leg_per_account_per_transfer} - the same transfer id cannot
- *       post the same leg twice. In M1 this surfaces as a
+ *       post the same leg twice. It surfaces as a
  *       {@link org.springframework.dao.DataIntegrityViolationException}; turning that into a
- *       clean idempotent response is M4's job, not yours today.</li>
+ *       clean idempotent response is M4's job.</li>
  * </ul>
  *
  * <h2>Why {@code @Transactional} is on the method and not somewhere convenient</h2>
@@ -72,10 +67,13 @@ public class TransferService {
 
     private final AccountRepository accounts;
     private final LedgerEntryRepository ledgerEntries;
+    private final OutboxWriter outbox;
 
-    public TransferService(AccountRepository accounts, LedgerEntryRepository ledgerEntries) {
+    public TransferService(AccountRepository accounts, LedgerEntryRepository ledgerEntries,
+                           OutboxWriter outbox) {
         this.accounts = accounts;
         this.ledgerEntries = ledgerEntries;
+        this.outbox = outbox;
     }
 
     @Transactional
@@ -117,6 +115,16 @@ public class TransferService {
 
         source.applyDelta(-amount);
         destination.applyDelta(amount);
+
+        // The message is written HERE, by this transaction, alongside the ledger entries above.
+        // It is an INSERT, not a network call: if the transfer rolls back the message vanishes
+        // with it, and if the message is durable the transfer already is. A kafkaTemplate.send()
+        // on this line would be the dual-write bug - two systems, no transaction spanning them,
+        // and a crash in between publishing a fact about money that never moved.
+        outbox.append("Transfer", command.transferId(), Topics.ACCOUNT_EVENTS,
+            FundsTransferred.TYPE,
+            new FundsTransferred(command.transferId(), source.getId(), destination.getId(),
+                amount, command.currency()));
 
         return new TransferResult(
             command.transferId(),

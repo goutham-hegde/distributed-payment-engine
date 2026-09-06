@@ -23,6 +23,52 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+  # M2: consumes the events account-service relays out of its outbox.
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+    consumer:
+      # One group for the whole service. Every instance shares it, so Kafka gives each instance a
+      # disjoint set of partitions: scaling out divides the work instead of duplicating it.
+      group-id: payment-orchestrator
+
+      # Start from the beginning of a topic this group has never read. The alternative,
+      # 'latest', silently discards everything published before the consumer first started -
+      # which on a fresh deployment means losing every event already in the log.
+      auto-offset-reset: earliest
+
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+      # THE setting that decides whether this system can lose money.
+      #
+      # Left at its default of true, the client commits offsets on a five-second timer, with no
+      # knowledge of whether the handler ran, succeeded, or committed its transaction. A crash
+      # after an auto-commit and before the work is durable loses the message permanently: Kafka
+      # believes it was delivered and will never send it again. That is at-most-once.
+      #
+      # False means nothing is committed until AccountEventConsumer calls acknowledge(), which it
+      # does only after the handler's transaction has committed. Redelivery after a crash is then
+      # guaranteed - and absorbed by the inbox.
+      enable-auto-commit: false
+
+      # Small batches, so a redelivery after a crash replays little.
+      max-poll-records: 50
+
+      properties:
+        # Never let a subscribe() conjure the topic. A consumer that reaches an undeclared topic
+        # first has the broker auto-create it with the broker's defaults - one partition - and is
+        # then assigned only that partition, while the producer keys messages across all three.
+        # Two thirds of the traffic silently goes unread until a metadata refresh five minutes
+        # later. Nothing throws; the system just appears quiet. See KafkaTopicsConfig.
+        allow.auto.create.topics: false
+
+    listener:
+      # Hands the listener an Acknowledgment and commits only when it is used.
+      # MANUAL_IMMEDIATE rather than MANUAL: it commits at the point of the call instead of
+      # deferring to the end of the poll batch, which keeps test assertions honest about what
+      # has actually been committed.
+      ack-mode: manual_immediate
+
 server:
   port: ${SERVER_PORT:8081}
 

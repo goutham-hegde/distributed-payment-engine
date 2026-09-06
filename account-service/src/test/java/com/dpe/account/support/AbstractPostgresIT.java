@@ -25,7 +25,13 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  * itself. Flyway then runs {@code V1__ledger_core.sql} against it on context start, so the
  * migration is exercised by every test rather than only in production.
  */
-@SpringBootTest
+@SpringBootTest(properties = {
+        // The relay's timer is off for every test by default. A background thread draining the
+        // outbox while a test is asserting on it makes failures depend on scheduling, and the
+        // tests that do exercise the relay call drainBatch() directly so their assertions are
+        // deterministic. AbstractKafkaIT is where a broker actually exists.
+        "dpe.outbox.scheduled=false"
+})
 public abstract class AbstractPostgresIT {
 
     // Testcontainers 2.x: PostgreSQLContainer is NOT generic. The old self-typed
@@ -42,8 +48,8 @@ public abstract class AbstractPostgresIT {
     protected JdbcTemplate jdbc;
 
     /**
-     * Returns the database to the state V1 leaves it in: an empty ledger, no customer accounts,
-     * and a SYSTEM account at zero.
+     * Returns the database to the state the migrations leave it in: an empty ledger, an empty
+     * outbox, no customer accounts, and a SYSTEM account at zero.
      *
      * <p>Deliberately not {@code @Transactional} rollback on the test method. These tests run
      * work on several threads, and a rollback-scoped test transaction is bound to one thread -
@@ -53,6 +59,7 @@ public abstract class AbstractPostgresIT {
     @BeforeEach
     void resetLedger() {
         jdbc.execute("TRUNCATE TABLE ledger_entries RESTART IDENTITY");
+        jdbc.execute("TRUNCATE TABLE outbox");
         jdbc.update("DELETE FROM accounts WHERE account_type = 'CUSTOMER'");
         jdbc.update("UPDATE accounts SET balance_minor = 0 WHERE account_type = 'SYSTEM'");
     }

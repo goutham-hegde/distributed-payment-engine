@@ -9,8 +9,8 @@ and what broke along the way. Newest entries at the bottom.
 |---|---|---|
 | M0 | Environment + multi-module skeleton | ✅ **done** |
 | M1 | Ledger core — double-entry, `SELECT FOR UPDATE`, deadlock-safe lock ordering | ✅ **done** |
-| M2 | Transactional outbox + Kafka publishing + inbox dedup | ⬜ next |
-| M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ⬜ |
+| M2 | Transactional outbox + Kafka publishing + inbox dedup | ✅ **done** |
+| M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ⬜ next |
 | M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ⬜ |
 | M5 | JWT authentication and per-account authorization | ⬜ |
 | M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing | ⬜ |
@@ -347,3 +347,177 @@ last is scheduled, the lock is never contested, and a completely broken implemen
 
 M2: the transactional outbox. Business state and the outbox row written in one local transaction,
 a relay claiming rows with `FOR UPDATE SKIP LOCKED`, and an inbox table for consumer idempotency.
+
+---
+
+### M2 — Transactional outbox and idempotent consumer · 2026-09-07
+
+**Goal**
+
+Get an event out of account-service and into payment-orchestrator without ever being in a state
+where one of them is wrong. Specifically: no message describing a transfer that did not commit, no
+transfer that commits without its message, and no message applied twice on the far side.
+
+**Decisions**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Publishing a message | An `INSERT` into `outbox`, in the business transaction | A database write and a broker publish cannot be made atomic. Making the message a row removes the second system entirely: one write, one commit. |
+| Message identity | The outbox row's own primary key, generated in Java before the insert | It must be stable across redelivery. A Kafka offset changes when the relay republishes after crashing between the send and the `published_at` update — which is exactly the case dedup exists to absorb, so dedup would never fire. |
+| Relay claim query | `FOR UPDATE SKIP LOCKED`, native SQL | `SKIP LOCKED` is what turns a table into a work queue: N relays each get a disjoint batch immediately, with no coordination. JPQL cannot express it, and Hibernate's dialect hint degrades silently to plain `FOR UPDATE` where unsupported. |
+| Publish/mark ordering | Send, wait for the broker ack, *then* mark published | Mark-then-publish can lose a message outright; publish-then-mark can duplicate one. Duplicates are absorbed by the consumer's inbox. Losses are absorbed by nobody. |
+| Kafka sends inside the claim transaction | Accepted, with a small batch and a bounded send timeout | The claim's locks are what stop a second relay publishing the same rows. Nothing else ever touches these rows, so holding them blocks no user-facing work; the cost is a long-running transaction, which is bounded rather than eliminated. |
+| A failed send in a batch | Record the failure, skip that aggregate's remaining messages, keep going | Aborting the batch would let one poison message stall every unrelated transfer behind it. Continuing blindly would let a later message of the same aggregate overtake the failed one — losing the per-aggregate ordering the partition key was chosen to provide. |
+| Consumer dedup | `INSERT ... ON CONFLICT DO NOTHING`, in the same transaction as the business write | A `SELECT`-then-`INSERT` has a race window; a primary key does not. `save()` plus a caught `DataIntegrityViolationException` does not work at all — the violation marks the transaction rollback-only, so the business write that was about to be skipped to would fail too. |
+| Read-model upsert | Deliberately **not** idempotent — a repeat increments `apply_count` | If it were idempotent, a completely broken dedup gate would still produce a correct-looking table and the test would be asserting the primary key's behaviour rather than the inbox's. Production would prefer defence in depth; this trades that for provability. |
+| Offset commit | Manual, after the handler's transaction commits | The default auto-commit runs on a five-second timer with no knowledge of whether the work succeeded. A crash after an auto-commit and before the write is durable loses the message permanently. |
+| Broker | Redpanda by default, Apache Kafka behind a `--profile kafka` | Same wire protocol, no JVM, starts in about a second on a 16 GB machine. "Passes on Redpanda" is evidence, not proof, so the real thing stays one flag away. |
+
+**Built**
+
+`V2__outbox.sql` adds the `outbox` table to `accounts_db`: message identity, routing (`topic`,
+`event_type`), the aggregate id that becomes the Kafka partition key, a `jsonb` payload serialized
+at write time, and `published_at` / `attempts` / `last_error` for the relay. The index on
+unpublished rows is **partial** — `WHERE published_at IS NULL` — so it grows with the backlog
+rather than with the archive, and the relay's claim query stays flat no matter how many million
+messages have already been sent.
+
+`V1__inbox_and_read_model.sql` adds `inbox` and `transfer_projection` to `payments_db`.
+
+On the producing side, `TransferService` appends the event through `OutboxWriter`, which has no
+`@Transactional` of its own precisely so that it joins the caller's transaction. `OutboxRelay`
+claims a batch, publishes each record keyed by aggregate id with the message id and event type in
+headers, waits for the acknowledgement, and only then marks the row. Its `@Scheduled` trigger
+lives in a separate bean: had both annotations been on one class, the scheduled method calling
+the transactional one internally would bypass Spring's proxy and run with no transaction at all —
+the claim's locks would be released the instant the query returned, and two relays would publish
+the same rows.
+
+On the consuming side, `AccountEventConsumer` decodes, routes and acknowledges — nothing else —
+and `AccountEventHandler` writes the inbox row and the projection row in one transaction.
+
+Serialization deserves a note. The payload is serialized inside the business transaction rather
+than at publish time. A payload that cannot be serialized then fails while the transaction can
+still roll back, instead of being discovered after the money has already moved and the message is
+undeliverable.
+
+**What broke**
+
+1. **A consumer can create the topic it is about to read — with the wrong shape.** The first live
+   run published four events and the orchestrator applied exactly one. Nothing errored. The cause
+   was a startup race: the orchestrator's consumer subscribed before account-service declared the
+   topic, and Redpanda auto-created it with the broker default of **one partition**. The consumer
+   was assigned that one partition; account-service's `NewTopic` then grew the topic to three
+   behind its back. The producer keyed messages across all three exactly as designed, and roughly
+   two thirds of the traffic was never delivered — no exception, no lag alert on the partition
+   being read, nothing above DEBUG in the log. It looks identical to a system with less traffic
+   than it has, and it heals itself silently five minutes later when `metadata.max.age.ms` forces
+   a refresh and a rebalance.
+
+   `rpk group describe` is what made it visible: partitions 1 and 2 had lag and an **empty
+   member-id** — assigned to nobody.
+
+   Fixed in three places, because one is not enough. The partition count is now a constant in
+   `Topics` that both services declare, so whichever boots first creates the topic correctly and
+   the two cannot drift. `allow.auto.create.topics=false` stops the consumer requesting creation.
+   And the broker runs with `auto_create_topics_enabled=false`, so a topic nobody declared is a
+   visible error rather than a silent wrong default.
+
+2. **`jsonb` does not store the bytes you give it.** Two tests asserted on the text of the stored
+   payload and failed against perfectly correct rows: Postgres parses `jsonb` into a binary tree
+   and renders it back with its own key order and its own `": "` spacing, so `payload::text` is
+   Postgres's serialization of the document, never Jackson's. Any test that string-matches a
+   `jsonb` column is asserting on the database's serializer. The assertions now read fields
+   through `->>`.
+
+3. **A compression codec can wedge a partition below the reach of every error handler.** Replaying
+   a message by hand with `rpk topic produce` — which compresses with **snappy by default** —
+   permanently stalled a partition. `snappy-java` unpacks a bundled native library and dlopens it;
+   the service image is `eclipse-temurin:21-jre-alpine`, which is musl, and the `.so` is
+   glibc-linked:
+
+   ```
+   UnsatisfiedLinkError: libsnappyjava.so:
+       Error loading shared library ld-linux-x86-64.so.2: No such file or directory
+   ```
+
+   What makes it worth recording is *where* it fails. Decompression happens inside
+   `consumer.poll()`, below the listener, so it surfaces as a `KafkaException` carrying no record —
+   and `DefaultErrorHandler` refuses it outright: *"This error handler cannot process
+   'KafkaException's; no record information is available."* No error handler can intercept it, and
+   neither will the dead letter topic in M4. The consumer spins on that record forever; recovery
+   was a manual `rpk group seek` past the offset with the service stopped.
+
+   Every Kafka codec except gzip goes through JNI, so `compression.type` is now pinned to `none`
+   explicitly, with the reason written beside it. Turning compression on for throughput requires a
+   glibc base image first.
+
+4. **Redpanda will not start when its `--memory` equals its container limit.** `--memory=512M`
+   under a 512M cap fails with `insufficient physical memory: needed 536870912 available
+   500000000`. Seastar allocates the full amount up front, and the runtime's own overhead comes
+   out of the same cgroup. Now 384M under a 512M cap.
+
+5. **`./mvnw -pl account-service test` stopped working.** account-service depends on
+   `common-events` as of this milestone, and `-pl` alone does not build it:
+   `Could not find artifact com.dpe:common-events:jar:0.0.1-SNAPSHOT`. It needs `-am`.
+
+**Verified**
+
+```
+./mvnw -B -ntp verify                    BUILD SUCCESS, 5 modules
+                                         AccountIssuanceTest              5/5
+                                         LedgerConstraintTest             7/7
+                                         OutboxWriteTest                  5/5
+                                         OutboxRelayTest                  6/6
+                                         TransferServiceConcurrencyTest   7/7
+                                         InboxDedupTest                   4/4
+                                         AccountEventConsumerTest         3/3
+                                         Tests run: 37, Failures: 0, Errors: 0
+```
+
+End to end on the Compose stack — five containers healthy, no test doubles:
+
+```
+POST /accounts x5, POST /transfers x5, one 422 overdraft
+
+outbox      10 rows | 10 published | 0 backlog | 0 attempts | worst relay lag 834ms
+inbox       10 rows
+projection  10 rows | all apply_count = 1
+rejected transfer (422)                     left NO outbox row
+```
+
+Duplicate delivery was tested against the running system rather than only in a unit test: an
+already-consumed record was republished to the topic carrying its original message id.
+
+```
+rpk topic produce ... -H dpe-message-id:4d32d3dd-... --compression none
+  -> Produced to partition 2 at offset 5
+
+orchestrator log:  message 4d32d3dd-... (FundsTransferred) skipped as duplicate
+transfer_projection.apply_count:  still 1
+```
+
+The recovery from failure (1) is itself evidence for the delivery guarantee: the three messages
+stranded on unassigned partitions were **not lost**. Restarting the consumer rebalanced it onto
+all three partitions and it drained the backlog immediately — total lag 0.
+
+Invariants, baselined before the run and checked after three transfers:
+
+```
+./scripts/verify-invariants.sh baseline   I3 baseline recorded: 400001
+./scripts/verify-invariants.sh            I1 PASS  I2 PASS  I3 PASS  I4 SKIP  I5 PASS   exit 0
+```
+
+**Terminology**
+
+This system provides **at-least-once delivery with idempotent consumers, giving effectively-once
+processing**. Not exactly-once delivery, which is impossible here: the relay cannot make "the
+broker acknowledged" and "the row is marked published" atomic, so a crash between them
+republishes. The whole design is choosing *which* failure to have, and then absorbing it on the
+other side.
+
+**Next**
+
+M3: the saga. Orchestration across all three services, compensation on decline, and a timeout
+sweeper for sagas that stall — plus invariant I4, which has been skipped since M1 because
+`saga_instances` does not exist yet.

@@ -22,6 +22,19 @@ public final class Topics {
 
     // Events: service -> orchestrator (and any other interested subscriber)
     public static final String ACCOUNT_EVENTS = "dpe.account.events.v1";
+
+    /**
+     * Partition count for {@link #ACCOUNT_EVENTS}, declared here because <b>every service that
+     * touches the topic must declare it identically</b>.
+     *
+     * <p>Whichever service boots first creates the topic, and a topic's partition count is fixed
+     * at creation - it can be grown later, but consumers that already joined keep the stale count
+     * until a metadata refresh (up to {@code metadata.max.age.ms}, five minutes by default) and
+     * are assigned nothing on the new partitions in the meantime. Messages keyed onto those
+     * partitions simply sit there. Two services disagreeing about this number, or leaving it to
+     * the broker's default of 1, is therefore a silent stall rather than a startup error.
+     */
+    public static final int ACCOUNT_EVENTS_PARTITIONS = 3;
     public static final String GATEWAY_EVENTS = "dpe.gateway.events.v1";
 
     /**

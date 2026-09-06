@@ -1,12 +1,36 @@
 # M0 stack: PostgreSQL plus the three services.
+# M2 adds Redpanda - the transactional outbox needs somewhere to relay messages to.
 #
-# Redpanda arrives at M2, Redis at M4, Prometheus/Grafana/Jaeger at M6 - each
-# container shows up in the commit that first needs it, so nothing here is
-# unexplained.
+# Redis arrives at M4, Prometheus/Grafana/Jaeger at M6 - each container shows up in
+# the commit that first needs it, so nothing here is unexplained.
 #
 # Run from the repo root:  docker compose -f infra/docker-compose.yml up -d
+#                          docker compose -f infra/docker-compose.yml --profile kafka up -d
 
 name: dpe
+
+# Hoisted out of the service blocks so KAFKA_BOOTSTRAP can be added to only the services
+# that actually speak Kafka. payment-gateway gets one at M3, when it joins the saga.
+x-jvm-env: &jvm-env
+  # Explicit heap cap. Three JVMs at default sizing will each claim a quarter
+  # of the container's visible RAM and this machine cannot afford that.
+  JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+UseSerialGC"
+
+x-build-ctx: &build-ctx
+  context: ..
+  dockerfile: Dockerfile
+
+x-health: &health
+  test: ["CMD-SHELL", "wget -qO- http://localhost:$${SERVER_PORT}/actuator/health | grep -q '\"status\":\"UP\"'"]
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 45s
+
+x-mem-limit: &mem-limit
+  resources:
+    limits:
+      memory: 512M
 
 services:
 
@@ -32,41 +56,117 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+    deploy: *mem-limit
+
+  # Kafka API, one binary, no ZooKeeper and no JVM. Chosen over Apache Kafka as the default
+  # because it idles at a fraction of the memory on a 16 GB machine - see the `kafka` profile
+  # below for the real thing, which the same code must also pass against.
+  redpanda:
+    image: redpandadata/redpanda:v25.3.17
+    container_name: dpe-redpanda
+    command:
+      - redpanda
+      - start
+      # Two listeners, because containers and the host reach the broker by different names.
+      # A Kafka client does not talk to the address it dialled: it fetches metadata, and then
+      # connects to whatever `advertise-kafka-addr` told it. Get this wrong and the bootstrap
+      # succeeds while every produce and fetch afterwards hangs on an unresolvable host - the
+      # single most common Kafka-in-Docker failure, and it looks nothing like a DNS problem.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --smp=1
+      # MUST be below the container's memory limit below, not equal to it. Seastar allocates
+      # this much up front and refuses to start if the cgroup cannot hand it over:
+      #   "Could not initialize seastar: insufficient physical memory:
+      #    needed 536870912 available 500000000"
+      # with --memory=512M under a 512M limit. The gap is the runtime's own overhead - the rpk
+      # wrapper, the page cache, the allocator's metadata - which comes out of the same cgroup.
+      # 384M under a 512M cap leaves that headroom.
+      - --memory=384M
+      - --reserve-memory=0M
+      # Skips the production readiness checks (open file limits, memory locking). Correct for
+      # a laptop, never for production.
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      # A topic is a declared artifact, never something the first client to ask for it brings
+      # into existence. With auto-creation on, whichever service connects first silently
+      # defines the topic's shape - and a consumer that wins that race creates it with ONE
+      # partition, is assigned only that partition, and then never sees the messages the
+      # producer keys onto the other two. Off, an undeclared topic is an error someone can see.
+      - --set redpanda.auto_create_topics_enabled=false
+    ports:
+      # Host-facing listener only. Services inside the network use redpanda:9092.
+      - "19092:19092"
+    healthcheck:
+      # A broker that accepts TCP is not a broker that can serve a produce request; the
+      # controller has to have elected a leader first. Same lesson as pg_isready above.
+      test: ["CMD-SHELL", "rpk cluster health 2>/dev/null | grep -qE 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    deploy: *mem-limit
+
+  # The same broker, for real. Apache Kafka in KRaft mode - no ZooKeeper either, since 3.3.
+  # Profile-gated: `--profile kafka` and stop redpanda first, as both claim host port 19092.
+  # The point of keeping it is that "works on Redpanda" is not "works on Kafka", and the
+  # chaos suite at M7 should be able to prove the difference.
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: dpe-kafka
+    profiles: ["kafka"]
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:19092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # A single-broker cluster cannot replicate. These default to 3 and every internal
+      # topic creation fails with a replication-factor error until they are set to 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1G
 
   payment-orchestrator:
-    build: &build-ctx
-      context: ..
-      dockerfile: Dockerfile
+    build:
+      <<: *build-ctx
       args:
         MODULE: payment-orchestrator
     container_name: dpe-orchestrator
     depends_on:
       postgres:
         condition: service_healthy
-    environment: &jvm-env
-      # Explicit heap cap. Three JVMs at default sizing will each claim a quarter
-      # of the container's visible RAM and this machine cannot afford that.
-      JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+UseSerialGC"
+      redpanda:
+        condition: service_healthy
+    environment:
+      <<: *jvm-env
       DB_URL: jdbc:postgresql://postgres:5432/payments_db
       DB_USER: payments
       DB_PASSWORD: payments
+      KAFKA_BOOTSTRAP: redpanda:9092
       SERVER_PORT: "8081"
     ports:
       - "8081:8081"
-    healthcheck: &health
-      test: ["CMD-SHELL", "wget -qO- http://localhost:$${SERVER_PORT}/actuator/health | grep -q '\"status\":\"UP\"'"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 45s
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+    healthcheck: *health
+    deploy: *mem-limit
 
   account-service:
     build:
@@ -77,19 +177,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redpanda:
+        condition: service_healthy
     environment:
       <<: *jvm-env
       DB_URL: jdbc:postgresql://postgres:5432/accounts_db
       DB_USER: accounts
       DB_PASSWORD: accounts
+      KAFKA_BOOTSTRAP: redpanda:9092
       SERVER_PORT: "8082"
     ports:
       - "8082:8082"
     healthcheck: *health
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+    deploy: *mem-limit
 
   payment-gateway:
     build:
@@ -109,10 +209,7 @@ services:
     ports:
       - "8083:8083"
     healthcheck: *health
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+    deploy: *mem-limit
 
 volumes:
   pgdata:

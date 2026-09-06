@@ -52,6 +52,14 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- M2: the transactional outbox needs somewhere to relay to. Boot 4 folded
+             spring-kafka into a starter; the Boot 3 coordinate `org.springframework.kafka:spring-kafka`
+             still resolves but brings no auto-configuration and no managed version. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-kafka</artifactId>
+        </dependency>
+
         <!-- Spring Boot 4 splits the old monolithic spring-boot-starter-test into per-module
              test starters. You need one per production starter you actually test against. -->
         <dependency>
@@ -87,6 +95,20 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Testcontainers 2.x renamed every module: `org.testcontainers:redpanda` is the
+             1.x coordinate and stops at 1.21.4. The class moved too, to
+             org.testcontainers.redpanda.RedpandaContainer, and like PostgreSQLContainer it
+             is no longer generic. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-redpanda</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

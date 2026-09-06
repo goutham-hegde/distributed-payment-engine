@@ -29,6 +29,67 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+  # M2: the outbox relay is the only thing in this service that talks to Kafka.
+  kafka:
+    # In Compose this is redpanda:9092 (the internal listener). From the IDE it is
+    # localhost:19092 (the external one). Same broker, two advertised addresses.
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # The payload was already serialized to JSON inside the business transaction, so the
+      # producer is handed a String and does no mapping. A JsonSerializer here would move
+      # serialization to publish time, where a failure can no longer roll anything back.
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+      # Wait for every in-sync replica, not just the partition leader. With acks=1 a write is
+      # acknowledged by the leader alone, and if that leader dies before its followers catch up
+      # the acknowledged message is gone - the relay has already marked the row published, so
+      # nothing will ever resend it. This is the setting that makes the outbox's guarantee true.
+      # (On this single-broker dev cluster "all replicas" is one machine. It is honest to say
+      # that acks=all is doing nothing for durability here; it is set so that the code is correct
+      # on the cluster it would actually run on.)
+      acks: all
+      retries: 2147483647
+      properties:
+        # Deduplicates the producer's OWN retries within a session, by tagging records with a
+        # producer id and sequence number so the broker can drop a redelivery it has already
+        # written. Worth having - it removes the commonest source of duplicates. It is NOT
+        # end-to-end exactly-once: it knows nothing about the relay crashing and republishing
+        # from the outbox, which is a different producer session with different sequence numbers.
+        # That case is the consumer's inbox's job.
+        enable.idempotence: true
+        # Idempotence permits up to 5 in flight while still guaranteeing order on retry. Above
+        # 5 the broker cannot deduplicate reliably and Kafka refuses to start with idempotence on.
+        max.in.flight.requests.per.connection: 5
+        # Explicit, because the runtime image cannot support anything else. Every Kafka codec
+        # except gzip - snappy, lz4, zstd - decompresses through a bundled JNI library, and the
+        # service image is eclipse-temurin:21-jre-alpine, which is musl: the .so is glibc-linked
+        # and fails to load with "Error loading shared library ld-linux-x86-64.so.2".
+        #
+        # The way it fails is what makes this worth pinning. Decompression happens inside
+        # consumer.poll(), BELOW the listener, so the failure arrives as a KafkaException with no
+        # record attached - DefaultErrorHandler refuses it ("no record information is available"),
+        # no error handler and no future DLQ can intercept it, and the partition spins on that
+        # record forever. Recovery is a manual offset seek. Turning compression on for throughput
+        # therefore needs a glibc base image FIRST.
+        compression.type: none
+        linger.ms: 5
+        request.timeout.ms: 3000
+        # Total budget for one send, retries included. Kept BELOW the relay's send-timeout on
+        # purpose: the future then always completes on its own, exceptionally if need be, rather
+        # than leaving the relay to time out while the producer is still retrying in the
+        # background - which would publish a message the relay had already given up on.
+        delivery.timeout.ms: 4000
+
+# M2 relay tuning. See OutboxProperties for what each knob actually trades away.
+dpe:
+  outbox:
+    batch-size: 100
+    poll-interval: 500ms
+    send-timeout: 5s
+    # Tests turn this off and call drainBatch() directly, so nothing races them.
+    scheduled: true
+
 server:
   port: ${SERVER_PORT:8082}
 
