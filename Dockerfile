@@ -12,6 +12,7 @@ WORKDIR /build
 # does not invalidate the dependency layer below it and rebuilds stay fast.
 COPY pom.xml ./
 COPY common-events/pom.xml           common-events/
+COPY common-messaging/pom.xml        common-messaging/
 COPY account-service/pom.xml         account-service/
 COPY payment-orchestrator/pom.xml    payment-orchestrator/
 COPY payment-gateway/pom.xml         payment-gateway/
@@ -22,6 +23,7 @@ RUN --mount=type=cache,target=/root/.m2 \
     mvn -B -ntp dependency:go-offline -DskipTests
 
 COPY common-events/src           common-events/src
+COPY common-messaging/src        common-messaging/src
 COPY account-service/src         account-service/src
 COPY payment-orchestrator/src    payment-orchestrator/src
 COPY payment-gateway/src         payment-gateway/src

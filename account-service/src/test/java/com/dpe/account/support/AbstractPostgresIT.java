@@ -58,9 +58,16 @@ public abstract class AbstractPostgresIT {
      */
     @BeforeEach
     void resetLedger() {
+        // Order matters: holds carries a foreign key to accounts, so it has to go before the
+        // customer accounts it references or the DELETE below fails on the constraint.
+        jdbc.execute("TRUNCATE TABLE holds");
         jdbc.execute("TRUNCATE TABLE ledger_entries RESTART IDENTITY");
         jdbc.execute("TRUNCATE TABLE outbox");
+        jdbc.execute("TRUNCATE TABLE inbox");
         jdbc.update("DELETE FROM accounts WHERE account_type = 'CUSTOMER'");
-        jdbc.update("UPDATE accounts SET balance_minor = 0 WHERE account_type = 'SYSTEM'");
+        // Both non-customer accounts go back to zero. Missing the CLEARING account here would
+        // leave a balance behind from a previous test with no entries to justify it, and every
+        // subsequent I2 assertion would fail against a fixture bug rather than a real one.
+        jdbc.update("UPDATE accounts SET balance_minor = 0 WHERE account_type <> 'CUSTOMER'");
     }
 }

@@ -2,7 +2,7 @@ package com.dpe.orchestrator.consumer;
 
 import com.dpe.events.EventEnvelope;
 import com.dpe.events.FundsTransferred;
-import com.dpe.orchestrator.inbox.InboxRepository;
+import com.dpe.messaging.inbox.InboxRepository;
 import com.dpe.orchestrator.readmodel.TransferProjectionRepository;
 import java.util.UUID;
 import org.springframework.stereotype.Component;

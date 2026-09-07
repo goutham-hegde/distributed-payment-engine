@@ -1,6 +1,6 @@
 package com.dpe.account.service;
 import java.util.*;
-import com.dpe.account.outbox.OutboxWriter;
+import com.dpe.messaging.outbox.OutboxWriter;
 import com.dpe.account.repository.AccountRepository;
 import com.dpe.account.repository.LedgerEntryRepository;
 import com.dpe.events.FundsTransferred;

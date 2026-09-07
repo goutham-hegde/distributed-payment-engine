@@ -24,8 +24,31 @@ spring:
     locations: classpath:db/migration
 
   # M2: consumes the events account-service relays out of its outbox.
+  # M3: also PRODUCES, because the saga issues commands through an outbox of its own.
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+
+    # Identical to account-service's producer block, and identical on purpose: these settings
+    # are what make the outbox's guarantee true, so they are not a per-service preference.
+    # See account-service/src/main/resources/application.yml for what each one buys.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 2147483647
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        # Stays 'none' until the base image changes. Every codec except gzip decompresses
+        # through a glibc-linked JNI library and the runtime image is Alpine/musl; the failure
+        # happens inside consumer.poll(), below every error handler, and wedges the partition
+        # permanently. M2 hit this for real.
+        compression.type: none
+        linger.ms: 5
+        request.timeout.ms: 3000
+        # Below the relay's send-timeout, so the send future always completes on its own rather
+        # than being abandoned while the producer is still retrying in the background.
+        delivery.timeout.ms: 4000
     consumer:
       # One group for the whole service. Every instance shares it, so Kafka gives each instance a
       # disjoint set of partitions: scaling out divides the work instead of duplicating it.
@@ -68,6 +91,39 @@ spring:
       # deferring to the end of the poll batch, which keeps test assertions honest about what
       # has actually been committed.
       ack-mode: manual_immediate
+
+# M3 relay tuning. See OutboxProperties for what each knob trades away.
+dpe:
+  outbox:
+    batch-size: 100
+    poll-interval: 500ms
+    send-timeout: 5s
+    # Tests turn this off and call drainBatch() directly, so nothing races them.
+    scheduled: true
+
+  saga:
+    # How long a saga may sit in a non-terminal state before the sweeper forces compensation.
+    #
+    # This is a POLICY number and the most consequential one in the milestone. Too short and a
+    # merely slow account-service gets its perfectly good reserve compensated out from under it,
+    # producing a spurious failure and, worse, a release racing a late commit. Too long and money
+    # sits stranded in a hold for that long whenever a participant dies. It must comfortably
+    # exceed the p99 of a full round trip - relay poll interval, broker, consumer poll, the
+    # gateway's own latency - and 30s is that with room to spare while staying observable in a
+    # test.
+    step-timeout: 30s
+    # How often to look for expired sagas. The sweep is one indexed query against a partial
+    # index containing only in-flight sagas, so it is cheap enough to run often.
+    sweep-interval: 5s
+    # Cap on how many times the sweeper will try to drive one saga to a terminal state before
+    # leaving it alone and letting it be alerted on. Without a cap, a saga that cannot be
+    # compensated is swept forever and the log fills with the same failure.
+    max-sweep-attempts: 5
+    # Sagas claimed per sweep. Bounded for the same reason the outbox batch is: the claim
+    # transaction stays open across the whole batch.
+    sweep-batch-size: 100
+    # Tests turn this off and call sweep() directly, so a background thread cannot race them.
+    scheduled: true
 
 server:
   port: ${SERVER_PORT:8081}

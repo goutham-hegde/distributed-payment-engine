@@ -20,6 +20,22 @@ public final class Topics {
     public static final String ACCOUNT_COMMANDS = "dpe.account.commands.v1";
     public static final String GATEWAY_COMMANDS = "dpe.gateway.commands.v1";
 
+    /**
+     * Partition counts for the saga topics. Same rule as {@link #ACCOUNT_EVENTS_PARTITIONS}:
+     * every service that touches a topic declares it from the constant, so no client can bring
+     * a topic into existence with the broker's one-partition default and then silently read
+     * only a third of the traffic.
+     *
+     * <p>Three everywhere, and the number is not arbitrary. Every message in one saga is keyed
+     * by its transfer id, so a saga's whole conversation lands on a single partition and is
+     * delivered in the order it was sent - which is what lets a participant assume it will never
+     * see {@code CommitFunds} before {@code ReserveFunds}. Across transfers there is no order and
+     * none is needed. More partitions buys parallelism, never correctness; fewer would serialise
+     * unrelated transfers behind each other.
+     */
+    public static final int ACCOUNT_COMMANDS_PARTITIONS = 3;
+    public static final int GATEWAY_COMMANDS_PARTITIONS = 3;
+
     // Events: service -> orchestrator (and any other interested subscriber)
     public static final String ACCOUNT_EVENTS = "dpe.account.events.v1";
 
@@ -35,7 +51,9 @@ public final class Topics {
      * the broker's default of 1, is therefore a silent stall rather than a startup error.
      */
     public static final int ACCOUNT_EVENTS_PARTITIONS = 3;
+
     public static final String GATEWAY_EVENTS = "dpe.gateway.events.v1";
+    public static final int GATEWAY_EVENTS_PARTITIONS = 3;
 
     /**
      * Dead letter topic suffix. Spring Kafka's {@code DeadLetterPublishingRecoverer} appends

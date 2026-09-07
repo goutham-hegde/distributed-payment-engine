@@ -20,6 +20,13 @@
             <artifactId>common-events</artifactId>
         </dependency>
 
+        <!-- M3: the outbox relay and the inbox gate, shared by all three services. It brings
+             spring-boot-starter-data-jpa and spring-boot-starter-kafka with it. -->
+        <dependency>
+            <groupId>com.dpe</groupId>
+            <artifactId>common-messaging</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>
@@ -84,6 +91,14 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- M3: the gateway joined the saga, so it has a KafkaTemplate to satisfy and topics
+             to declare. Its own tests do not need a broker, but the context will not start
+             without the Kafka test support on the path. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-kafka-test</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

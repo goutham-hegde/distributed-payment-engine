@@ -2,7 +2,7 @@ package com.dpe.account;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.dpe.account.outbox.OutboxRelay;
+import com.dpe.messaging.outbox.OutboxRelay;
 import com.dpe.account.support.AbstractKafkaIT;
 import com.dpe.account.support.Concurrently;
 import com.dpe.events.EventEnvelope;

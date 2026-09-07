@@ -23,6 +23,50 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+  # M3: the gateway joins the saga. It consumes ChargeGateway commands and produces
+  # GatewayApproved / GatewayDeclined events out of its own outbox.
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 2147483647
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        # 'none' until the base image stops being musl. See account-service's yml.
+        compression.type: none
+        linger.ms: 5
+        request.timeout.ms: 3000
+        delivery.timeout.ms: 4000
+
+    consumer:
+      group-id: payment-gateway
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Nothing is committed until the handler's transaction has committed. Auto-commit would
+      # acknowledge a charge command on a timer, with no idea whether the charge happened.
+      enable-auto-commit: false
+      max-poll-records: 50
+      properties:
+        # A consumer must never conjure a topic. See KafkaTopicsConfig in any service for the
+        # silent one-partition failure this prevents.
+        allow.auto.create.topics: false
+
+    listener:
+      ack-mode: manual_immediate
+
+# M3 relay tuning. See OutboxProperties for what each knob trades away.
+dpe:
+  outbox:
+    batch-size: 100
+    poll-interval: 500ms
+    send-timeout: 5s
+    scheduled: true
+
 server:
   port: ${SERVER_PORT:8083}
 

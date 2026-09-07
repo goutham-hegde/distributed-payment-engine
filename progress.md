@@ -10,7 +10,7 @@ and what broke along the way. Newest entries at the bottom.
 | M0 | Environment + multi-module skeleton | ✅ **done** |
 | M1 | Ledger core — double-entry, `SELECT FOR UPDATE`, deadlock-safe lock ordering | ✅ **done** |
 | M2 | Transactional outbox + Kafka publishing + inbox dedup | ✅ **done** |
-| M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ⬜ next |
+| M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ✅ **done** |
 | M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ⬜ |
 | M5 | JWT authentication and per-account authorization | ⬜ |
 | M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing | ⬜ |
@@ -521,3 +521,325 @@ other side.
 M3: the saga. Orchestration across all three services, compensation on decline, and a timeout
 sweeper for sagas that stall — plus invariant I4, which has been skipped since M1 because
 `saga_instances` does not exist yet.
+
+---
+
+### M3 (part 1) — Saga foundations · 2026-09-07
+
+**Goal**
+
+Everything the saga needs to exist: the schema it runs on, the message contracts it speaks, the
+transport that carries them, and the simulated payment provider that gives compensation a real
+cause. The state machine itself is deliberately the next commit — this one ends with its
+specification written as failing tests.
+
+**Decisions**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Where money in flight lives | A third account type, `CLEARING` | Both obvious designs break an invariant. See "the reserve problem" below — the most consequential decision in the milestone. |
+| Outbox/inbox code across three services | Extracted to a new `common-messaging` module | All three become producers and consumers at M3. Sharing infrastructure that carries no business meaning; each service still owns its own tables. ADR 0004. |
+| Outbox/inbox *tables* | Duplicated per database, deliberately | A shared table would be a shared database — the coupling database-per-service exists to prevent. |
+| Saga state: stored or derived | A `status` column, with `saga_steps` as the full history | The timeout sweeper needs an indexed query for "non-terminal and past deadline". A state folded from an event log cannot be indexed, so every sweep would scan every saga ever run. |
+| Rejected reserve vs. declined gateway | Different terminal paths | A rejection moved no money, so there is nothing to compensate. Routing it through compensation would emit a release naming a hold that does not exist. |
+| Saga deadline | One deadline for the whole saga, set at creation | A per-step deadline is more precise but must be reset on every transition, and a missed reset produces a saga that can never time out — the exact failure the deadline exists to prevent. One deadline fails safe. |
+| Consumer groups per service | Exactly one, so exactly one inbound listener | Forced by the inbox's key. See "what broke" (1). |
+| `POST /transfers` response | `202 Accepted`, not `201 Created` | The money has not moved when it returns. 201 would claim the transfer is done; 202 says it has been accepted and the outcome comes later. That is the saga in one status code. |
+
+**The reserve problem, and why there is a CLEARING account**
+
+Reserve-then-commit has to satisfy four invariants at once, and the two obvious implementations
+each break one:
+
+- *"A hold is just a row; leave the balance alone."* Breaks **I1**'s companion **I3** —
+  `SUM(customer balances) + SUM(active holds)` climbs by the reserved amount on every reserve,
+  because the balance never moved. It also pushes the overdraft rule back into application code
+  where I5's CHECK constraint cannot see it.
+- *"Debit the sender now; the hold records it."* Breaks **I1** — a debit with no matching credit
+  means the ledger no longer sums to zero.
+
+Both fail for the same reason: in double-entry there is no such place as "in transit" unless you
+make one. So a reserve debits the sender and credits a `CLEARING` account, which is what real
+payment rails do:
+
+```
+reserve   DEBIT  sender   -X    CREDIT clearing  +X    hold ACTIVE
+commit    DEBIT  clearing -X    CREDIT recipient +X    hold COMMITTED
+release   DEBIT  clearing -X    CREDIT sender    +X    hold RELEASED
+```
+
+Every invariant then holds with no special-casing. `CLEARING` is not a `CUSTOMER` account, so its
+balance sits outside I3's sum and the hold accounts for that money instead.
+
+The property this produced for free is the best structural guarantee in the milestone. Commit and
+release write the **identical** ledger leg — `(transfer_id, clearing, DEBIT)` — and that triple is
+covered by a UNIQUE constraint. So for any one transfer the database permits a commit or a release
+and never both, and never either one twice. A saga that tried to complete and compensate the same
+transfer — through a bug, a redelivered command, or a timeout sweeper racing a late approval —
+cannot double-spend. **The mutual exclusion is a property of the schema, not a promise made by the
+orchestrator.**
+
+**Built**
+
+- `common-messaging`: the outbox entity, repository, writer, relay and scheduler, plus the inbox
+  entity and repository, moved out of the two services that had them. It holds no domain type; the
+  payload is an opaque string in both directions.
+- Migrations: `V3__holds_and_inbox.sql` (accounts_db — `holds`, `inbox`, the CLEARING account, the
+  widened account-type constraint), `V2__saga.sql` (payments_db — `transfers`, `saga_instances`,
+  `saga_steps`, `outbox`), `V1__gateway_charges.sql` (gateway_db).
+- Ten new contracts in `common-events`: `ReserveFunds` / `FundsReserved` / `ReserveRejected`,
+  `ChargeGateway` / `GatewayApproved` / `GatewayDeclined`, `CommitFunds` / `FundsCommitted`,
+  `ReleaseFunds` / `FundsReleased`.
+- `payment-gateway` became a real service: charge domain, idempotent `ChargeService`, command
+  consumer, and runtime-tunable fault injection (`POST /admin/simulation`) for decline rate,
+  latency, timeout rate and duplicate callbacks. Its `transfer_id` is UNIQUE — an external charge
+  is the one step in this system that cannot be undone by writing an opposite row, so the
+  protection has to be structural rather than a promise made by the caller.
+- Orchestrator: `Transfer` and saga entities, repositories including the sweeper's
+  `FOR UPDATE SKIP LOCKED` claim, `POST /api/v1/transfers`, and the single inbound listener.
+- account-service: `Hold`, `HoldRepository`, the command consumer and its transactional gate.
+
+Deliberately left unimplemented, with their tests written: `SagaOrchestrator` (the state machine),
+`SagaTimeoutSweeper.sweep`, and `ReservationService` (reserve, commit, release).
+
+**What broke**
+
+1. **Two consumer groups over one topic would have silently swallowed every saga reply.** The saga
+   reply consumer was first written as a second `@KafkaListener` alongside M2's projection
+   consumer, with its own group id. Both subscribe to `dpe.account.events.v1`, and two consumer
+   groups each receive *every* message — while the inbox's primary key is the message id **alone**.
+
+   So whichever group committed first would insert the inbox row, and the second would find the
+   message already recorded and skip it as a duplicate. Correctly, by its own rules. Every saga
+   would have stalled in `STARTED` and the sweeper would have compensated perfectly healthy
+   transfers — with nothing logging an error, because from each component's point of view nothing
+   went wrong.
+
+   Caught before it ran, by a column comment written at M2 warning about exactly this case. Fixed
+   by collapsing to one listener that routes by event type, so every message passes through
+   exactly one gate. The general rule is worth more than the fix: **a dedup key must be unique
+   across everything that shares the table.** A key that is unique per message but not per consumer
+   works right up until someone adds a second consumer, and then it fails by being too effective
+   rather than by erroring.
+
+2. **`@EntityScan` moved package in Spring Boot 4.** No longer
+   `org.springframework.boot.autoconfigure.domain.EntityScan` — Boot 4 split `autoconfigure` into
+   per-technology modules and it now ships in `spring-boot-persistence` as
+   `org.springframework.boot.persistence.autoconfigure.EntityScan`. `@EnableJpaRepositories` did
+   not move, being Spring Data rather than Boot. Symptom: *"package
+   org.springframework.boot.autoconfigure.domain does not exist"*.
+
+3. **`@EntityScan` and `@EnableJpaRepositories` replace the default scan rather than extending
+   it.** Declaring either one makes Boot back off its own scanning entirely. So `common-messaging`
+   cannot declare them on a service's behalf — naming only the library would silently unregister
+   the service's own repositories, and the library would work while the application broke. Each
+   application class names both packages instead, where a reader looks first.
+
+4. **The outbox `payload` column holds the envelope, not the event.** Three test helpers reached
+   for `payload->>'transferId'`, which is always NULL — the business fields are one level down, at
+   `payload->'payload'->>'transferId'`. The failure mode is nasty inside a test: a `WHERE` clause
+   on it matches nothing, so an assertion that "no such row exists" passes for entirely the wrong
+   reason. Only one of the four surfaced as a real failure; the rest were found by grep afterwards.
+   Related to M2's lesson about `jsonb` and worth stating alongside it: reading a `jsonb` column
+   requires knowing the shape you actually stored, not the shape you had in mind.
+
+**Verified**
+
+```
+./mvnw -B -ntp verify        BUILD SUCCESS, 6 modules
+                             43 passing, 18 failing (the unwritten specification)
+
+passing  AccountIssuanceTest            5/5    LedgerConstraintTest    7/7
+         OutboxWriteTest                5/5    OutboxRelayTest         6/6
+         TransferServiceConcurrencyTest 7/7    InboxDedupTest          4/4
+         AccountEventConsumerTest       3/3    ChargeServiceTest       6/6
+
+failing  ReservationServiceTest         6      every one an
+         SagaFlowTest                   6      UnsupportedOperationException
+         SagaTimeoutTest                6
+```
+
+Every one of M2's 37 tests still passes through the `common-messaging` extraction and the three
+new migrations, which is the check that mattered most — the refactor touched every service's
+Spring wiring and both existing databases.
+
+The 18 failing tests are the specification for the state machine, the sweeper and the reservation
+logic, written before the implementations they describe. They fail with
+`UnsupportedOperationException` rather than assertion errors, so the build distinguishes "not
+written yet" from "written wrong" — which is worth the small effort of stubbing the methods rather
+than leaving them absent.
+
+**Next**
+
+Implement the three files the tests specify: `ReservationService` (reserve / commit / release with
+sorted lock ordering), `SagaOrchestrator` (the state machine and its two failure branches), and
+`SagaTimeoutSweeper.sweep`. Then the end-to-end run on the Compose stack — a happy-path transfer, a
+forced decline through the gateway's simulation endpoint, and a stalled participant to exercise the
+sweeper — each followed by `verify-invariants.sh`, which can finally check I4 now that
+`saga_instances` exists.
+
+---
+
+### M3 (part 2) — The saga, working end to end · 2026-09-07
+
+**Goal**
+
+Implement the three pieces part 1 left specified but unwritten — the reservation logic, the saga
+state machine, and the timeout sweeper — and prove all four saga paths on the running stack rather
+than only in tests.
+
+**Decisions**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Transaction propagation on the saga and reservation services | `@Transactional` with the default `REQUIRED` | The handler opens the transaction and writes the inbox row; these join it. `REQUIRES_NEW` would commit the ledger independently of the inbox row that makes it idempotent. `REQUIRED` also makes both callable directly from a test, which is why the specification tests can drive the state machine without a broker. |
+| A reply that does not match the saga's current state | Record a `SKIPPED` step and return | A late approval arriving after the sweeper compensated is normal operation. Throwing would roll back the inbox row and redeliver forever. |
+| A `CommitFunds` for a hold that is already `RELEASED` | Log at ERROR and return, do not throw | Same reasoning. The money was never at risk — the UNIQUE constraint on `(transfer_id, clearing, DEBIT)` already made the double settlement impossible — so the only thing left to choose is whether the anomaly is loud or infinite. |
+| Sweeper failure handling | Catch per saga, continue the batch | One saga that cannot be compensated must not stop every other stranded saga from being rescued. Same principle as the relay blocking only the aggregate that failed. |
+| `onTimeout` transaction boundary | None of its own; runs inside the sweeper's batch transaction | The claim's locks are the only mutual exclusion between sweeper instances and must be held to the end of the batch. |
+
+**Built**
+
+- `ReservationService.reserve/commit/release` — validate, lock the sender and CLEARING in sorted id
+  order, post both ledger legs, move the hold, write the reply to the outbox. All in the caller's
+  transaction.
+- `SagaOrchestrator` — `start` plus six reply handlers plus `onTimeout`, each loading the saga
+  `FOR UPDATE`, guarding the expected state, and recording a `saga_steps` row.
+- `SagaTimeoutSweeper.sweep` — claims expired sagas `FOR UPDATE SKIP LOCKED` and drives each one.
+
+**What broke**
+
+1. **The new module was invisible to Docker.** `./mvnw verify` was green while
+   `docker compose build` failed with a bare `dependency:go-offline` exit code 1. The Dockerfile
+   copies each module's POM and `src` **by name**, so `common-messaging` existed in the reactor and
+   not in the image build. Worth internalising: a green local build is not evidence that the
+   container build works, and the error message names nothing useful.
+
+2. **Compose merges `ports` across `-f` files rather than replacing them.** Another project's kind
+   cluster held host port 19092. An override file with `ports: []` changed nothing — sequence
+   fields are merged by default and `!override` is required to replace one. The host binding is
+   only there for IDE and host-side `rpk` access; services reach the broker at `redpanda:9092` on
+   the internal network, so dropping it for the verification run cost nothing.
+
+3. **Services raced the network on a partially failed `up`.** After the port failure above, the
+   three service containers had been created but the broker had not started, and starting them
+   afterwards produced `No resolvable bootstrap urls given in bootstrap.servers` — a DNS failure
+   that reads like a configuration error. `--force-recreate` after the broker was healthy resolved
+   it. `depends_on: service_healthy` protects a clean `up`, not a resumed one.
+
+**Verified**
+
+Unit and integration suite, real Postgres and Redpanda via Testcontainers:
+
+```
+./mvnw -B -ntp verify        BUILD SUCCESS, 6 modules, 61 tests, 0 failures
+
+AccountIssuanceTest 5   LedgerConstraintTest 7   OutboxWriteTest 5
+OutboxRelayTest 6       ReservationServiceTest 6 TransferServiceConcurrencyTest 7
+AccountEventConsumerTest 3   InboxDedupTest 4    SagaFlowTest 6   SagaTimeoutTest 6
+ChargeServiceTest 6
+```
+
+Then all four saga paths on the Compose stack — five containers, no test doubles. Alice opened with
+₹1,000.00, Bob with zero; the I3 baseline was 100000 minor units throughout.
+
+**1. Happy path** — ₹300.00 Alice → Bob:
+
+```
+POST /api/v1/transfers            HTTP 202, status PENDING, sagaStatus STARTED
+after 10s                         status COMPLETED, sagaStatus COMPLETED
+saga steps    ReserveFunds STARTED/SUCCEEDED, ChargeGateway STARTED/SUCCEEDED,
+              CommitFunds STARTED/SUCCEEDED
+hold          COMMITTED 30000
+ledger        alice DEBIT -30000 | clearing CREDIT +30000
+              clearing DEBIT -30000 | bob CREDIT +30000
+balances      alice 70000, bob 30000, clearing 0
+```
+
+**2. Gateway decline** — `POST /admin/simulation {"failureRate":1.0}`, then ₹250.00:
+
+```
+transfer      status FAILED, failureReason GATEWAY_DECLINED, sagaStatus COMPENSATED
+gateway       DECLINED, reason card_expired
+hold          RELEASED 25000
+ledger        alice DEBIT -25000 | clearing CREDIT +25000
+              clearing DEBIT -25000 | alice CREDIT +25000     <- four entries, not zero
+balances      alice back to 70000, clearing 0
+```
+
+The four ledger entries are the point. **Compensation is not rollback**: the reserve's debit is
+still there, and the reversal sits beside it. Alice's statement shows the money leaving and coming
+back, which is what actually happened.
+
+**3. Timeout** — `{"timeoutRate":1.0}`, so the PSP never answers at all, then ₹150.00:
+
+```
+t+10s   saga RESERVED, hold ACTIVE 15000, alice 55000, clearing 15000
+        I3 PASS  total money conserved (100000)
+        I4 FAIL  1 saga(s) stuck in a non-terminal state - money may be stranded
+```
+
+That pair of results is exactly why both invariants exist. No money was lost — I3 balances,
+because the hold accounts for it — and it is nonetheless stranded, which only I4 can see.
+
+```
+t+55s   orchestrator log: "saga sweeper compensated 1 stalled saga(s)"
+        transfer FAILED / SAGA_TIMEOUT, saga COMPENSATED, sweep_attempts 1
+        saga steps  ChargeGateway TIMED_OUT -> COMPENSATING, ReleaseFunds STARTED/SUCCEEDED
+        hold RELEASED, alice back to 70000, clearing 0
+        I1 I2 I3 I4 I5 all PASS
+```
+
+**4. Rejected reserve** — ask for ₹9,999.99 against a ₹700.00 balance:
+
+```
+transfer      status FAILED, failureReason INSUFFICIENT_FUNDS, sagaStatus FAILED
+saga          hold_id NULL, went to FAILED directly, never COMPENSATING
+ledger        0 entries      holds 0 rows      ReleaseFunds emitted: 0
+saga steps    ReserveFunds STARTED, ReserveFunds FAILED -> FAILED
+```
+
+No money moved, so nothing was compensated — and no `ReleaseFunds` naming a hold that does not
+exist.
+
+Messaging health after the run, with the counts reconciling exactly across three databases:
+
+```
+payments_db  outbox=10 published=10 backlog=0 attempts=0 inbox=10
+accounts_db  outbox=8  published=8  backlog=0 attempts=0 inbox=7
+gateway_db   outbox=2  published=2  backlog=0 attempts=0 inbox=2
+
+sagas   COMPLETED 1, COMPENSATED 2, FAILED 1
+```
+
+`gateway inbox=2` against three `ChargeGateway` commands is correct rather than a gap: the timed-out
+charge rolled its inbox row back with the transaction, exhausted the container's retry budget, and
+was never recorded — which is precisely why the sweeper had to be the thing that resolved it.
+
+Final invariant check:
+
+```
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (100000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+All invariants hold.
+```
+
+I4 has been skipped since M1 because `saga_instances` did not exist. This is the first run in which
+all five are actually checked.
+
+**Next**
+
+M4: idempotency keys at the API edge (a client retry of `POST /transfers` currently starts a second
+transfer), retry with backoff, and the dead letter queue — including the honest note from M2 that
+not every poison message is reachable by a DLQ.
+
+Debt carried forward, deliberately recorded rather than hidden: when a saga times out in `STARTED`,
+the sweeper marks it `FAILED` without releasing anything, because there may be no hold. If the
+reserve did in fact succeed and only its reply was lost, that leaves an `ACTIVE` hold with no live
+saga — I3 still balances and the money is accounted for, but it is stranded and no timeout will
+find it. The fix is a reconciliation job that scans for holds with no corresponding saga; it is out
+of scope here and is called out in `SagaOrchestrator.onTimeout`.

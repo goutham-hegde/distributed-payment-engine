@@ -9,8 +9,8 @@
 
 name: dpe
 
-# Hoisted out of the service blocks so KAFKA_BOOTSTRAP can be added to only the services
-# that actually speak Kafka. payment-gateway gets one at M3, when it joins the saga.
+# Hoisted out of the service blocks so the heap cap is stated once. As of M3 all three
+# services speak Kafka - the gateway joined the saga and got its KAFKA_BOOTSTRAP here.
 x-jvm-env: &jvm-env
   # Explicit heap cap. Three JVMs at default sizing will each claim a quarter
   # of the container's visible RAM and this machine cannot afford that.
@@ -200,12 +200,21 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # M3: the gateway joined the saga, so it now needs the broker at startup like the other
+      # two - it declares its topics before its listener subscribes.
+      redpanda:
+        condition: service_healthy
     environment:
       <<: *jvm-env
       DB_URL: jdbc:postgresql://postgres:5432/gateway_db
       DB_USER: gateway
       DB_PASSWORD: gateway
+      KAFKA_BOOTSTRAP: redpanda:9092
       SERVER_PORT: "8083"
+      # Default to a gateway that always approves, so `compose up` gives a working happy path.
+      # The chaos suite turns these up at runtime via POST /admin/simulation.
+      GATEWAY_FAILURE_RATE: "0.0"
+      GATEWAY_LATENCY_MS: "50"
     ports:
       - "8083:8083"
     healthcheck: *health

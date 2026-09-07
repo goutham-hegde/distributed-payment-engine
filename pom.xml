@@ -27,6 +27,7 @@
 
     <modules>
         <module>common-events</module>
+        <module>common-messaging</module>
         <module>account-service</module>
         <module>payment-orchestrator</module>
         <module>payment-gateway</module>
@@ -43,6 +44,11 @@
             <dependency>
                 <groupId>com.dpe</groupId>
                 <artifactId>common-events</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.dpe</groupId>
+                <artifactId>common-messaging</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>

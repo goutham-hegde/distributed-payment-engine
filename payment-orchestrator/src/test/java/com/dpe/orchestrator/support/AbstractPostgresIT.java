@@ -23,7 +23,13 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         // No broker in these tests, so the listener container must not start. Left on, it
         // retries a connection it will never get, floods the log, and slows every test in the
         // class down behind its backoff. AbstractKafkaIT turns it back on.
-        "spring.kafka.listener.auto-startup=false"
+        "spring.kafka.listener.auto-startup=false",
+        // Both background timers off. A relay draining the outbox, or a sweeper compensating a
+        // saga, while a test is asserting on exactly those rows makes failures depend on thread
+        // scheduling. The tests that exercise them call drainBatch() and sweep() directly, so
+        // their assertions are deterministic.
+        "dpe.outbox.scheduled=false",
+        "dpe.saga.scheduled=false"
 })
 public abstract class AbstractPostgresIT {
 
@@ -41,7 +47,7 @@ public abstract class AbstractPostgresIT {
     protected JdbcTemplate jdbc;
 
     /**
-     * Empties both tables the consumer writes.
+     * Empties everything the consumer and the saga write.
      *
      * <p>Deliberately not a rollback-scoped test transaction: the code under test manages its own
      * transaction boundary, and that boundary is the thing being verified. Wrapping it in an outer
@@ -51,5 +57,9 @@ public abstract class AbstractPostgresIT {
     void resetConsumerState() {
         jdbc.execute("TRUNCATE TABLE inbox");
         jdbc.execute("TRUNCATE TABLE transfer_projection");
+        jdbc.execute("TRUNCATE TABLE outbox");
+        // One statement, because saga_steps references saga_instances which references transfers.
+        // Truncating them separately fails on the foreign keys no matter which order you pick.
+        jdbc.execute("TRUNCATE TABLE saga_steps, saga_instances, transfers");
     }
 }

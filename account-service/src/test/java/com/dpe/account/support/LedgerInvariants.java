@@ -65,13 +65,8 @@ public final class LedgerInvariants {
      * it is not part of {@link #assertAll}.
      */
     public static void assertI3TotalIsConserved(JdbcTemplate jdbc, long expectedTotalMinor) {
-        Long total = jdbc.queryForObject("""
-                SELECT COALESCE(SUM(balance_minor), 0)
-                  FROM accounts
-                 WHERE account_type = 'CUSTOMER'
-                """, Long.class);
-        assertThat(total)
-                .as("I3: total customer money must be conserved across the run")
+        assertThat(totalCustomerMoney(jdbc))
+                .as("I3: customer balances plus money held in flight must be conserved")
                 .isEqualTo(expectedTotalMinor);
     }
 
@@ -94,11 +89,25 @@ public final class LedgerInvariants {
                 .isEmpty();
     }
 
-    /** Total customer money, for capturing an I3 baseline before a run. */
+    /**
+     * Total customer money, for capturing an I3 baseline before a run.
+     *
+     * <p><b>Includes money sitting in ACTIVE holds</b>, and that term is what makes I3 hold
+     * across a saga rather than only at rest. A reserve moves an amount out of a customer balance
+     * and into the CLEARING account; CLEARING is not a CUSTOMER account, so without the second
+     * term this sum would drop by the reserved amount and I3 would fail on every in-flight
+     * transfer. The hold is what accounts for it.
+     *
+     * <p>Identical to the query in {@code scripts/verify-invariants.sh}, deliberately - what the
+     * test suite proves and what the chaos suite proves must not be allowed to diverge.
+     */
     public static long totalCustomerMoney(JdbcTemplate jdbc) {
-        Long total = jdbc.queryForObject(
-                "SELECT COALESCE(SUM(balance_minor), 0) FROM accounts WHERE account_type = 'CUSTOMER'",
-                Long.class);
+        Long total = jdbc.queryForObject("""
+                SELECT COALESCE((SELECT SUM(balance_minor) FROM accounts
+                                  WHERE account_type = 'CUSTOMER'), 0)
+                     + COALESCE((SELECT SUM(amount_minor) FROM holds
+                                  WHERE status = 'ACTIVE'), 0)
+                """, Long.class);
         return total == null ? 0L : total;
     }
 }

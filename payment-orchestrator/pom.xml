@@ -20,6 +20,13 @@
             <artifactId>common-events</artifactId>
         </dependency>
 
+        <!-- M3: the outbox relay and the inbox gate, shared by all three services. It brings
+             spring-boot-starter-data-jpa and spring-boot-starter-kafka with it. -->
+        <dependency>
+            <groupId>com.dpe</groupId>
+            <artifactId>common-messaging</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>

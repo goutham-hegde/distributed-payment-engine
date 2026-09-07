@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dpe</groupId>
+        <artifactId>distributed-payment-engine</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>common-messaging</artifactId>
+    <name>common-messaging</name>
+    <description>
+        The transactional outbox and the idempotent-consumer inbox, extracted at M3 so that all
+        three services can use them.
+
+        NOTE ON THE COUPLING THIS INTRODUCES, because it is the obvious objection: three services
+        now share a library, and a change to it forces all three to rebuild. That is a real cost
+        and it is accepted deliberately, because of WHAT is shared. This module holds
+        INFRASTRUCTURE - "how does a row become a Kafka record" - which is identical everywhere
+        and has no business meaning. It holds no domain type, no money, no saga state, and knows
+        nothing about accounts, transfers or charges.
+
+        The failure mode of shared libraries in microservices is a shared DOMAIN model, where
+        adding a field for one service's use silently changes another service's behaviour. That
+        cannot happen here: the payload is an opaque String on the way out and an opaque String
+        on the way in.
+
+        Each service still owns its own outbox and inbox TABLES, in its own database, created by
+        its own Flyway migration. The schema is duplicated on purpose - one shared table would be
+        a shared database, which is the coupling that database-per-service exists to prevent.
+        Only the code that drives those tables is shared.
+
+        See docs/adr/0004-shared-messaging-library.md.
+    </description>
+
+    <dependencies>
+        <!-- EventEnvelope and the header names. No domain types come with it. -->
+        <dependency>
+            <groupId>com.dpe</groupId>
+            <artifactId>common-events</artifactId>
+        </dependency>
+
+        <!-- The outbox and inbox are database tables; the relay claims rows FOR UPDATE. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!-- KafkaTemplate, ProducerRecord. Boot 4 folded spring-kafka into this starter. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-kafka</artifactId>
+        </dependency>
+
+        <!-- OutboxWriter serializes the envelope inside the business transaction. Declared
+             explicitly rather than leant on transitively: data-jpa does not bring Jackson, and
+             this module must build even in a service with no web starter on the classpath. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-json</artifactId>
+        </dependency>
+    </dependencies>
+
+    <!-- No spring-boot-maven-plugin: this is a library, not an application. Repackaging it
+         would produce an executable jar with no main class. -->
+
+</project>

@@ -81,6 +81,26 @@ spring:
         # background - which would publish a message the relay had already given up on.
         delivery.timeout.ms: 4000
 
+    # M3: this service now CONSUMES too - the saga commands the orchestrator issues to it.
+    consumer:
+      # One group for the whole service, so scaling out divides the partitions rather than
+      # duplicating the commands.
+      group-id: account-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Nothing is committed until AccountCommandHandler's transaction has. Auto-commit would
+      # acknowledge a ReserveFunds on a five-second timer with no idea whether the money moved.
+      enable-auto-commit: false
+      max-poll-records: 50
+      properties:
+        # A consumer must never conjure a topic. See KafkaTopicsConfig for the silent
+        # one-partition stall this prevents.
+        allow.auto.create.topics: false
+
+    listener:
+      ack-mode: manual_immediate
+
 # M2 relay tuning. See OutboxProperties for what each knob actually trades away.
 dpe:
   outbox:

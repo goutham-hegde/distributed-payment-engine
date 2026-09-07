@@ -43,4 +43,38 @@ public class KafkaTopicsConfig {
                 .replicas(1)
                 .build();
     }
+
+    /**
+     * M3: the orchestrator now produces to both command topics and consumes the gateway's event
+     * topic, so all four topics it touches are declared here.
+     *
+     * <p>Declaring the ones it produces to is not optional either. A producer that reaches an
+     * undeclared topic first creates it with the broker's defaults - one partition - and the
+     * consumer on the other side inherits that shape permanently. Every saga's messages would
+     * then be totally ordered across all transfers, which looks like it works and quietly
+     * serialises the whole system behind the slowest participant.
+     */
+    @Bean
+    NewTopic accountCommandsTopic() {
+        return TopicBuilder.name(Topics.ACCOUNT_COMMANDS)
+                .partitions(Topics.ACCOUNT_COMMANDS_PARTITIONS)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    NewTopic gatewayCommandsTopic() {
+        return TopicBuilder.name(Topics.GATEWAY_COMMANDS)
+                .partitions(Topics.GATEWAY_COMMANDS_PARTITIONS)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    NewTopic gatewayEventsTopic() {
+        return TopicBuilder.name(Topics.GATEWAY_EVENTS)
+                .partitions(Topics.GATEWAY_EVENTS_PARTITIONS)
+                .replicas(1)
+                .build();
+    }
 }
