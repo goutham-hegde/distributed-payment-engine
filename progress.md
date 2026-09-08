@@ -11,9 +11,10 @@ and what broke along the way. Newest entries at the bottom.
 | M1 | Ledger core — double-entry, `SELECT FOR UPDATE`, deadlock-safe lock ordering | ✅ **done** |
 | M2 | Transactional outbox + Kafka publishing + inbox dedup | ✅ **done** |
 | M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ✅ **done** |
-| M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ⬜ |
+| M4 | Idempotency keys + retry/backoff + Dead Letter Queue | 🚧 **in progress** |
 | M5 | JWT authentication and per-account authorization | ⬜ |
 | M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing | ⬜ |
+| M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ⬜ |
 | M7 | Chaos suite — 8 injected-failure scenarios | ⬜ |
 | M8 | Load test — k6 to 1,000 concurrent transfers | ⬜ |
 | M9 | Documentation, ADRs, README polish | ⬜ |
@@ -42,10 +43,41 @@ Redlock's safety depends on bounded clock drift and bounded GC pauses. If a proc
 process, and both proceed — a double charge, with the lock behaving exactly as specified. That
 risk is acceptable for a cache warm-up. It is not acceptable for money.
 
-So correctness rests on `UNIQUE (client_id, idempotency_key)` in Postgres: insert first, and treat
-a constraint violation as "duplicate — return the stored original response." ACID, no timing
+So correctness rests on `PRIMARY KEY (client_id, idempotency_key)` in Postgres: insert first, and
+treat a conflict as "duplicate — return the stored original response." ACID, no timing
 assumptions. Redis remains as a fast-path response cache and an anti-stampede lock, but it is
 **not load-bearing** — delete Redis and the system is still correct, only slower.
+
+There is a second reason, discovered while building it, that turns out to be the stronger one. A
+duplicate arriving while the first request is still in flight does not merely lose a race: Postgres
+**blocks** the second `INSERT ... ON CONFLICT DO NOTHING` on the first request's uncommitted index
+tuple until that transaction ends — replaying the stored response if it committed, and taking over
+the work if it rolled back. That is mutual exclusion between concurrent duplicates, with correct
+handoff on failure, out of an index. It is precisely what a distributed lock is usually reached
+for, without the lease, the TTL or the clock assumption. Full argument in
+`docs/adr/0002-idempotency.md`.
+
+### A demo console, and why it comes after observability
+
+The system is asynchronous and its most interesting behaviour is invisible from an HTTP response:
+money sitting in a `CLEARING` hold, a command travelling from one service's outbox to another
+service's inbox, a saga being compensated by a timeout sweeper nobody called. All of it is already
+recorded — `saga_steps` deliberately writes two rows per step, one when the command is issued and
+one when its reply lands, so the gap between them is the step latency — but reading it means
+reading three databases.
+
+M6.5 renders it: a transfer tracker showing the stage timeline and the compensation branch, the
+balances at each stage, and the message trail by message id; a system view with outbox backlog,
+in-flight sagas, DLQ depth and the five invariants as five lights; and controls onto the gateway's
+existing simulation endpoint, so a decline can be forced and the compensation watched.
+
+It is sequenced after M6 rather than earlier for two reasons. Tracing has to exist first, or the
+per-transfer view cannot link out to the trace that explains it. And it has to exist before M7, or
+the chaos scenarios are verified by reading logs when they could be watched.
+
+The nginx container in front of it reverse-proxies all three services under one origin rather than
+having the browser call three ports with CORS enabled on each. That is one place to configure
+instead of three, and it is closer to how an edge actually sits in front of services.
 
 ### At-least-once delivery, not "exactly-once"
 
@@ -843,3 +875,216 @@ reserve did in fact succeed and only its reply was lost, that leaves an `ACTIVE`
 saga — I3 still balances and the money is accounted for, but it is stranded and no timeout will
 find it. The fix is a reconciliation job that scans for holds with no corresponding saga; it is out
 of scope here and is called out in `SagaOrchestrator.onTimeout`.
+
+---
+
+### M4 (part 1) — The idempotency gate, specified · 2026-09-08
+
+**Goal**
+
+Everything the API-edge idempotency gate needs to exist: the table, the statements it is built
+from, the Redis client, the HTTP contract, and the specification written as failing tests. The
+gate itself and the Redis cache are the next commit — the same split M3 used, and for the same
+reason: the specification is easier to argue about before there is an implementation to defend.
+
+**Decisions**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Where the guarantee lives | `PRIMARY KEY (client_id, idempotency_key)` on `idempotency_records` | ACID, no clock assumptions. The pair is the identity of the row, not a UNIQUE index beside a surrogate id — a surrogate lets a second row for the same pair be inserted by any code path that forgets to check. ADR 0002. |
+| Redis's role | Response cache and `SET NX PX` anti-stampede lock, both optional | Placed where its failure mode is harmless. A lease measured in time cannot protect a resource that does not check the lease. |
+| Claim and work | One transaction — the claim, the transfer, the saga, the outbox row and the stored response all commit together | Either split leaves a broken state: a claimed key pointing at a transfer that does not exist (and every retry refused forever), or a transfer whose key was never recorded (and the retry makes a second one). |
+| The transaction boundary | An injected `TransactionTemplate` rather than a second `@Transactional` method | Self-invocation goes down the `this` reference and never reaches the proxy, so the transaction silently does not exist. It passes every single-threaded test. |
+| An `IN_PROGRESS` state column | Not included | The work is a local commit, so the insert and the completion share a transaction and any committed row already has its response. A state column that is always in the same state is machinery pretending to be a design. The migration records the case that would need one: work that happens outside the transaction, such as a synchronous call to an external provider. |
+| The replayed body | The stored JSON, verbatim | Re-rendering from current state would answer a retry `COMPLETED` where the original answered `PENDING` — two different answers to what the client believes is one request, which is the ambiguity idempotency exists to remove. |
+| A key reused with a different body | `409`, never a replay | Replaying answers the second request with the first request's receipt: a 5,000 transfer confirmed with the record of a 300 one, silently, and in the direction the caller is happy to believe. |
+| A request that fails validation | Rolls back the claim; the key remains usable | Caching failures (as some payment APIs do) requires claiming the key in a separate transaction that survives the rollback, plus a decision about what to answer a duplicate arriving mid-flight. The smaller mechanism was chosen deliberately rather than by omission. |
+| `Idempotency-Key` header | Required; `400` when absent | This endpoint moves money. A caller without a key has no safe way to retry, and accepting the request anyway lets it assume a guarantee it never asked for. |
+| `X-Client-Id` header | Required; replaced by the JWT subject in M5 | Keys live in per-client namespaces. A shared namespace makes a common key like `"1"` collide, and a collision does not fail — it hands one client another client's response body. |
+| Fingerprint input | The parsed fields, separator-joined, SHA-256 | Hashing raw bytes turns key order, whitespace and `30000` vs `30000.0` into false conflicts. Omitting the separator lets account `...ab` sending `1` and account `...a` sending `b1` hash identically. |
+| Redis in Compose | `depends_on: service_started`, no volume, `maxmemory 64mb`, `allkeys-lru` | `service_healthy` would make the cache a hard startup dependency in the easiest place to introduce one by accident. A persisted cache can disagree with the database after a restore; empty on boot is the correct state. The default `noeviction` policy makes a full Redis refuse writes, which this design survives but silently. |
+
+**Built**
+
+- `V3__idempotency.sql` — `idempotency_records`, with the reasoning for each column in the file.
+- `IdempotencyRecord` (read-only entity, composite `@IdClass`) and `IdempotencyRepository`:
+  `claim` (`INSERT ... ON CONFLICT DO NOTHING`), `complete`, and a bounded `deleteExpired`.
+- `IdempotencyProperties` and `IdempotencyConfig` — retention, cache TTL, lock TTL, lock wait, and
+  the `TransactionTemplate` that makes the transaction boundary visible.
+- `RequestFingerprint`, `CachedResponse`, `IdempotentOutcome`, `IdempotencyConflictException`.
+- `TransferController` now requires both headers and returns the stored response body as raw JSON
+  with an `Idempotency-Replayed` header; `ApiExceptionHandler` maps the 409 and the missing-header
+  400 into the existing error shape.
+- Redis: `spring-boot-starter-data-redis` with 200ms client timeouts, and `redis:7-alpine` in
+  Compose.
+- 16 new tests across `IdempotencyGateTest`, `IdempotencyCacheTest` and
+  `IdempotencyWithoutRedisTest`, plus `AbstractRedisIT`.
+- `docs/adr/0002-idempotency.md`.
+
+`IdempotencyGate.execute` and the four methods of `IdempotencyCache` are stubs that throw. The
+tests that specify them fail with `UnsupportedOperationException`, so the build distinguishes "not
+written yet" from "written wrong".
+
+**The test that justifies the architecture**
+
+`IdempotencyWithoutRedisTest` enables the cache and points it at a port with nothing behind it, so
+every `lookup`, `store`, `acquireLock` and `releaseLock` fails on the request path under
+concurrency. It then asserts that 100 concurrent identical requests still produce exactly one
+transfer and exactly one `ReserveFunds` command.
+
+The failure it exists to catch is a common one: a cache added in front of a database with its
+exceptions left to propagate does not degrade, it **amplifies** — the system now fails whenever
+*either* component is down, so a component added to make things faster has made them less
+available. "Redis is not load-bearing" is a claim that should be executable, and this is what makes
+it so.
+
+**What broke**
+
+1. **An `@IdClass` cannot be a record.** The persistence provider instantiates the id class through
+   a public no-argument constructor, and a record has only its canonical one. It fails at
+   bootstrap, not at the first query.
+
+2. **There is no `org.testcontainers:testcontainers-redis` module.** Redis was never an official
+   Testcontainers module; the widely-used artifact is third-party. It is not needed — Boot's
+   `RedisContainerConnectionDetailsFactory` accepts any container whose *image name* is `redis`, so
+   `@ServiceConnection` on a plain `GenericContainer` wires `spring.data.redis.*` correctly. Note
+   the counterpart to M1's trap: `GenericContainer<SELF>` **is** still generic in Testcontainers
+   2.x, unlike `PostgreSQLContainer`, so the diamond compiles for one and not the other.
+
+3. **`@SpringBootTest` properties do not merge down a class hierarchy.** Spring finds the first
+   `@SpringBootTest` in the hierarchy and uses it alone, so a subclass that re-declares it must
+   repeat the parent's properties in full. Omitting one silently restores a production default —
+   here, a background outbox relay racing the assertions.
+
+4. **A primitive `boolean` in a `@ConfigurationProperties` record binds to `false` when the key is
+   absent**, which would have shipped the fast path silently disabled anywhere the key was not set.
+   Boxed to `Boolean` so "absent" and "false" are distinguishable, then defaulted to true.
+
+5. **Spring Data Redis attempted to claim the JPA repositories.** Adding the starter enables Redis
+   repository scanning, which inspects every repository in the service and logs five "could not
+   safely identify store assignment" lines on each boot. Disabled via
+   `spring.data.redis.repositories.enabled: false` rather than tolerated: multi-store scanning
+   resolves ambiguity by guessing, and a wrong guess would be silent.
+
+6. **`TRUNCATE transfers` began failing on a foreign key** once `idempotency_records` referenced
+   it. Added to the same single `TRUNCATE` statement as the saga tables — with foreign keys, no
+   ordering of separate truncates works.
+
+**Verified**
+
+```
+./mvnw -pl payment-orchestrator -am test -Dtest=InboxDedupTest -Dsurefire.failIfNoSpecifiedTests=false
+  Tests run: 4, Failures: 0, Errors: 0, Skipped: 0     BUILD SUCCESS
+```
+
+The check that mattered: Flyway applied V3 and Hibernate's `ddl-auto: validate` accepted the new
+entity against it, `jsonb` column and composite key included.
+
+```
+./mvnw -pl payment-orchestrator -am test -Dtest=IdempotencyCacheTest -Dsurefire.failIfNoSpecifiedTests=false
+  Tests run: 6, Failures: 0, Errors: 6
+  java.lang.UnsupportedOperationException: M4: SET NX PX with a fresh token, ...
+```
+
+Six errors, every one from an unimplemented method and none from the context — so the Redis
+container starts, the service connection wires it, and the application boots with the cache
+enabled. The only thing missing is the implementation.
+
+**Open / next**
+
+- Implement `IdempotencyGate.execute` and `IdempotencyCache`; done when all 16 new tests pass,
+  including both 100-thread cases.
+- M4 part 2: retry with exponential backoff and jitter, `DefaultErrorHandler` with
+  `DeadLetterPublishingRecoverer`, a DLQ replay endpoint, and the expiry sweep for
+  `idempotency_records`. M2's caveat still stands — a decompression failure happens inside
+  `poll()`, below every error handler, and no dead-letter topic can reach it.
+- Carried from M3: a reconciliation job for holds left with no live saga.
+- `transfer_projection` is now redundant with `transfers`, but its `apply_count` column is the only
+  thing in the schema that can distinguish "the inbox worked" from "a primary key happened to save
+  us". Whether that is worth keeping a redundant table for is a decision for part 2.
+
+---
+
+### M4 (part 1b) — The gate and the cache, implemented · 2026-09-09
+
+**Goal**
+
+Turn the 16 failing tests from part 1b's specification into 16 passing ones: write
+`IdempotencyGate.execute` and the four methods of `IdempotencyCache`, and keep the property the
+specification exists to defend — that removing Redis leaves the system correct.
+
+**Decisions**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| What `acquireLock` returns | A sealed `LockOutcome` — `Acquired(token)`, `HeldByAnother`, `Unavailable` — not `Optional<String>` | Three outcomes, and the caller must branch differently on each. See "What broke" #1: collapsing two of them into `Optional.empty()` compiles, passes every test, and adds a fixed latency penalty to every request whenever the cache is off or Redis is down. |
+| Release under Lua, not `DEL` | `GET`-compare-`DEL` in one script | A holder that stalls past the lease wakes up and deletes whichever lock is now there — its successor's. Redis is single-threaded, so a script runs with nothing interleaved, which is what makes compare-and-delete atomic. |
+| Where the fingerprint is checked | On both replay paths — Redis and Postgres | Two routes to one decision is two places to forget the check, and the fast one is the one that runs under load. |
+| Cache written after commit, lock released after that | Ordering, not preference | Storing before the commit lets a rollback leave Redis asserting a transfer that does not exist, and the fast path then serves that assertion to every retry — a lie Postgres can no longer correct, because nothing reaches Postgres any more. Releasing last means the loser wakes to a populated cache. |
+
+**Built**
+
+- `IdempotencyGate.execute` — fingerprint, cache fast path, advisory lock, one transaction holding
+  the claim and the work, then store-and-release.
+- `IdempotencyCache` — `lookup`, `store`, `acquireLock`, `releaseLock`, plus the sealed
+  `LockOutcome`. Every method catches broadly and degrades to "no answer".
+- `IdempotencyCacheTest` updated to assert the `LockOutcome` variant rather than presence, so the
+  distinction the type exists to carry is itself under test.
+
+**What broke**
+
+1. **`Optional.empty()` was the wrong return type for a three-outcome operation, and no test could
+   see it.** `acquireLock` returned empty for "another caller holds the lock", "Redis is
+   unreachable" and "the cache is switched off". The gate could only branch on empty, so it waited
+   for a winner in all three cases — but in the last two there is no cache for a winner to publish
+   into, so `waitForWinner` polled a lookup that returns empty by construction until its deadline
+   and then returned null. Net effect: **with the cache off or Redis down, every write request
+   slept `lockWait` (500 ms) before it was allowed to reach Postgres.**
+
+   Nothing failed. `IdempotencyGateTest` runs with `dpe.idempotency.cache=false` and all seven of
+   its tests were paying the penalty and passing. It is the mirror image of the failure
+   `IdempotencyWithoutRedisTest` was built to catch — a cache that degrades the system when absent
+   — except expressed as latency instead of as an exception, and latency is invisible to an
+   assertion that only checks the answer. Fixed by making the three outcomes three types.
+
+   The general lesson is about `Optional` specifically: it models "a value or nothing", and it is
+   the wrong shape the moment "nothing" has more than one cause that callers must distinguish.
+
+2. **Changing the signature broke two tests at *runtime*, not at compile time.** `mvn verify`
+   reported `Unresolved compilation problems` inside surefire rather than a compiler error, because
+   the two call sites that still assigned to `Optional<String>` were compiled by ecj into classes
+   that throw on entry. A test source file that does not compile can therefore look like a test
+   failure, in a build that otherwise says nothing.
+
+**Verified**
+
+```
+./mvnw -B -ntp verify
+
+Tests run: 36, Failures: 0, Errors: 0, Skipped: 0     account-service
+Tests run: 35, Failures: 0, Errors: 0, Skipped: 0     payment-orchestrator
+Tests run:  6, Failures: 0, Errors: 0, Skipped: 0     payment-gateway
+BUILD SUCCESS
+```
+
+The two that carry the milestone:
+
+```
+IdempotencyGateTest.oneHundredConcurrentRetriesProduceExactlyOneTransfer      PASSED
+IdempotencyWithoutRedisTest.theLockWasNeverTheGuarantee                       PASSED
+```
+
+The second runs 100 concurrent identical requests with Redis pointed at a closed port, so every
+`lookup`, `store`, `acquireLock` and `releaseLock` on the request path fails — and still produces
+exactly one transfer and exactly one `ReserveFunds` command. The Redis lock is an optimization,
+and this is the executable form of that claim.
+
+**Open / next**
+
+- M4 part 2, unchanged from part 1a: retry with exponential backoff and jitter,
+  `DefaultErrorHandler` with `DeadLetterPublishingRecoverer`, a DLQ replay endpoint, and the expiry
+  sweep for `idempotency_records`.
+- The DLQ replay endpoint needs a decision made before it is written: replaying a dead-lettered
+  message is a second delivery of a message the inbox may already have recorded, so replay either
+  goes through the inbox (and may be a no-op, which the operator must be told) or around it (and is
+  no longer idempotent).

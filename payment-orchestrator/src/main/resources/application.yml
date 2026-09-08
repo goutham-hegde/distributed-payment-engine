@@ -23,6 +23,28 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+  # M4: the idempotency fast path. NOT a dependency - see IdempotencyCache. The timeouts are
+  # short on purpose: this client sits on the request path, and a Redis that has become slow must
+  # degrade into a cache miss within milliseconds rather than adding its latency to every write.
+  # A long timeout here would make an optional component able to take the API down.
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 200ms
+      connect-timeout: 200ms
+      repositories:
+        # Off, because there are none and there never will be. Left on, Spring Data Redis scans
+        # for repositories at startup and inspects every JPA repository in this service trying to
+        # decide whether it belongs to Redis - which is five INFO lines of "could not safely
+        # identify store assignment" on every boot, for a store that holds no entities at all.
+        #
+        # Worth switching off rather than tolerating: multi-store repository scanning resolves
+        # ambiguity by GUESSING, and the day someone adds an entity that both stores could claim,
+        # the guess is silent. Naming the one store that owns repositories here removes the
+        # ambiguity instead of hoping it stays benign.
+        enabled: false
+
   # M2: consumes the events account-service relays out of its outbox.
   # M3: also PRODUCES, because the saga issues commands through an outbox of its own.
   kafka:
@@ -124,6 +146,22 @@ dpe:
     sweep-batch-size: 100
     # Tests turn this off and call sweep() directly, so a background thread cannot race them.
     scheduled: true
+
+  # M4. Every one of these is policy, not tuning - see IdempotencyProperties.
+  idempotency:
+    # How long a key is honoured. Published API contract: a retry after this is a new payment.
+    retention: 24h
+    # Redis keeps its copy no longer than Postgres keeps the row, or the cache would answer for
+    # a key the database has already forgotten.
+    cache-ttl: 24h
+    # The master switch. Off must change nothing but latency; the tests prove it.
+    cache: true
+    # Short lease. It is an optimization, and a crashed holder must not block its own retries for
+    # longer than one request takes.
+    lock-ttl: 3s
+    # How long a caller that lost the lock waits for the winner answer before going to Postgres
+    # regardless. Never refuse, never wait forever.
+    lock-wait: 500ms
 
 server:
   port: ${SERVER_PORT:8081}

@@ -66,6 +66,21 @@
             <artifactId>spring-boot-starter-kafka</artifactId>
         </dependency>
 
+        <!-- M4: the idempotency fast path and the anti-stampede lock. Brings Lettuce and
+             StringRedisTemplate. Note what it is NOT here for: correctness. The guarantee is the
+             PRIMARY KEY on idempotency_records, and this service must stay correct with Redis
+             switched off - IdempotencyCacheTest asserts exactly that.
+
+             Boot 4 kept the Boot 3 coordinate for this one; unlike spring-kafka, there was never
+             a `spring-data-redis` starter to rename. The Testcontainers side has no module at
+             all - `org.testcontainers:testcontainers-redis` does not exist - so the tests use a
+             plain GenericContainer, which the Redis connection-details factory in
+             spring-boot-data-redis accepts by image name. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc-test</artifactId>

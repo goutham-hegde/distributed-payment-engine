@@ -1,8 +1,10 @@
 # M0 stack: PostgreSQL plus the three services.
 # M2 adds Redpanda - the transactional outbox needs somewhere to relay messages to.
+# M4 adds Redis - the idempotency fast path, and the only container here that can be
+# killed without the system becoming incorrect.
 #
-# Redis arrives at M4, Prometheus/Grafana/Jaeger at M6 - each container shows up in
-# the commit that first needs it, so nothing here is unexplained.
+# Prometheus/Grafana/Jaeger arrive at M6 - each container shows up in the commit that
+# first needs it, so nothing here is unexplained.
 #
 # Run from the repo root:  docker compose -f infra/docker-compose.yml up -d
 #                          docker compose -f infra/docker-compose.yml --profile kafka up -d
@@ -145,6 +147,47 @@ services:
         limits:
           memory: 1G
 
+  # M4. The idempotency fast path and the anti-stampede lock, and NOTHING that the system's
+  # correctness rests on: the guarantee is the PRIMARY KEY on idempotency_records. That claim is
+  # meant to be tested, not asserted - `docker compose stop redis` and the API keeps answering,
+  # keeps deduplicating retries, and gets slower. If it ever does anything else, the design has
+  # drifted and IdempotencyCache is the place to look.
+  #
+  # Deliberately no volume. This data is a copy of rows in Postgres; persisting it across
+  # restarts would buy a warm cache in exchange for a store that can disagree with the database
+  # after a restore. Empty on boot is the correct state for a cache.
+  redis:
+    image: redis:7-alpine
+    container_name: dpe-redis
+    command:
+      # No RDB snapshots and no AOF. Same reasoning as the missing volume, and it also keeps
+      # Redis off the disk entirely on a machine where Postgres wants all of it.
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      # A hard ceiling, because an unbounded cache on a 16 GB laptop is a memory leak with good
+      # intentions. allkeys-lru rather than the default noeviction: when full, a cache must
+      # forget something, not start refusing writes. noeviction would make `SET` fail, which the
+      # gate survives - it just stops caching - but silently and forever.
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
   payment-orchestrator:
     build:
       <<: *build-ctx
@@ -156,12 +199,20 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      # service_started, NOT service_healthy, and the difference is the design in one line. The
+      # orchestrator must boot and serve requests with Redis missing entirely; making startup
+      # wait on a healthy Redis would turn the cache into a hard dependency in the one place it
+      # is easiest to do by accident.
+      redis:
+        condition: service_started
     environment:
       <<: *jvm-env
       DB_URL: jdbc:postgresql://postgres:5432/payments_db
       DB_USER: payments
       DB_PASSWORD: payments
       KAFKA_BOOTSTRAP: redpanda:9092
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
       SERVER_PORT: "8081"
     ports:
       - "8081:8081"
