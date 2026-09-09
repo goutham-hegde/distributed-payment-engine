@@ -89,15 +89,17 @@ public class SagaOrchestrator {
     private final TransferRepository transfers;
     private final OutboxWriter outbox;
     private final SagaProperties properties;
+    private final SagaMetrics metrics;
 
     public SagaOrchestrator(SagaInstanceRepository sagas, SagaStepRepository steps,
                             TransferRepository transfers, OutboxWriter outbox,
-                            SagaProperties properties) {
+                            SagaProperties properties, SagaMetrics metrics) {
         this.sagas = sagas;
         this.steps = steps;
         this.transfers = transfers;
         this.outbox = outbox;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     /**
@@ -121,6 +123,7 @@ public class SagaOrchestrator {
                         transfer.getCurrency(), transfer.getInitiatedBy()));
 
         recordStep(saga, STEP_RESERVE, StepOutcome.STARTED, messageId, null);
+        metrics.sagaStarted();
         return saga;
     }
 
@@ -160,7 +163,7 @@ public class SagaOrchestrator {
 
         // The caller is told why in the vocabulary the participant used, not one invented here.
         failTransfer(saga, event.reason());
-        saga.finish(SagaStatus.FAILED, event.reason());
+        finish(saga, SagaStatus.FAILED, event.reason());
         recordStep(saga, STEP_RESERVE, StepOutcome.FAILED, messageId, event.detail());
     }
 
@@ -211,7 +214,7 @@ public class SagaOrchestrator {
         }
 
         transfers.findById(saga.getTransferId()).ifPresent(Transfer::complete);
-        saga.finish(SagaStatus.COMPLETED, null);
+        finish(saga, SagaStatus.COMPLETED, null);
         recordStep(saga, STEP_COMMIT, StepOutcome.SUCCEEDED, messageId, null);
     }
 
@@ -230,7 +233,7 @@ public class SagaOrchestrator {
         }
 
         failTransfer(saga, event.reason());
-        saga.finish(SagaStatus.COMPENSATED, event.reason());
+        finish(saga, SagaStatus.COMPENSATED, event.reason());
         recordStep(saga, STEP_RELEASE, StepOutcome.SUCCEEDED, messageId, event.reason());
     }
 
@@ -262,7 +265,7 @@ public class SagaOrchestrator {
                         + "succeed, its hold is now orphaned and needs reconciliation.",
                         saga.getId());
                 failTransfer(saga, ReleaseFunds.SAGA_TIMEOUT);
-                saga.finish(SagaStatus.FAILED, "timed out before the reserve replied");
+                finish(saga, SagaStatus.FAILED, "timed out before the reserve replied");
                 recordStep(saga, STEP_RESERVE, StepOutcome.TIMED_OUT, null,
                         "no reply before the deadline");
             }
@@ -285,6 +288,23 @@ public class SagaOrchestrator {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /**
+     * Ends a saga, and records that it ended.
+     *
+     * <p>Every terminal transition goes through here rather than calling
+     * {@link SagaInstance#finish} directly, and that is the point: there are four of them, in four
+     * branches, and a fifth added later would otherwise be invisible to
+     * {@code dpe.saga.terminal} - the compensation rate would quietly under-report and nobody
+     * would find out from a test. One door, so the meter cannot be forgotten.
+     *
+     * <p>{@link SagaMetrics} defers the actual increment to {@code afterCommit}; see the reasoning
+     * there. This method being called is not yet an event that happened.
+     */
+    private void finish(SagaInstance saga, SagaStatus terminal, String failureReason) {
+        saga.finish(terminal, failureReason);
+        metrics.sagaFinished(terminal, saga.getCreatedAt());
+    }
 
     /** Loads the saga for a transfer with a row lock. See the repository for why it is required. */
     private SagaInstance load(UUID transferId) {

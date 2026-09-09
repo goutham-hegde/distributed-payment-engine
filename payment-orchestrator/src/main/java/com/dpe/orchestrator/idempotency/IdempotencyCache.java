@@ -3,6 +3,8 @@ import java.util.List;
 import java.util.UUID;
 import org.springframework.data.redis.core.script.RedisScript;
 import java.util.Optional;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -90,11 +92,36 @@ public class IdempotencyCache {
     private final ObjectMapper objectMapper;
     private final IdempotencyProperties properties;
 
+    /**
+     * M6. Three outcomes, and the whole point of the metric is that they are three and not two.
+     *
+     * <p>{@code hit} and {@code miss} are the cache doing its job. {@code unavailable} is Redis
+     * switched off or Redis throwing - and it is counted separately because the system is
+     * REQUIRED to stay correct in that state, only slower. That claim is meant to be falsifiable:
+     * {@code docker compose stop redis} should drive this to {@code unavailable} and change
+     * nothing on any other panel except latency. A cache that lumps "miss" and "broken" together
+     * cannot show you that, and it is the same distinction the M4 LockOutcome refactor existed to
+     * make - {@code Optional.empty()} carrying two causes the caller has to tell apart.
+     */
+    private final Counter hits;
+    private final Counter misses;
+    private final Counter unavailable;
+
     public IdempotencyCache(StringRedisTemplate redis, ObjectMapper objectMapper,
-                            IdempotencyProperties properties) {
+                            IdempotencyProperties properties, MeterRegistry registry) {
         this.redis = redis;
         this.objectMapper = objectMapper;
         this.properties = properties;
+        this.hits = counter(registry, "hit");
+        this.misses = counter(registry, "miss");
+        this.unavailable = counter(registry, "unavailable");
+    }
+
+    private static Counter counter(MeterRegistry registry, String result) {
+        return Counter.builder("dpe.idempotency.cache")
+                .tag("result", result)
+                .description("Idempotency fast-path lookups by outcome")
+                .register(registry);
     }
     private static String responseKey(String clientId, String key) {
         return RESPONSE_PREFIX + clientId + ":" + key;
@@ -110,16 +137,31 @@ public class IdempotencyCache {
      */
     public Optional<CachedResponse> lookup(String clientId, String key) {
         if (!properties.cache()) {
+            // Switched off is not a miss. A miss says "the cache answered and had nothing";
+            // this says "there is no cache", and an operator reading a 0% hit ratio needs to
+            // know which of those they are looking at.
+            unavailable.increment();
             return Optional.empty();
         }
         try {
             String json = redis.opsForValue().get(responseKey(clientId, key));
             if (json == null) {
+                misses.increment();
                 return Optional.empty();
             }
-        return Optional.of(objectMapper.readValue(json, CachedResponse.class));
+            // Parse BEFORE counting the hit. Counted first, a stored value that no longer
+            // deserialises - an old shape left over across a deploy - would increment `hit` and
+            // then fall into the catch below and increment `unavailable` as well, so one lookup
+            // would appear twice and the hit ratio would read above what actually happened.
+            CachedResponse response = objectMapper.readValue(json, CachedResponse.class);
+            hits.increment();
+            return Optional.of(response);
         } catch (Exception e) {
             log.debug("Idempotency cache lookup failed for {}:{}", clientId, key, e);
+            // Redis threw, or the stored JSON no longer parses. Both mean the fast path is not
+            // available for this request, and neither means the request is in trouble: the
+            // caller falls through to the Postgres claim, which is where the guarantee lives.
+            unavailable.increment();
             return Optional.empty();
         }
     }

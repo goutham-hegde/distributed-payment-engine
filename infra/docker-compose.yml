@@ -36,8 +36,11 @@ x-build-ctx: &build-ctx
   context: ..
   dockerfile: Dockerfile
 
+# M6 moved this. The actuator now listens on MANAGEMENT_PORT, not SERVER_PORT, so a probe pointed
+# at the application port gets a 404 - which Compose reports only as "unhealthy", with no hint that
+# the endpoint merely moved. The same correction is due for the K8s probes at M10.
 x-health: &health
-  test: ["CMD-SHELL", "wget -qO- http://localhost:$${SERVER_PORT}/actuator/health | grep -q '\"status\":\"UP\"'"]
+  test: ["CMD-SHELL", "wget -qO- http://localhost:$${MANAGEMENT_PORT}/actuator/health | grep -q '\"status\":\"UP\"'"]
   interval: 10s
   timeout: 5s
   retries: 12
@@ -228,6 +231,9 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       SERVER_PORT: "8081"
+      # M6. Deliberately absent from every `ports:` block: reachable from prometheus
+      # across this network and from nowhere else. See SecurityConfig#managementChain.
+      MANAGEMENT_PORT: "9091"
     ports:
       - "8081:8081"
     healthcheck: *health
@@ -251,6 +257,9 @@ services:
       DB_PASSWORD: accounts
       KAFKA_BOOTSTRAP: redpanda:9092
       SERVER_PORT: "8082"
+      # M6. Deliberately absent from every `ports:` block: reachable from prometheus
+      # across this network and from nowhere else. See SecurityConfig#managementChain.
+      MANAGEMENT_PORT: "9092"
     ports:
       - "8082:8082"
     healthcheck: *health
@@ -276,6 +285,9 @@ services:
       DB_PASSWORD: gateway
       KAFKA_BOOTSTRAP: redpanda:9092
       SERVER_PORT: "8083"
+      # M6. Deliberately absent from every `ports:` block: reachable from prometheus
+      # across this network and from nowhere else. See SecurityConfig#managementChain.
+      MANAGEMENT_PORT: "9093"
       # Default to a gateway that always approves, so `compose up` gives a working happy path.
       # The chaos suite turns these up at runtime via POST /admin/simulation.
       GATEWAY_FAILURE_RATE: "0.0"
@@ -285,5 +297,96 @@ services:
     healthcheck: *health
     deploy: *mem-limit
 
+  # ---------------------------------------------------------------------------------------
+  # M6: observability. Both containers are pure consumers of what the services already
+  # publish - stopping either one changes nothing about how a payment behaves, which is the
+  # test of whether monitoring has quietly become load-bearing.
+  # ---------------------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: dpe-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Retention is a statement about which questions can still be asked, and it is the same
+      # kind of statement as the one on idempotency_records: bounded on purpose, and bounded
+      # where the boundary is defensible. 24h covers "what happened during the chaos run I did
+      # this morning" and nothing longer, which is all a laptop should promise.
+      - --storage.tsdb.retention.time=24h
+      # NOT passing --web.enable-lifecycle, rather than passing it as false. Prometheus 3's
+      # flag parser rejects `--web.enable-lifecycle=false` outright ("unexpected false") - these
+      # are presence flags, and the negative form is `--no-web.enable-lifecycle`. Absent is
+      # already the secure default: no reload endpoint, and no admin API that could delete series.
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      # service_started, not service_healthy. Prometheus must come up and SHOW targets as down;
+      # waiting for the services would hide exactly the startup window worth watching.
+      payment-orchestrator:
+        condition: service_started
+      account-service:
+        condition: service_started
+      payment-gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy | grep -q Healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    container_name: dpe-grafana
+    environment:
+      # Anonymous viewer with the Admin role, and no login page. This is a laptop demo whose
+      # entire audience is the person running it; a password prompt in front of a dashboard of
+      # data that is already unauthenticated on the Compose network protects nothing and gets
+      # in the way of the screenshot this milestone exists to produce.
+      #
+      # It is also exactly the kind of thing that must never be copied to a deployment, so it
+      # is stated here rather than hidden in a volume: GF_AUTH_ANONYMOUS_ORG_ROLE=Admin means
+      # anyone who can reach port 3000 can edit and query. Only true because port 3000 is
+      # reachable from this machine alone.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Land on the payments dashboard rather than an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/dpe-payments.json
+      # Nothing here should phone home from a portfolio project.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q '\"database\": *\"ok\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

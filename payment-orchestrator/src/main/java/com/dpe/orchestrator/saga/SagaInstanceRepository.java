@@ -62,6 +62,31 @@ public interface SagaInstanceRepository extends JpaRepository<SagaInstance, UUID
                                     @Param("maxAttempts") int maxAttempts,
                                     @Param("batchSize") int batchSize);
 
+    /**
+     * M6: in-flight sagas grouped by state, for {@code dpe.saga.inflight}.
+     *
+     * <p>The live form of invariant I4, and more useful than {@link #countNonTerminal()} because
+     * the SHAPE names the broken hop. STARTED piling up means account-service is not replying;
+     * RESERVED piling up means the gateway is not answering; COMPENSATING piling up means the
+     * release command is not landing. A single total says only "something is wrong".
+     *
+     * <p>Native, and the status list is written out rather than derived from
+     * {@link SagaStatus#isTerminal()}, for exactly the reason given on {@link #claimExpired}: SQL
+     * cannot call Java, and this predicate must match {@code idx_saga_instances_in_flight}
+     * character for character or the planner ignores the partial index and this degrades to a
+     * sequential scan over every saga ever run - on a timer, forever. That makes this the FIFTH
+     * place the terminal set is written down; they change together or I4 stops meaning anything.
+     *
+     * @return rows of {@code [status, count]}
+     */
+    @Query(value = """
+            SELECT status, COUNT(*)
+            FROM saga_instances
+            WHERE status NOT IN ('COMPLETED', 'COMPENSATED', 'FAILED')
+            GROUP BY status
+            """, nativeQuery = true)
+    List<Object[]> countInFlightByStatus();
+
     /** Invariant I4, as a query. Zero at rest; anything else means money may be stranded. */
     @Query("select count(s) from SagaInstance s where s.status not in "
             + "(com.dpe.orchestrator.saga.SagaStatus.COMPLETED, "

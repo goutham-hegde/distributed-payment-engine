@@ -3,7 +3,7 @@ package com.dpe.account.saga;
 import com.dpe.events.CommitFunds;
 import com.dpe.events.ReleaseFunds;
 import com.dpe.events.ReserveFunds;
-import com.dpe.messaging.inbox.InboxRepository;
+import com.dpe.messaging.inbox.InboxGate;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,7 +27,7 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <p>Because then it is impossible to forget. A gate replicated into three business methods is
  * three chances to omit it, and the omission is invisible until a duplicate delivery double-spends
- * in production. Here there is exactly one call to {@link InboxRepository#insertIfAbsent} and
+ * in production. Here there is exactly one call to {@link InboxGate#claim} and
  * every command passes through it.
  */
 @Component
@@ -35,10 +35,10 @@ public class AccountCommandHandler {
 
     private static final Logger log = LoggerFactory.getLogger(AccountCommandHandler.class);
 
-    private final InboxRepository inbox;
+    private final InboxGate inbox;
     private final ReservationService reservations;
 
-    public AccountCommandHandler(InboxRepository inbox, ReservationService reservations) {
+    public AccountCommandHandler(InboxGate inbox, ReservationService reservations) {
         this.inbox = inbox;
         this.reservations = reservations;
     }
@@ -50,7 +50,7 @@ public class AccountCommandHandler {
      */
     @Transactional
     public boolean handle(UUID messageId, String topic, String eventType, Object command) {
-        if (inbox.insertIfAbsent(messageId, topic, eventType) == 0) {
+        if (!inbox.claim(messageId, topic, eventType)) {
             return false;
         }
 
@@ -85,6 +85,6 @@ public class AccountCommandHandler {
      */
     @Transactional
     public boolean skip(UUID messageId, String topic, String eventType) {
-        return inbox.insertIfAbsent(messageId, topic, eventType) != 0;
+        return inbox.claim(messageId, topic, eventType);
     }
 }

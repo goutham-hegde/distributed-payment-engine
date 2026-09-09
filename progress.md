@@ -1753,3 +1753,438 @@ All invariants hold.
 - Still outstanding from M4: `ErrorHandlingDeserializer`, so a failure inside `consumer.poll()`
   becomes a poison-pill value the listener can see rather than an unreachable partition stall; and
   retention for `outbox`, `inbox` and `dead_letters`, which still grow without limit.
+
+## Session 11 — 2026-09-09
+
+### Goal
+
+M6 part 1: stand up the metrics pipeline. Prometheus scraping all three services, Grafana
+provisioned from the repository, and the cardinality controls that make a metrics system survive
+contact with production traffic. The custom `dpe.*` business meters are deliberately not in this
+session — the dashboard was written first, as their specification.
+
+The decision deferred since M5 — *how does a scraper authenticate to an operator-only actuator?* —
+had to be answered before anything else could be built.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| How Prometheus reaches `/actuator/prometheus` | A separate `management.server.port`, unpublished in Compose | The alternatives were a static bearer token or basic auth. A never-expiring token in a config file is a published credential and contradicts the 15-minute TTL the whole of M5 argued for; basic auth adds a second authentication mechanism to a system that just spent a milestone arguing there should be one. A port the host cannot reach makes the network the boundary — which is the same answer this system already gives for `dpe.account.commands.v1`, where nobody authenticates to produce either. A system with two different stories about where its perimeter sits has neither. |
+| Where the port rule lives | The `permitAll` in each service's own `SecurityConfig`; only the port *matcher* is shared | `common-security`'s stated contract is that it holds token-validation mechanics and no authorization rule. "Which connector did this arrive on" is a fact about a socket and is shared; "therefore permit it" is a rule, and a `permitAll` that arrives from a library is the single most dangerous kind of reuse. |
+| Whether the scraper gets its own credential | No | Adding one would have meant the actuator stayed reachable from the host, and the credential would have become the thing protecting it. Removing host reachability removes the need for the credential; that is a smaller system, not a looser one. |
+| One Prometheus job or three | One, with `application` as a meter tag | Three jobs would make `job` duplicate the `application` tag each service already stamps on its own meters, and two labels that always agree are two labels that can one day disagree. `job` is the scrape file's opinion; `application` is the application's own claim, and it survives federation and `remote_write`. |
+| Quantiles | Histogram buckets, never client-side percentiles | A percentile computed inside one JVM cannot be aggregated — averaging two p99s is not the p99 of anything. Buckets can be summed, so the same query stays correct behind a load balancer with three replicas. |
+| Bucket range | Bounded explicitly, 5ms–5s for requests and 50ms–60s for sagas | Every bucket boundary is a time series multiplied by every other label. The default range emits roughly seventy per meter; bounding it to what these operations actually do gives about thirty. |
+| Grafana auth | Anonymous, with the Admin role | Stated in the Compose file rather than hidden in a volume, because it is exactly the setting that must never be copied to a deployment. It is only defensible because port 3000 is reachable from this machine alone. |
+| Dashboard storage | Provisioned from files, `allowUiUpdates: false` | A dashboard that exists only in Grafana's volume cannot be reviewed, diffed, or restored, and `docker compose down -v` deletes it along with every query in it. |
+| Prometheus retention | 24h | Retention is a statement about which questions can still be asked. A day covers "what happened during this morning's chaos run" and promises nothing longer, which is all a laptop should. |
+
+### Built
+
+- **`ManagementPortMatcher`** (`common-security`) — a `RequestMatcher` that answers whether a
+  request arrived on the management connector, using `HttpServletRequest.getLocalPort()`: the port
+  the connector actually accepted on, not a header, not `X-Forwarded-Port`, nothing a client can
+  set. That is the only reason a port is usable as a trust boundary. Fails closed — if
+  `management.server.port` is unset, zero, or equal to `server.port`, there is no second connector,
+  it matches nothing, and the actuator stays operator-only.
+- **A second `SecurityFilterChain` in each service**, `@Order(0)`, selected by that matcher and
+  permitting everything on it. It has to be a whole chain rather than a `requestMatchers` rule
+  because `requestMatchers` only ever sees a path and cannot tell two sockets apart.
+- **`micrometer-registry-prometheus`** in all three services. Actuator alone gives the metrics API
+  but no registry that can serialise it, and without this artifact `/actuator/prometheus` is simply
+  absent — which reads like an exposure typo rather than a missing dependency.
+- **Metrics configuration** in all three `application.yml`: the `application` common tag,
+  `max-uri-tags: 50` as the cardinality backstop, and bounded histogram buckets.
+- **Prometheus and Grafana containers**, 384M and 320M caps. Prometheus depends on the services
+  with `service_started`, not `service_healthy`, so it comes up and *shows targets down* rather
+  than hiding the startup window worth watching.
+- **`infra/prometheus/prometheus.yml`**, **Grafana datasource and dashboard provisioning**, and
+  **`infra/grafana/dashboards/dpe-payments.json`** — 26 panels in five sections: RED for
+  request-driven work, a section of its own for the saga, the messaging spine, the idempotency
+  edge, and USE for resources. Every panel description names the meter it reads. The panels reading
+  `dpe_*` are empty until those meters exist; the dashboard is their specification, not a
+  decoration over them.
+- **`ManagementPortSecurityTest`** — five assertions covering the two-connector posture, including
+  the one that bounds the whole design: the business API returns 404 on the management port,
+  because the management child context has its own `DispatcherServlet` carrying only actuator
+  mappings. The API is not merely denied there; it is not mapped.
+
+### What broke
+
+1. **A separate management port is not unprotected — Boot puts the application's own security on
+   it.** This was the assumption the entire design rested on, and it is false.
+   `ServletManagementChildContextConfiguration$ServletManagementContextSecurityConfiguration`
+   reaches into the *parent* bean factory and registers the parent's `springSecurityFilterChain`
+   on the management connector:
+
+   ```java
+   springSecurityFilterChain(HierarchicalBeanFactory bf) {
+       return bf.getParentBeanFactory().getBean("springSecurityFilterChain", Filter.class);
+   }
+   ```
+
+   So every M5 rule applied to port 9091 too and the scraper got a 401. It fails in the safe
+   direction, which is exactly why it survives review: the natural response is to give Prometheus
+   a credential rather than to ask why a port with "no security on it" is refusing.
+
+2. **A test class named `*IT` never runs.** `ManagementPortSecurityIT` compiled, passed when run
+   explicitly with `-Dtest=`, and was silently skipped by `./mvnw verify` — no Failsafe plugin is
+   configured and Surefire's default includes are `*Test`, `Test*`, `*Tests`. The only signal was
+   the suite total not going up, from 151 to 151, which is the one number nobody checks. Renamed
+   to `ManagementPortSecurityTest`; the count then went to 156.
+
+3. **`AdminEndpointSecurityTest` had been passing for the wrong reason since M4.** It asserts
+   `GET /actuator/health == 200` to show the probe needs no token. Boot's `RedisHealthIndicator`
+   probes Redis regardless of `dpe.idempotency.cache=false` — switching the cache off does not
+   remove the connection factory — and one DOWN component makes the whole endpoint 503. These
+   tests run with no Redis, so the assertion only held when something happened to be listening on
+   `localhost:6379`, which in practice meant "Docker Compose was up in another window". Confirmed
+   directly: with nothing on 6379 the test fails; start a bare `redis:7-alpine` on 6379 and it
+   passes. It survived all of M4 and M5 that way. The test is about authorization, so the health
+   of a dependency it deliberately does not run is noise in it —
+   `management.health.redis.enabled=false` in the test properties.
+
+4. **`DynamicPropertyRegistry.add` takes a supplier that is invoked on every resolution, not
+   once.** Passing `TestSocketUtils::findAvailableTcpPort` directly returned a *different* free
+   port each call, so the web server bound one port and `ManagementPortMatcher` was constructed
+   with another. The matcher then compared against a port nothing was listening on, matched
+   nothing, and every request fell through to the M5 chain — presenting as a 401 from a connector
+   that is supposed to be open, which reads exactly like the security rule being wrong. A dynamic
+   property supplier must be idempotent; the port is now chosen once into a constant.
+
+5. **The application port cannot return 404 to an anonymous caller at all.** With the actuator
+   moved, `GET /actuator/health` on port 8081 has no handler; the 404 becomes a servlet ERROR
+   dispatch to `/error`; and `/error` matches no rule, so `anyRequest().denyAll()` denies it. Every
+   unmapped path therefore answers 401. That is a real and desirable property of `denyAll()` — the
+   port cannot be walked for its routes — but it means the expected status for "this endpoint
+   moved" is 401, not 404, and a probe left on the old port reports unhealthy forever with nothing
+   in the log to say the endpoint merely moved. The Compose healthcheck moved to `MANAGEMENT_PORT`
+   with it; the same correction is due for the K8s probes at M10.
+
+6. **`--web.enable-lifecycle=false` is rejected by Prometheus 3** with `error: unexpected false`.
+   These are presence flags; the negative form is `--no-web.enable-lifecycle`. Absent is already
+   the secure default, so the flag was dropped rather than negated.
+
+7. **Compose merges list values by concatenation.** An override file supplying a different `ports:`
+   entry *adds* a mapping rather than replacing it, so the original conflicting binding was still
+   attempted. `ports: !override` is the replacement form. (Hit while working around host port
+   19092 being held by an unrelated container on this machine — the services themselves reach the
+   broker at `redpanda:9092` on the Compose network and were never affected.)
+
+8. **Boot 4 moved `TestRestTemplate` and made it opt-in.** It is no longer
+   `org.springframework.boot.test.web.client.TestRestTemplate` from the test starter; it lives in a
+   `spring-boot-resttestclient` module no starter pulls in, needs `@AutoConfigureTestRestTemplate`
+   for the bean, and then fails at context load with `NoClassDefFoundError: RestTemplateBuilder`
+   until `spring-boot-restclient` is added as well. Three modules and an annotation to issue a GET
+   and read a status code. The test uses the JDK's own `HttpClient` instead, which needs none of
+   them and — unlike a bare `RestTemplate` — does not throw on a 4xx, which this test depends on.
+
+### Verified
+
+Full suite, 156 tests (151 at M5, plus the five new ones once the class was named so they would
+actually run):
+
+```
+./mvnw -B -ntp verify
+
+common-messaging       Tests run:  13, Failures: 0, Errors: 0
+account-service        Tests run:  64, Failures: 0, Errors: 0
+payment-orchestrator   Tests run:  73, Failures: 0, Errors: 0
+payment-gateway        Tests run:   6, Failures: 0, Errors: 0
+BUILD SUCCESS
+```
+
+Live on Compose, eight containers healthy. All three targets scraped:
+
+```
+payment-orchestrator:9091          up       ok
+account-service:9092               up       ok
+payment-gateway:9093               up       ok
+localhost:9090                     up       ok
+```
+
+The scrape path, and the boundary that replaces the credential:
+
+```
+# from inside the network, no credential of any kind
+docker exec dpe-prometheus wget -qO- http://payment-orchestrator:9091/actuator/prometheus
+  hikaricp_connections_active{application="payment-orchestrator",pool="orchestrator-pool"} 0.0
+  jvm_memory_used_bytes{application="payment-orchestrator",area="heap",id="Eden Space"} 1.9368464E7
+
+# the same endpoint from the host - 9091 appears in no `ports:` block
+curl http://localhost:9091/actuator/prometheus        -> connection failed (000)
+
+# and the application port is untouched by any of this
+curl http://localhost:8081/actuator/prometheus        -> 401
+```
+
+Thirty-four transfers driven through the stack, and the built-in RED metrics that came with them:
+
+```
+sum by (uri,method) (rate(http_server_requests_seconds_count{application="payment-orchestrator"}[5m]))
+  method=POST uri=/api/v1/transfers        0.1036
+  method=POST uri=/auth/token              0.0114
+  method=GET  uri=/.well-known/jwks.json   0
+  method=GET  uri=UNKNOWN                  0
+
+sum(http_server_requests_seconds_count{uri="/api/v1/transfers",status="202"})   34
+```
+
+Quantiles computed by Prometheus from `_bucket` series, which is the point of choosing histograms:
+
+```
+histogram_quantile(0.50, ...)   0.0383
+histogram_quantile(0.95, ...)   0.0551
+histogram_quantile(0.99, ...)   0.0657
+```
+
+`uri=UNKNOWN` in that first output is the cardinality guard working: paths that match no handler
+collapse into one series instead of minting one apiece.
+
+Grafana provisioned from the repository, and querying end to end through its datasource:
+
+```
+GET /api/datasources    Prometheus  prometheus  http://prometheus:9090  uid=dpe-prometheus  default=True
+GET /api/search         dash-db | DPE - Payments | uid=dpe-payments | folder=DPE
+
+GET /api/datasources/proxy/uid/dpe-prometheus/api/v1/query?query=up{job="dpe"}
+  account-service:9092           up=1
+  payment-gateway:9093           up=1
+  payment-orchestrator:9091      up=1
+```
+
+Invariants, before the traffic and after it:
+
+```
+./scripts/verify-invariants.sh baseline     I3 baseline recorded: 1900000
+  ... 34 transfers ...
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (1900000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+```
+
+Memory, since RAM is this project's binding constraint — the two new containers cost 147 MB
+together, well under their caps:
+
+```
+dpe-prometheus     37.8MiB / 384MiB
+dpe-grafana       108.8MiB / 320MiB
+```
+
+### Committed
+
+Not yet — the business meters the dashboard specifies belong in the same commit as the pipeline
+that carries them.
+
+### Open / next
+
+- **The `dpe.*` business meters**, which the dashboard already names and queries: saga starts,
+  terminal outcomes by status, saga duration, in-flight sagas by state, outbox backlog and oldest
+  age, DLQ depth, inbox duplicates suppressed, and idempotency gate outcomes. Each gauge must ride
+  the partial index its worker already uses — `idx_outbox_unpublished`, `idx_dead_letters_pending`,
+  `idx_saga_instances_in_flight` — because a gauge is re-evaluated on every scrape, forever,
+  against tables on the write path of every payment.
+- **M6 part 2: tracing.** The interesting problem is that the transactional outbox destroys
+  automatic trace propagation — the message is written inside the request's transaction and
+  relayed later on a different thread, so the `traceparent` has to be persisted in the outbox row
+  and restored by the relay, or one payment becomes five disconnected traces.
+- **M6 part 3:** the read endpoints M6.5 needs.
+- Grafana's anonymous-Admin setting is correct for a laptop and must not survive contact with
+  anything else.
+- Still outstanding from M4: `ErrorHandlingDeserializer`, and retention for `outbox`, `inbox` and
+  `dead_letters`, which still grow without limit.
+
+## Session 12 — 2026-09-09
+
+### Goal
+
+Finish M6 part 1 by writing the business meters the dashboard was built as a specification for.
+Session 11 landed the pipeline and left every `dpe_*` panel empty on purpose; this session fills
+them, and the interesting work is not the counters themselves but deciding *when* each one is
+allowed to fire and *what* it must still say when nothing is happening.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| When a counter increments | On `afterCommit`, never inline | The dual-write problem again, one level down: the meter is in process memory, the saga is in Postgres, nothing spans both. The increment and the commit cannot be atomic, so the only choice is which way it fails. Inline over-counts on every rollback — and rollbacks are routine here, because a redelivered message losing the inbox race rolls back by design — so the metric reads permanently high. After commit under-counts by one if the process dies in the gap, once. Bounded and rare beats unbounded and permanent. |
+| How gauges are read | `AtomicLong` fields refreshed by a scheduler; the scrape never touches the database | A Micrometer gauge over a lambda calls it on *every* scrape. Pointed at a repository that means queries against the write path every 10s forever, and the scrape now blocks on Postgres — precisely when the metrics are all you have left. Reading a field makes the scrape unable to block or fail, and fixes database load to the refresh interval rather than to the number of scrapers. |
+| Where the shared meters live | `common-messaging`, component-scanned | Outbox backlog, outbox age and DLQ depth are the same question in all three services. `micrometer-core` at compile scope, not the actuator starter: the module instruments, it does not expose. Which registry the meters land in stays the service's decision. |
+| The inbox dedup seam | A new `InboxGate` replacing five direct `insertIfAbsent` calls | Five handlers across three services each wrote the same three lines, and there was nowhere to observe *the* rule that makes at-least-once delivery safe. The guarantee did not move: still `ON CONFLICT DO NOTHING` against the primary key, still decided by Postgres under the row lock. The class adds a counter and a name, not a check. |
+| Which labels exist | `status`, `state`, `outcome`, `result`, `topic` — and nothing else | Every one is drawn from a fixed vocabulary that requires a code change to extend. `transfer_id`, `account_id` and the idempotency key are deliberately absent: those are one series per payment, and "what happened to this transfer" is a question for a trace or `saga_steps`. |
+| Meters that may legitimately stay at zero | Pre-registered at startup | `FAILED`, `conflict`, and inbox duplicates are all meters whose healthy reading is zero. Registered lazily they do not exist until they first fire, so the panel reads "No data" on a working system — which is the fastest way to teach an operator to ignore a panel. Worse for alerting: `absent()` then cannot tell "healthy" from "the exporter died". |
+| Where terminal transitions are recorded | One private `finish()` helper in `SagaOrchestrator` | There are four terminal call sites in four branches. A fifth added later would otherwise be invisible to `dpe.saga.terminal`, the compensation rate would silently under-report, and no test would catch it. One door, so the meter cannot be forgotten. |
+
+### Built
+
+**Shared, in `common-messaging`:**
+
+- `MessagingMetrics` — `dpe.outbox.backlog`, `dpe.outbox.age`, `dpe.dlq.depth`, refreshed by
+  `MessagingMetricsScheduler` every 5s against a 10s scrape. Each query rides the partial index
+  its own worker already uses (`idx_outbox_unpublished`, `idx_dead_letters_pending`), so it reads
+  only the active set and its cost stays flat as the archive grows.
+- `OutboxRepository.oldestUnpublishedAgeSeconds()` — `MIN(created_at)` under the same predicate as
+  the partial index, so it is an index scan that stops at the first entry.
+- `InboxGate` — `dpe.inbox.accepted` and `dpe.inbox.duplicate`, tagged by topic.
+
+**In `payment-orchestrator`:**
+
+- `SagaMetrics` — `dpe.saga.started`, `dpe.saga.terminal{status}`, `dpe.saga.duration{status}`
+  (a Timer, with buckets from `application.yml` so Prometheus computes the quantiles), and
+  `dpe.saga.inflight{state}` gauges refreshed from one `GROUP BY` query.
+- `SagaInstanceRepository.countInFlightByStatus()` — native, with the terminal list written out to
+  match `idx_saga_instances_in_flight` character for character, because a parameterised `NOT IN`
+  cannot be proven to imply the partial index's predicate and the planner would fall back to a
+  sequential scan over every saga ever run — on a timer, forever. That makes it the fifth place the
+  terminal set is written down: `SagaStatus`, the `saga_status_known` CHECK, the partial index,
+  `verify-invariants.sh`, and now the two native queries in this repository. They change together
+  or I4 stops meaning anything.
+- `dpe.idempotency.request{outcome}` in `IdempotencyGate` — `new`, `replay`, `in_flight`,
+  `conflict`, all four pre-registered.
+- `dpe.idempotency.cache{result}` in `IdempotencyCache` — `hit`, `miss`, `unavailable`, kept as
+  three and not two for the same reason the M4 `LockOutcome` refactor existed: "switched off" and
+  "threw" are not misses, and an operator reading a 0% hit ratio needs to know which they have.
+
+**Tests:** `SagaMetricsTest` (5) and `MessagingMetricsTest` (4). 156 → 165.
+
+### What broke
+
+1. **Micrometer appends `baseUnit` to the Prometheus metric name.** `.baseUnit("messages")`
+   publishes `dpe_outbox_backlog_messages`, not `dpe_outbox_backlog` — so every dashboard panel and
+   every future alert written against the documented name silently matches nothing. Nothing warns,
+   the meter is exported, the scrape is healthy, and the panel just says "No data". Caught only by
+   diffing the live `/actuator/prometheus` output against the dashboard's queries. Units dropped
+   from the three count gauges; `seconds` kept on `dpe.outbox.age`, where the suffix is the
+   Prometheus convention and the dashboard already expected it.
+
+2. **A test that passes alone and fails under `verify`, which is the worst way round.**
+   `SagaMetricsTest` asserted `timer().count() == 1`. The `MeterRegistry` is a singleton in the
+   shared Spring test context, so every other class that had run a saga to completion in that JVM
+   had already incremented it. Green on the machine where it was written, red in a full build.
+   Every assertion now captures a before-value and asserts the delta.
+
+3. **A `@Modifying` query still needs a transaction, and the error does not say so.**
+   `MessagingMetricsTest` called `InboxGate.claim` directly and got
+   `TransactionRequiredException: No active transaction for update or delete query`. Same family as
+   the M4 sweeper trap — "no transaction" is not a third option. Fixed with a `TransactionTemplate`
+   per claim, which is also the more honest test: two deliveries of a message are genuinely two
+   transactions, and running both in one would let the second see the first's uncommitted row.
+
+4. **A counter registered lazily does not exist until it first fires.** `dpe_inbox_duplicate_total`
+   was missing from Prometheus entirely after a clean run, because no duplicate had arrived. The
+   healthy reading for that meter is zero — and a missing series and an explicit zero look identical
+   on a graph while meaning opposite things. `InboxGate` now touches both counters and increments
+   one. Same fix applied to the three terminal saga counters and the four idempotency outcomes.
+
+5. **Counting a cache hit before parsing the cached value double-counted it.** The first version
+   incremented `hit` and then called `readValue` inside the same `try`; a stored value that no
+   longer deserialises would increment `hit` and then fall into the catch and increment
+   `unavailable`, so one lookup appeared twice and the hit ratio read above 100% of what happened.
+   Parse first, count second.
+
+6. **A verification race that looked like a broken feature.** Forcing `failureRate=1.0`, issuing
+   six transfers and immediately restoring `failureRate=0.0` produced six *approved* charges and
+   zero compensations — the API returns 202 immediately and the gateway is reached asynchronously
+   several hundred milliseconds later, by which time the failure injection had already been turned
+   off. Nothing was wrong with the gateway. Worth remembering before M7 writes eight chaos
+   scenarios against exactly this endpoint: **a chaos scenario must wait for the sagas to reach a
+   terminal state before it restores the fault**, or it asserts on a system that was healthy again
+   by the time the work arrived.
+
+7. **`verify-invariants.sh baseline` records I3 at the moment it runs.** Baselining and then
+   opening two funded accounts fails I3 by exactly the amount opened. Correct behaviour — the
+   invariant caught real money entering the system — but the baseline has to be taken after the
+   fixtures exist, not before.
+
+### Verified
+
+165 tests:
+
+```
+./mvnw -B -ntp verify
+
+common-messaging       Tests run:  13, Failures: 0, Errors: 0
+account-service        Tests run:  64, Failures: 0, Errors: 0
+payment-orchestrator   Tests run:  82, Failures: 0, Errors: 0
+payment-gateway        Tests run:   6, Failures: 0, Errors: 0
+BUILD SUCCESS
+```
+
+Live on Compose. 27 transfers across three shapes — fresh, retried, and forced to compensate — and
+every meter cross-checks against the database independently:
+
+```
+dpe_saga_started_total                    27
+sum by (status) (dpe_saga_terminal_total) COMPENSATED=6  COMPLETED=21  FAILED=0
+                                          -> 6 + 21 = 27, and psql agrees: COMPENSATED 6
+
+compensation rate                         0.2222   (= 6/27)
+saga p95 from _bucket series              3.11s
+
+sum by (outcome) (dpe_idempotency_request_total)
+                                          new=27  replay=5  in_flight=0  conflict=1
+                                          -> exactly the 27 distinct keys, 5 retries of one key,
+                                             and one deliberate reuse with a different amount (409)
+
+sum by (result) (dpe_idempotency_cache_total)
+                                          hit=6  miss=27  unavailable=0
+                                          -> 6 hits = 5 replays + the conflict, which was also
+                                             detected from the cache
+```
+
+The inbox gate is live on all four consumer paths across the three services:
+
+```
+sum by (application, topic) (dpe_inbox_accepted_total)
+  payment-orchestrator   dpe.account.events.v1     58
+  account-service        dpe.account.commands.v1   54
+  payment-gateway        dpe.gateway.commands.v1   27
+  payment-orchestrator   dpe.gateway.events.v1     27
+```
+
+Every metric name the dashboard queries resolves, and the meters whose healthy value is zero say
+zero rather than nothing:
+
+```
+dpe_saga_started_total              1 series      dpe_outbox_backlog             3 series
+dpe_saga_terminal_total             3 series      dpe_outbox_age_seconds         3 series
+dpe_saga_duration_seconds_bucket   50 series      dpe_dlq_depth                  3 series
+dpe_saga_inflight                   4 series      dpe_inbox_duplicate_total      4 series
+dpe_idempotency_request_total       4 series      dpe_inbox_accepted_total       4 series
+dpe_idempotency_cache_total         3 series
+
+sum by (application,topic) (dpe_inbox_duplicate_total)
+  account-service        dpe.account.commands.v1   0
+  payment-gateway        dpe.gateway.commands.v1   0
+  payment-orchestrator   dpe.account.events.v1     0
+  payment-orchestrator   dpe.gateway.events.v1     0
+```
+
+Invariants, after the compensations:
+
+```
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (2900000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+```
+
+### Open / next
+
+- **M6 part 2: tracing.** The transactional outbox destroys automatic trace propagation — the
+  message is written inside the request's transaction and relayed later on a different thread, so
+  the `traceparent` has to be persisted in the outbox row and restored by the relay, or one payment
+  becomes five disconnected traces.
+- **M6 part 3:** the read endpoints M6.5 needs.
+- Alert rules. Every threshold on the dashboard is currently a colour, not a rule — the obvious
+  first three are outbox age, DLQ depth above zero, and a compensation rate step change.
+- Note for M7: chaos scenarios must wait for terminal sagas before restoring an injected fault,
+  per "what broke" item 6.
+- Still outstanding from M4: `ErrorHandlingDeserializer`, and retention for `outbox`, `inbox` and
+  `dead_letters`.

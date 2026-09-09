@@ -2,7 +2,7 @@ package com.dpe.gateway.saga;
 
 import com.dpe.events.ChargeGateway;
 import com.dpe.gateway.service.ChargeService;
-import com.dpe.messaging.inbox.InboxRepository;
+import com.dpe.messaging.inbox.InboxGate;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,10 +17,10 @@ import org.springframework.transaction.annotation.Transactional;
 @Component
 public class GatewayCommandHandler {
 
-    private final InboxRepository inbox;
+    private final InboxGate inbox;
     private final ChargeService charges;
 
-    public GatewayCommandHandler(InboxRepository inbox, ChargeService charges) {
+    public GatewayCommandHandler(InboxGate inbox, ChargeService charges) {
         this.inbox = inbox;
         this.charges = charges;
     }
@@ -30,7 +30,7 @@ public class GatewayCommandHandler {
      */
     @Transactional
     public boolean handle(UUID messageId, String topic, ChargeGateway command) {
-        if (inbox.insertIfAbsent(messageId, topic, ChargeGateway.TYPE) == 0) {
+        if (!inbox.claim(messageId, topic, ChargeGateway.TYPE)) {
             return false;
         }
         charges.charge(command);
@@ -40,6 +40,6 @@ public class GatewayCommandHandler {
     /** Records a command this version does not understand, without acting on it. */
     @Transactional
     public boolean skip(UUID messageId, String topic, String eventType) {
-        return inbox.insertIfAbsent(messageId, topic, eventType) != 0;
+        return inbox.claim(messageId, topic, eventType);
     }
 }

@@ -5,6 +5,8 @@ import java.util.Optional;
 import com.dpe.orchestrator.web.dto.TransferResponse;
 import com.dpe.orchestrator.transfer.TransferService;
 import com.dpe.orchestrator.web.dto.CreateTransferRequest;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -104,15 +106,50 @@ public class IdempotencyGate {
     private final ObjectMapper objectMapper;
     private final IdempotencyProperties properties;
 
+    /**
+     * M6. What the gate decided, per request.
+     *
+     * <p>Four outcomes, each of which means something different to whoever is reading the graph.
+     * {@code new} is a first request. {@code replay} is the mechanism working - a client retried
+     * and got the first answer back instead of a second payment. {@code in_flight} is a duplicate
+     * that arrived while the first was still running and waited for the winner. {@code conflict}
+     * is a client reusing one key for a DIFFERENT body, which is a bug in the CALLER and is the
+     * one an operator should chase, because nothing else in the system will report it.
+     *
+     * <p>The client id is not a tag. It is unbounded - one series per client, forever - and
+     * "which client is misusing keys" is a question for a log line, which is where it is.
+     */
+    private final MeterRegistry registry;
+
     public IdempotencyGate(IdempotencyRepository records, IdempotencyCache cache,
                            TransferService transfers, TransactionTemplate tx,
-                           ObjectMapper objectMapper, IdempotencyProperties properties) {
+                           ObjectMapper objectMapper, IdempotencyProperties properties,
+                           MeterRegistry registry) {
         this.records = records;
         this.cache = cache;
         this.transfers = transfers;
         this.tx = tx;
         this.objectMapper = objectMapper;
         this.properties = properties;
+        this.registry = registry;
+
+        // Every outcome gets a series at zero before the first request. Registered here rather
+        // than on first use because `conflict` in particular may legitimately never happen - and
+        // a panel that reads "No data" for a healthy system teaches an operator to ignore it.
+        for (String outcome : new String[] {"new", "replay", "in_flight", "conflict"}) {
+            outcomeCounter(outcome);
+        }
+    }
+
+    private void recordOutcome(String outcome) {
+        outcomeCounter(outcome).increment();
+    }
+
+    private Counter outcomeCounter(String outcome) {
+        return Counter.builder("dpe.idempotency.request")
+                .tag("outcome", outcome)
+                .description("Idempotency gate decisions, by what the gate concluded")
+                .register(registry);
     }
 
     /**
@@ -130,7 +167,7 @@ public class IdempotencyGate {
 
         Optional<CachedResponse> cached = cache.lookup(clientId, key);
         if (cached.isPresent()) {
-            return replayOrConflict(cached.get(), fingerprint, clientId, key);
+            return replayOrConflict(cached.get(), fingerprint, clientId, key, "replay");
         }
         IdempotencyCache.LockOutcome lockOutcome = cache.acquireLock(clientId, key);
 
@@ -164,8 +201,20 @@ if (lockOutcome instanceof IdempotencyCache.LockOutcome.HeldByAnother) {
                 return new IdempotentOutcome(202, body, false);
             });
 
+            // Counted here rather than inside the lambda, and the placement is the point: at
+            // this line the transaction has COMMITTED. An increment inside tx.execute would
+            // count work that a rollback then undid - and a rollback here is not exotic, it is
+            // what a duplicate losing the race on the unique index does by design. The metric
+            // would read permanently high, which is worse than not having it.
+            recordOutcome(outcome.replayed() ? "replay" : "new");
+
             cache.store(clientId, key, new CachedResponse(fingerprint, outcome.status(), outcome.bodyJson()));
             return outcome;
+        } catch (IdempotencyConflictException e) {
+            // Thrown out of the transaction by the fingerprint check, so it never reaches the
+            // line above.
+            recordOutcome("conflict");
+            throw e;
         } finally {
     if (lockOutcome instanceof IdempotencyCache.LockOutcome.Acquired acquired) {
         cache.releaseLock(clientId, key, acquired.token());
@@ -178,7 +227,7 @@ private IdempotentOutcome waitForWinner(String clientId, String key, String fing
     while (System.currentTimeMillis() < deadline) {
         Optional<CachedResponse> cached = cache.lookup(clientId, key);
         if (cached.isPresent()) {
-            return replayOrConflict(cached.get(), fingerprint, clientId, key);
+            return replayOrConflict(cached.get(), fingerprint, clientId, key, "in_flight");
         }
         try {
             Thread.sleep(LOCK_POLL_INTERVAL.toMillis());
@@ -191,10 +240,12 @@ private IdempotentOutcome waitForWinner(String clientId, String key, String fing
 }
 
 private IdempotentOutcome replayOrConflict(
-        CachedResponse cached, String fingerprint, String clientId, String key) {
+        CachedResponse cached, String fingerprint, String clientId, String key, String outcome) {
     if (!cached.fingerprint().equals(fingerprint)) {
+        recordOutcome("conflict");
         throw new IdempotencyConflictException(
         "Idempotency key " + key + " for client " + clientId + " was reused with a different request");
     }
+    recordOutcome(outcome);
     return new IdempotentOutcome(cached.status(), cached.bodyJson(), true);
 }}

@@ -58,6 +58,16 @@
         <!-- OutboxWriter serializes the envelope inside the business transaction. Declared
              explicitly rather than leant on transitively: data-jpa does not bring Jackson, and
              this module must build even in a service with no web starter on the classpath. -->
+        <!-- M6: MeterRegistry, Counter, Gauge, Timer. Compile scope, not the actuator starter:
+             this module INSTRUMENTS, it does not expose. Which registry the meters land in - and
+             whether an HTTP endpoint serialises them at all - is the service's decision, exactly
+             as it is for the web stack below. All three services bring the actuator and the
+             Prometheus registry themselves. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-json</artifactId>

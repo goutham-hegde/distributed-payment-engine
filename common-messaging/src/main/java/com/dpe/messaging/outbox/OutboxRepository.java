@@ -54,4 +54,26 @@ public interface OutboxRepository extends JpaRepository<OutboxMessage, UUID> {
 
     /** Backlog depth. M6 turns this into the gauge that says whether the relay is keeping up. */
     long countByPublishedAtIsNull();
+
+    /**
+     * Age in seconds of the oldest un-relayed row, or {@code null} when the outbox is drained.
+     *
+     * <p>Strictly more useful than the count above, and the pair is the reason both exist. Depth
+     * answers "how much is waiting"; age answers "is anything moving". A backlog of ten thousand
+     * that is draining is a busy system; a backlog of one that is four minutes old is a dead
+     * relay, and the count alone cannot tell those apart.
+     *
+     * <p>Native, and shaped to hit {@code idx_outbox_unpublished} - the partial index on
+     * {@code (created_at, id) WHERE published_at IS NULL}. Because the index is partial and
+     * ordered by {@code created_at}, {@code MIN(created_at)} under the same predicate is an
+     * index scan that stops at the first entry, whatever the size of the published archive
+     * behind it. This runs on a timer against a table on the write path of every payment, so
+     * that is not an optimisation - it is the condition for the metric being affordable at all.
+     */
+    @Query(value = """
+            SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at)))
+            FROM outbox
+            WHERE published_at IS NULL
+            """, nativeQuery = true)
+    Double oldestUnpublishedAgeSeconds();
 }

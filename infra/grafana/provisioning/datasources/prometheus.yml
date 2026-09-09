@@ -1,0 +1,19 @@
+# Provisioned, not clicked. A datasource created through the UI lives in Grafana's SQLite volume
+# and disappears with `docker compose down -v`, taking every dashboard's queries with it - and
+# nothing in the repo would record that it ever existed. This file is the source of truth.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Grafana queries this server-side, from inside the container, so this is the Compose service
+    # name and not localhost. `access: proxy` is what makes that true; `access: direct` would have
+    # the BROWSER resolve it, and the browser has never heard of `prometheus`.
+    url: http://prometheus:9090
+    isDefault: true
+    uid: dpe-prometheus
+    jsonData:
+      # Must match prometheus.yml's scrape_interval. Grafana uses it to pick a sensible $__rate_interval
+      # and to avoid asking for a resolution the data does not have.
+      timeInterval: 10s

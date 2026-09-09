@@ -1,9 +1,12 @@
 package com.dpe.gateway.security;
 
+import com.dpe.security.ManagementPortMatcher;
 import com.dpe.security.Roles;
 import com.dpe.security.RolesConverter;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -55,6 +58,46 @@ public class SecurityConfig {
 
                 .oauth2ResourceServer(oauth2 ->
                         oauth2.jwt(jwt -> jwt.jwtAuthenticationConverter(roles)));
+
+        return http.build();
+    }
+
+    /**
+     * Recognises the management connector. Fails closed - see {@link ManagementPortMatcher}.
+     */
+    @Bean
+    ManagementPortMatcher managementPortMatcher(
+            @Value("${server.port:8080}") int applicationPort,
+            @Value("${management.server.port:-1}") int managementPort) {
+        return new ManagementPortMatcher(applicationPort, managementPort);
+    }
+
+    /**
+     * <b>M6: the scrape path.</b> Requests arriving on the management connector are permitted;
+     * every rule above still governs the application connector unchanged.
+     *
+     * <p>Port 9091 is not published in {@code infra/docker-compose.yml}, so this is reachable from
+     * the Compose network and nowhere else. The trust boundary is the network - the same answer
+     * this service already gives for {@code dpe.account.commands.v1}.
+     *
+     * <p>It has to be a separate chain, not a {@code requestMatchers} rule, because the question is
+     * which socket the request arrived on and {@code requestMatchers} only sees a path. And it has
+     * to exist at all because a separate management port is <b>not</b> unprotected by default: Boot
+     * registers this context's own filter chain on the management connector. The full reasoning,
+     * with the autoconfiguration that does it, is in
+     * {@code payment-orchestrator}'s {@code SecurityConfig#managementChain} and in
+     * {@link ManagementPortMatcher}.
+     */
+    @Bean
+    @Order(0)
+    SecurityFilterChain managementChain(HttpSecurity http, ManagementPortMatcher managementPort)
+            throws Exception {
+        http
+                .securityMatcher(managementPort)
+                .csrf(AbstractHttpConfigurer::disable)
+                .sessionManagement(session ->
+                        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -> auth.anyRequest().permitAll());
 
         return http.build();
     }

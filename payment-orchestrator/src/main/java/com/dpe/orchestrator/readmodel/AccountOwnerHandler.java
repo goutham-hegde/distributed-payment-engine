@@ -2,7 +2,7 @@ package com.dpe.orchestrator.readmodel;
 
 import com.dpe.events.AccountOpened;
 import com.dpe.events.EventEnvelope;
-import com.dpe.messaging.inbox.InboxRepository;
+import com.dpe.messaging.inbox.InboxGate;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,10 +30,10 @@ public class AccountOwnerHandler {
 
     private static final Logger log = LoggerFactory.getLogger(AccountOwnerHandler.class);
 
-    private final InboxRepository inbox;
+    private final InboxGate inbox;
     private final AccountOwnerRepository owners;
 
-    public AccountOwnerHandler(InboxRepository inbox, AccountOwnerRepository owners) {
+    public AccountOwnerHandler(InboxGate inbox, AccountOwnerRepository owners) {
         this.inbox = inbox;
         this.owners = owners;
     }
@@ -43,7 +43,7 @@ public class AccountOwnerHandler {
      */
     @Transactional
     public boolean handle(UUID messageId, String topic, EventEnvelope<AccountOpened> envelope) {
-        if (inbox.insertIfAbsent(messageId, topic, envelope.eventType()) == 0) {
+        if (!inbox.claim(messageId, topic, envelope.eventType())) {
             return false;
         }
 

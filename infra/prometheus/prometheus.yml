@@ -1,0 +1,46 @@
+# M6. What Prometheus is told about this system, and what it is deliberately not told.
+#
+# Prometheus PULLS. Nothing in the three services knows this file exists, has a Prometheus
+# dependency in its configuration, or fails if this container is missing - they publish a text
+# endpoint and that is the whole contract. That is the property worth defending in an interview:
+# a push-based agent makes every service depend on the monitoring system being up and reachable,
+# and turns a monitoring outage into an application problem. A pull model degrades to "no data",
+# which is the correct failure.
+
+global:
+  # Every series' resolution. Ten seconds is a deliberate compromise: fine enough to see a saga
+  # storm inside one minute, coarse enough that a laptop's TSDB is not writing constantly. It also
+  # sets the floor for every rate() window in the dashboards - a rate over a range shorter than
+  # ~4x this interval is noise, which is why they all use [1m] or wider.
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+  # Stamped on every series leaving this server. Meaningless with one Prometheus and essential
+  # with two, which is exactly when nobody remembers to add it.
+  external_labels:
+    cluster: dpe-local
+
+scrape_configs:
+  - job_name: dpe
+    metrics_path: /actuator/prometheus
+
+    # No `authorization:` block, and that is the M6 decision made visible. The scraper holds no
+    # credential; it reaches each service on its MANAGEMENT_PORT, which infra/docker-compose.yml
+    # never publishes to the host. The boundary is the network. If these targets ever move to a
+    # published port this file has to grow a credential on the same day.
+    #
+    # ONE job, not three. `job` would then duplicate the `application` label each service already
+    # stamps on its own meters, and two labels that always agree are two labels that can one day
+    # disagree. Dashboards group on `application` - the application's own claim about who it is,
+    # which survives federation and remote_write; `job` is only this file's opinion.
+    static_configs:
+      - targets:
+          - payment-orchestrator:9091
+          - account-service:9092
+          - payment-gateway:9093
+
+  # Prometheus scraping itself. Cheap, and the only way to notice that scrapes are failing when
+  # the thing that would have told you is the thing that is down.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

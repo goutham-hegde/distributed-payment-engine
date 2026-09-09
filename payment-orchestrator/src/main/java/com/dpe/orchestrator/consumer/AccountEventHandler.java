@@ -2,7 +2,7 @@ package com.dpe.orchestrator.consumer;
 
 import com.dpe.events.EventEnvelope;
 import com.dpe.events.FundsTransferred;
-import com.dpe.messaging.inbox.InboxRepository;
+import com.dpe.messaging.inbox.InboxGate;
 import com.dpe.orchestrator.readmodel.TransferProjectionRepository;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
@@ -17,7 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
  * <h2>What {@link #handle} does</h2>
  *
  * <ol>
- *   <li><b>Claims the message</b> with {@link InboxRepository#insertIfAbsent}, which returns 1 for
+ *   <li><b>Claims the message</b> with {@link InboxGate#claim}, which returns 1 for
  *       a first delivery and 0 for a repeat.</li>
  *
  *   <li><b>Returns {@code false} on a repeat</b>, immediately and without throwing. A duplicate is
@@ -44,7 +44,7 @@ import org.springframework.transaction.annotation.Transactional;
  * {@code if (inbox.existsById(id)) return false;} followed by a save - has a window between the
  * check and the insert in which a second consumer thread can pass the same check, and both apply
  * the message. Constraints cannot race; {@code if} statements can. Read
- * {@link InboxRepository#insertIfAbsent}'s javadoc for why a caught
+ * {@link InboxGate#claim}'s javadoc for why a caught
  * {@code DataIntegrityViolationException} is not a workable third option here either.
  *
  * <h2>What this does NOT protect against, on its own</h2>
@@ -58,10 +58,10 @@ import org.springframework.transaction.annotation.Transactional;
 @Component
 public class AccountEventHandler {
 
-    private final InboxRepository inbox;
+    private final InboxGate inbox;
     private final TransferProjectionRepository projections;
 
-    public AccountEventHandler(InboxRepository inbox, TransferProjectionRepository projections) {
+    public AccountEventHandler(InboxGate inbox, TransferProjectionRepository projections) {
         this.inbox = inbox;
         this.projections = projections;
     }
@@ -73,7 +73,7 @@ public class AccountEventHandler {
      */
     @Transactional
     public boolean handle(UUID messageId, String topic, EventEnvelope<FundsTransferred> envelope) {
-        if (inbox.insertIfAbsent(messageId, topic, envelope.eventType()) == 0) {
+        if (!inbox.claim(messageId, topic, envelope.eventType())) {
             return false;
         }
 

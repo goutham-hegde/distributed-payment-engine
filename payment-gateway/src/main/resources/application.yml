@@ -103,6 +103,17 @@ server:
   port: ${SERVER_PORT:8083}
 
 management:
+  # M6. The actuator moves to its own connector, which infra/docker-compose.yml deliberately does
+  # NOT publish: Prometheus scrapes it across the Compose network and the host cannot reach it at
+  # all. That is the whole scrape-credential decision - no token, no basic auth, a network boundary
+  # stated the same way this system already states the one around dpe.account.commands.v1.
+  #
+  # Overridable because tests collapse it back onto the application port: with one connector there
+  # is nothing to tell apart, ManagementPortMatcher matches nothing, and the M5 operator-only rule
+  # governs the actuator exactly as it did before. That is the fail-closed direction.
+  server:
+    port: ${MANAGEMENT_PORT:9093}
+
   endpoints:
     web:
       exposure:
@@ -112,6 +123,43 @@ management:
       show-details: always
       probes:
         enabled: true
+
+  metrics:
+    tags:
+      # Stamped on every meter this process publishes. Prometheus also attaches `job` and
+      # `instance` from its own scrape config, and those are the SCRAPER's opinion about who this
+      # is; `application` is the application's own claim, and it is the one that survives
+      # federation, remote_write, and someone rewriting prometheus.yml. Dashboards group on this.
+      application: payment-gateway
+
+    web:
+      server:
+        # THE cardinality guard, and the one that actually fires in production. Every distinct URI
+        # is a label value, so a path with an id in it - /api/v1/transfers/{id} - is one time
+        # series per transfer if the URI is not templated. Boot templates it correctly; a
+        # hand-written filter or a 404 to a random path does not. On hitting this ceiling
+        # Micrometer stops adding URIs and logs, instead of quietly growing until Prometheus dies.
+        max-uri-tags: 50
+
+    distribution:
+      # A histogram is what makes a real quantile possible: Prometheus computes p99 across
+      # instances from _bucket series, whereas a client-side `percentiles` is pre-computed per
+      # process and CANNOT be averaged or summed - averaging two p99s is not a p99 of anything.
+      # So: buckets here, percentiles never.
+      percentiles-histogram:
+        http.server.requests: true
+        dpe.saga.duration: true
+      # Buckets are not free - each boundary is its own time series, multiplied by every other
+      # label. Bounding the range keeps that count near 30 per meter instead of the ~70 the
+      # default range generates, and the bounds are chosen to bracket what these actually do.
+      minimum-expected-value:
+        http.server.requests: 5ms
+        dpe.saga.duration: 50ms
+      maximum-expected-value:
+        http.server.requests: 5s
+        # A saga outlives its HTTP response, so its ceiling is the timeout sweeper's horizon,
+        # not a request timeout.
+        dpe.saga.duration: 60s
 
 # Runtime-tunable fault injection. These are what the chaos suite manipulates at M7 to force
 # the orchestrator down its compensation path on demand.

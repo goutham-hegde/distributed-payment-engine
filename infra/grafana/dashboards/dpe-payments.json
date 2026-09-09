@@ -1,0 +1,1455 @@
+{
+  "uid": "dpe-payments",
+  "title": "DPE - Payments",
+  "description": "Distributed payment engine, M6.\n\nPanels split three ways on purpose: RED for request-driven work, a section of its own for the saga (which is neither a request nor a resource), and USE for resources. Every panel description names the meter it reads. Panels reading dpe_* stay empty until those meters exist - this dashboard is the specification for them, not a decoration over them.",
+  "tags": [
+    "dpe",
+    "payments",
+    "m6"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "application",
+        "label": "service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "dpe-prometheus"
+        },
+        "query": {
+          "query": "label_values(jvm_info, application)",
+          "refId": "app"
+        },
+        "definition": "label_values(jvm_info, application)",
+        "refresh": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "At a glance",
+      "id": 1,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Transfers accepted /min",
+      "description": "Rate of successful POST /api/v1/transfers. The business's own definition of throughput - not requests, not messages. 2xx only: a 422 is a request the system handled correctly and a payment that never happened.",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_seconds_count{application=\"payment-orchestrator\",uri=\"/api/v1/transfers\",method=\"POST\",status=~\"2..\"}[5m])) * 60",
+          "legendFormat": "accepted/min",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Compensation rate",
+      "description": "COMPENSATED terminal sagas as a fraction of sagas started, over 5m.\n\nThe single most useful number on this dashboard. A compensated saga is NOT an error - the money went back, every invariant held, the system did exactly what it was built to do - so it appears in no error rate and no 5xx graph. This is the only place a degrading downstream PSP becomes visible before customers notice.\n\nMetrics: dpe.saga.terminal{status}, dpe.saga.started",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 5,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(dpe_saga_terminal_total{application=\"payment-orchestrator\",status=\"COMPENSATED\"}[5m]))\n  / clamp_min(sum(rate(dpe_saga_started_total{application=\"payment-orchestrator\"}[5m])), 0.001)",
+          "legendFormat": "compensated",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.02
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Outbox backlog",
+      "description": "Unpublished outbox rows across all three services.\n\nWhy backlog and not publish throughput: a relay that has STOPPED and a system with NO TRAFFIC produce the same throughput graph - zero. Backlog tells them apart. It is the difference between 'quiet' and 'broken', which is the first question in every incident.\n\nMetric: dpe.outbox.backlog",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 10,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(dpe_outbox_backlog)",
+          "legendFormat": "rows",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": null,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 500
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Oldest unpublished row",
+      "description": "Age of the oldest un-relayed outbox row anywhere.\n\nStrictly better than backlog as an alert: a large backlog that is draining is fine, a single row stuck for ten minutes is a broken relay. Depth measures volume, age measures progress.\n\nMetric: dpe.outbox.age (seconds)",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 14,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "max(dpe_outbox_age_seconds)",
+          "legendFormat": "oldest",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": null,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 120
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Dead letters",
+      "description": "Unresolved rows in dead_letters, summed over services.\n\nNot a rate - a DEPTH, because a dead letter is not an event that passed, it is work still sitting there. Anything above zero is a human's queue.\n\nMetric: dpe.dlq.depth",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(dpe_dlq_depth)",
+          "legendFormat": "messages",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": null,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Sagas in flight",
+      "description": "Non-terminal sagas. Should return to zero after a burst; a floor that never comes back down is invariant I4 failing in slow motion, visible here long before verify-invariants.sh runs.\n\nMetric: dpe.saga.inflight{state}",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(dpe_saga_inflight{application=\"payment-orchestrator\"})",
+          "legendFormat": "in flight",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": null,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 500
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Golden signals - RED (request-driven work)",
+      "id": 8,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate - requests by endpoint",
+      "description": "Built in. http.server.requests comes from Boot with no code written; `uri` is the TEMPLATED path, which is what keeps this bounded - /api/v1/transfers/{id} is one series, not one per transfer. management.metrics.web.server.max-uri-tags=50 is the backstop if templating ever fails.",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (uri, method) (rate(http_server_requests_seconds_count{application=\"$application\"}[1m]))",
+          "legendFormat": "{{method}} {{uri}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors - by outcome",
+      "description": "Split rather than summed. CLIENT_ERROR is usually the caller's problem (a 422 for insufficient funds, a 403 for the wrong owner) and SERVER_ERROR is always ours; one blended ratio pages somebody at 3am because a client sent a bad request.",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (outcome) (rate(http_server_requests_seconds_count{application=\"$application\",outcome!=\"SUCCESS\"}[1m]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Duration - p50 / p95 / p99",
+      "description": "Computed from _bucket series by Prometheus, NOT from client-side percentiles.\n\nThis is why management.metrics.distribution.percentiles-histogram is set instead of `percentiles`: a percentile computed inside one JVM cannot be aggregated across instances - averaging two p99s produces a number that is not the p99 of anything. Buckets CAN be summed, so this query stays correct with three replicas behind a load balancer.",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_server_requests_seconds_bucket{application=\"$application\"}[5m])))",
+          "legendFormat": "p50",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{application=\"$application\"}[5m])))",
+          "legendFormat": "p95",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{application=\"$application\"}[5m])))",
+          "legendFormat": "p99",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "The saga - long-lived work, which is neither RED nor USE",
+      "id": 12,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Starts vs terminal outcomes",
+      "description": "Sagas started against sagas reaching each terminal state. In steady state the lines meet; a persistent gap is work accumulating in flight.\n\nMetrics: dpe.saga.started, dpe.saga.terminal{status=COMPLETED|COMPENSATED|FAILED}",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(dpe_saga_started_total{application=\"payment-orchestrator\"}[1m])) * 60",
+          "legendFormat": "started",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (status) (rate(dpe_saga_terminal_total{application=\"payment-orchestrator\"}[1m])) * 60",
+          "legendFormat": "{{status}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Saga duration by outcome - p50 / p95 / p99",
+      "description": "Start to terminal state, which OUTLIVES the HTTP response - the request returns 202 while the saga is still running, so no request timer can measure this. Split by status on purpose: a COMPENSATED saga is legitimately slower than a COMPLETED one (it did strictly more work), and blending them hides both.\n\nMetric: dpe.saga.duration{status} - a Timer, with buckets enabled in application.yml",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le, status) (rate(dpe_saga_duration_seconds_bucket{application=\"payment-orchestrator\"}[5m])))",
+          "legendFormat": "p50 {{status}}",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, status) (rate(dpe_saga_duration_seconds_bucket{application=\"payment-orchestrator\"}[5m])))",
+          "legendFormat": "p95 {{status}}",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, status) (rate(dpe_saga_duration_seconds_bucket{application=\"payment-orchestrator\"}[5m])))",
+          "legendFormat": "p99 {{status}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "In flight by state",
+      "description": "A gauge over saga_instances grouped by state - the live version of invariant I4. STARTED piling up means replies are not arriving; RESERVED piling up means the gateway is not answering; COMPENSATING piling up means the release command is not landing. The SHAPE names the broken hop, which no single counter can do.\n\nMetric: dpe.saga.inflight{state}",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (state) (dpe_saga_inflight{application=\"payment-orchestrator\"})",
+          "legendFormat": "{{state}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "The messaging spine - outbox, inbox, dead letters",
+      "id": 16,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox backlog by service",
+      "description": "COUNT of rows with published_at IS NULL, per service.\n\nA gauge like this runs a query on EVERY SCRAPE - every 10 seconds, forever, against a table on the write path of every payment. It must be an index-only count using the same partial index the relay itself uses, or the metric becomes a sequential scan that degrades the system it was added to observe. Measuring is not free.\n\nMetric: dpe.outbox.backlog",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "dpe_outbox_backlog",
+          "legendFormat": "{{application}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest unpublished row, by service",
+      "description": "Age, not depth. Depth answers 'how much', age answers 'is it moving' - and only the second distinguishes a busy relay from a dead one.\n\nMetric: dpe.outbox.age (seconds)",
+      "id": 18,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "dpe_outbox_age_seconds",
+          "legendFormat": "{{application}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Inbox duplicates suppressed",
+      "description": "Messages the inbox recognised as already processed and skipped.\n\nNOT an error graph - it is the proof that at-least-once delivery is being absorbed correctly, and a healthy system shows a non-zero trickle. Zero forever is suspicious: either the broker has never redelivered anything, or the dedup key is wrong and duplicates are getting through as fresh work.\n\nMetric: dpe.inbox.duplicate",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (application) (rate(dpe_inbox_duplicate_total[5m])) * 60",
+          "legendFormat": "{{application}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "The API edge - idempotency",
+      "id": 20,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Gate outcomes",
+      "description": "What the idempotency gate decided, per request.\n\n`replay` is the mechanism working - a client retried and got the first answer back instead of a second payment. `conflict` is a client reusing one key for a DIFFERENT body, which is a bug in the caller and worth seeing. `in_flight` is a duplicate that arrived while the first was still running.\n\nMetric: dpe.idempotency.request{outcome}",
+      "id": 21,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (outcome) (rate(dpe_idempotency_request_total{application=\"payment-orchestrator\"}[1m])) * 60",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis fast path - hit ratio and availability",
+      "description": "Redis is a cache and an anti-stampede lock, never a correctness dependency. This panel exists to make that claim falsifiable: `docker compose stop redis` should send the hit ratio to zero and change NOTHING on any other panel except latency.\n\nMetric: dpe.idempotency.cache{result=hit|miss|unavailable}",
+      "id": 22,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(dpe_idempotency_cache_total{application=\"payment-orchestrator\",result=\"hit\"}[5m]))\n  / clamp_min(sum(rate(dpe_idempotency_cache_total{application=\"payment-orchestrator\"}[5m])), 0.001)",
+          "legendFormat": "hit ratio",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(dpe_idempotency_cache_total{application=\"payment-orchestrator\",result=\"unavailable\"}[5m])) * 60",
+          "legendFormat": "unavailable/min",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Resources - USE",
+      "id": 23,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "JVM heap used",
+      "description": "All three JVMs are capped at -Xmx256m in Compose because RAM is this project's binding constraint. A heap that flattens against the ceiling with rising GC time is the shape to recognise.",
+      "id": 24,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (application) (jvm_memory_used_bytes{area=\"heap\"})",
+          "legendFormat": "{{application}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection pool - active and pending",
+      "description": "USE in its purest form. `pending` above zero means threads are QUEUING for a connection: the pool is saturated, and every latency graph above is about to move for a reason that has nothing to do with the code being slow. Utilisation without saturation is just a busy system.",
+      "id": 25,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (application) (hikaricp_connections_active)",
+          "legendFormat": "active {{application}}",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (application) (hikaricp_connections_pending)",
+          "legendFormat": "PENDING {{application}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka consumer lag",
+      "description": "Records behind the end of the partition, straight from the client's own metrics. Rising lag with healthy consumers means the handler is slower than the producer; rising lag with NO consumer activity is the poison-message stall this project has hit for real - see the compression note in the M4 log.",
+      "id": 26,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum by (application, client_id) (kafka_consumer_fetch_manager_records_lag)",
+          "legendFormat": "{{application}} {{client_id}}",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

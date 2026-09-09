@@ -6,7 +6,7 @@ import com.dpe.events.FundsReserved;
 import com.dpe.events.GatewayApproved;
 import com.dpe.events.GatewayDeclined;
 import com.dpe.events.ReserveRejected;
-import com.dpe.messaging.inbox.InboxRepository;
+import com.dpe.messaging.inbox.InboxGate;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,10 +28,10 @@ public class SagaReplyHandler {
 
     private static final Logger log = LoggerFactory.getLogger(SagaReplyHandler.class);
 
-    private final InboxRepository inbox;
+    private final InboxGate inbox;
     private final SagaOrchestrator orchestrator;
 
-    public SagaReplyHandler(InboxRepository inbox, SagaOrchestrator orchestrator) {
+    public SagaReplyHandler(InboxGate inbox, SagaOrchestrator orchestrator) {
         this.inbox = inbox;
         this.orchestrator = orchestrator;
     }
@@ -41,7 +41,7 @@ public class SagaReplyHandler {
      */
     @Transactional
     public boolean handle(UUID messageId, String topic, String eventType, Object reply) {
-        if (inbox.insertIfAbsent(messageId, topic, eventType) == 0) {
+        if (!inbox.claim(messageId, topic, eventType)) {
             return false;
         }
 
@@ -63,6 +63,6 @@ public class SagaReplyHandler {
     /** Records a reply this version does not understand, without acting on it. */
     @Transactional
     public boolean skip(UUID messageId, String topic, String eventType) {
-        return inbox.insertIfAbsent(messageId, topic, eventType) != 0;
+        return inbox.claim(messageId, topic, eventType);
     }
 }

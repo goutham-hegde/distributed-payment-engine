@@ -1,9 +1,12 @@
 package com.dpe.orchestrator.security;
 
+import com.dpe.security.ManagementPortMatcher;
 import com.dpe.security.Roles;
 import com.dpe.security.RolesConverter;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -121,6 +124,69 @@ public class SecurityConfig {
                 // a 403 for a caller whose token visibly contains the right role.
                 .oauth2ResourceServer(oauth2 ->
                         oauth2.jwt(jwt -> jwt.jwtAuthenticationConverter(roles)));
+
+        return http.build();
+    }
+
+    /**
+     * Recognises the management connector. Configuration in, no opinion attached - the opinion is
+     * the chain below. Fails closed: if {@code management.server.port} is unset or equal to
+     * {@code server.port} there is no second connector, this matches nothing, and the actuator
+     * stays operator-only exactly as it was at M5.
+     */
+    @Bean
+    ManagementPortMatcher managementPortMatcher(
+            @Value("${server.port:8080}") int applicationPort,
+            @Value("${management.server.port:-1}") int managementPort) {
+        return new ManagementPortMatcher(applicationPort, managementPort);
+    }
+
+    /**
+     * <b>M6: the scrape path.</b> Everything arriving on the management connector is permitted,
+     * and nothing else in this class changes.
+     *
+     * <h3>Why a second chain rather than a rule in the first one</h3>
+     *
+     * <p>Because the question is about a socket, not a path. {@code /actuator/prometheus} must be
+     * open on 9091 and shut on 8081, and {@code requestMatchers} cannot express that - it sees a
+     * path. {@code securityMatcher} selects the whole chain, so the two connectors get two sets of
+     * rules, which is what the deployment actually is.
+     *
+     * <h3>Why this is not simply a hole</h3>
+     *
+     * <p>Port 9091 appears in no {@code ports:} block in {@code infra/docker-compose.yml}. It is
+     * reachable from other containers on the Compose network and from nowhere else - not the host,
+     * not a browser, not the internet. The trust boundary is the network, which is the same answer
+     * this system already gives for {@code dpe.account.commands.v1}: nobody authenticates to
+     * produce to that topic either. Stating it the same way twice is deliberate; a system with two
+     * different stories about where its perimeter is has neither.
+     *
+     * <p>And note what is <i>not</i> being claimed. This is not "the actuator is safe because it is
+     * on another port". Anything that can open a socket on the Compose network can read these
+     * metrics. That is an accepted, bounded exposure - metric names and bounded label values, no
+     * account ids, no amounts, no tokens - and it is accepted knowingly rather than by omission.
+     * The cardinality rule in {@code MetricsConfig} is what keeps it true.
+     *
+     * <h3>The trap this exists to defeat</h3>
+     *
+     * <p>A separate management port is <b>not</b> unprotected by default. Boot registers the
+     * parent context's {@code springSecurityFilterChain} on the management connector, so without
+     * this chain every M5 rule applies to 9091 and Prometheus gets a 401. See
+     * {@link ManagementPortMatcher} for the exact autoconfiguration that does it.
+     *
+     * <p>No {@code oauth2ResourceServer} here on purpose: a scraper presents no token, and a chain
+     * that parses an absent credential only creates a way to fail.
+     */
+    @Bean
+    @Order(0)
+    SecurityFilterChain managementChain(HttpSecurity http, ManagementPortMatcher managementPort)
+            throws Exception {
+        http
+                .securityMatcher(managementPort)
+                .csrf(AbstractHttpConfigurer::disable)
+                .sessionManagement(session ->
+                        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -> auth.anyRequest().permitAll());
 
         return http.build();
     }

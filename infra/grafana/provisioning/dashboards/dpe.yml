@@ -1,0 +1,16 @@
+apiVersion: 1
+
+providers:
+  - name: dpe
+    orgId: 1
+    folder: DPE
+    type: file
+    # The dashboards are files in the repo and are reloaded from disk, so an edit in the Grafana
+    # UI is a scratch change that the next restart discards. That is intended: a dashboard that
+    # only exists in a volume is a dashboard nobody can review, diff, or restore.
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
