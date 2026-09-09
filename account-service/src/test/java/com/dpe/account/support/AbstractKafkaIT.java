@@ -1,6 +1,8 @@
 package com.dpe.account.support;
 
+import com.dpe.events.EventEnvelope;
 import com.dpe.events.Topics;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -12,9 +14,14 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import java.util.concurrent.TimeUnit;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.testcontainers.redpanda.RedpandaContainer;
@@ -57,21 +64,37 @@ public abstract class AbstractKafkaIT extends AbstractPostgresIT {
      */
     private final Map<TopicPartition, Long> watermark = new HashMap<>();
 
+    /**
+     * Every topic this module's tests observe. Watermarked together, so a test can assert on the
+     * command topic or a dead letter topic as easily as on the event topic - M4 part 2 needs
+     * both, since a replay publishes back to the topic the message originally failed on.
+     */
+    private static final List<String> WATCHED_TOPICS = List.of(
+            Topics.ACCOUNT_EVENTS,
+            Topics.ACCOUNT_COMMANDS,
+            Topics.ACCOUNT_COMMANDS + Topics.DLT_SUFFIX);
+
     @BeforeEach
     void markTopicPosition() {
         jdbc.execute("TRUNCATE TABLE outbox");
         watermark.clear();
         try (KafkaConsumer<String, String> consumer = probeConsumer()) {
-            List<TopicPartition> partitions = partitionsOf(consumer, Topics.ACCOUNT_EVENTS);
-            watermark.putAll(consumer.endOffsets(partitions));
+            for (String topic : WATCHED_TOPICS) {
+                watermark.putAll(consumer.endOffsets(partitionsOf(consumer, topic)));
+            }
         }
     }
 
     /** Every record published to {@link Topics#ACCOUNT_EVENTS} since this test began. */
     protected List<ConsumerRecord<String, String>> publishedNow() {
+        return publishedNow(Topics.ACCOUNT_EVENTS);
+    }
+
+    /** Every record published to {@code topic} since this test began. */
+    protected List<ConsumerRecord<String, String>> publishedNow(String topic) {
         List<ConsumerRecord<String, String>> collected = new ArrayList<>();
         try (KafkaConsumer<String, String> consumer = probeConsumer()) {
-            List<TopicPartition> partitions = partitionsOf(consumer, Topics.ACCOUNT_EVENTS);
+            List<TopicPartition> partitions = partitionsOf(consumer, topic);
             consumer.assign(partitions);
             for (TopicPartition partition : partitions) {
                 consumer.seek(partition, watermark.getOrDefault(partition, 0L));
@@ -98,6 +121,39 @@ public abstract class AbstractKafkaIT extends AbstractPostgresIT {
     protected static String headerOf(ConsumerRecord<String, String> record, String name) {
         var header = record.headers().lastHeader(name);
         return header == null ? null : new String(header.value());
+    }
+
+    /**
+     * Publishes a record with the relay's headers but an arbitrary body.
+     *
+     * <p>The relay itself could never produce this: it only ever writes JSON it serialized inside
+     * a transaction. Standing in for a BROKEN producer is exactly the point - a truncated payload,
+     * or one written by a version this consumer no longer agrees with, is how a poison message
+     * actually arrives.
+     */
+    protected void publishRaw(String topic, UUID messageId, UUID aggregateId, String eventType,
+                              String body) {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, REDPANDA.getBootstrapServers());
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+            ProducerRecord<String, String> record =
+                    new ProducerRecord<>(topic, aggregateId.toString(), body);
+            record.headers()
+                    .add(EventEnvelope.MESSAGE_ID_HEADER,
+                            messageId.toString().getBytes(StandardCharsets.UTF_8))
+                    .add(EventEnvelope.EVENT_TYPE_HEADER,
+                            eventType.getBytes(StandardCharsets.UTF_8));
+            producer.send(record).get(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while publishing test record", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("could not publish test record", e);
+        }
     }
 
     protected Map<String, Object> outboxRow(UUID messageId) {

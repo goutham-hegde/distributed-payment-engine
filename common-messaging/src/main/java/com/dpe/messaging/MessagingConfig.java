@@ -1,5 +1,6 @@
 package com.dpe.messaging;
 
+import com.dpe.messaging.deadletter.DeadLetterProperties;
 import com.dpe.messaging.outbox.OutboxProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.ComponentScan;
@@ -62,6 +63,6 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @Configuration
 @EnableScheduling
 @ComponentScan(basePackageClasses = MessagingConfig.class)
-@EnableConfigurationProperties(OutboxProperties.class)
+@EnableConfigurationProperties({OutboxProperties.class, DeadLetterProperties.class})
 public class MessagingConfig {
 }

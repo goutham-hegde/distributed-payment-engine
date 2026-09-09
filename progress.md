@@ -1088,3 +1088,283 @@ and this is the executable form of that claim.
   message is a second delivery of a message the inbox may already have recorded, so replay either
   goes through the inbox (and may be a no-op, which the operator must be told) or around it (and is
   no longer idempotent).
+
+---
+
+### M4 (part 2) — Retry, dead letters and replay, specified · 2026-09-09
+
+**Goal**
+
+Close the last hole in the consumer path. Up to this point every listener in the system ran on
+Spring Boot's default error handling, and that default is worth stating plainly because it is not
+what most people assume it is: `DefaultErrorHandler` retries a failed record **ten times with no
+delay between attempts**, and then **logs the exception and commits the offset**. A `ReserveFunds`
+command that fails ten times inside a few milliseconds — a two-second database failover is more
+than enough — is discarded. The saga is never told, so it sits in `STARTED` until the timeout
+sweeper compensates it, and the only surviving evidence is a stack trace.
+
+So: bounded retry with exponential backoff, a classifier that separates transient failures from
+poison ones, a dead letter topic, a queryable dead letter table, a replay endpoint, and the expiry
+sweep that stops `idempotency_records` growing without limit.
+
+**Decisions made**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Dead letter transport | A `.dlt` Kafka topic **and** a `dead_letters` table fed by a listener on it | The topic is what makes the failure durable at the moment of failure, in the same infrastructure, with no database needed. But a log answers none of an operator's questions — how deep is the queue, what have I already replayed, show me every failure for this transfer. Those are queries. Depth becomes a `COUNT`, replay becomes a row update, and the console planned for M6.5 needs no Kafka client in the browser. |
+| Dead letter dedup key | `(original_topic, original_partition, original_offset)`, **not** the message id | A replayed message that fails again is genuinely a second failure and must produce a second row; keying on the message id would silently discard it, and the operator would see an empty queue while the same message kept dying. Kafka coordinates are unique forever, so they identify the *failure* rather than the message. Same rule as the inbox — a dedup key must be unique across everything sharing the table — applied to a table whose rows are events *about* messages. |
+| Does a replay go through the inbox? | Through it, deliberately | Left open at the end of part 1; it resolves cleanly in both directions. A technical failure throws, which rolls back the inbox row with it, so a dead-lettered message left no trace of consumption and its replay is a first delivery. In the rarer case where the handler committed but the acknowledgement did not, the replay is a duplicate — exactly what the inbox exists to absorb. Replay is therefore safe without the operator having to know which case they are in, and that property is bought entirely by the idempotent-consumer work in M2 and M3. |
+| Shape of the classifier | A predicate over the whole cause chain, not a list of exception classes | Spring hands the error handler a `ListenerExecutionFailedException` every time; the exception that decides the outcome is one or two levels down. `addNotRetryableExceptions(...)` matches on the top of the chain, so it would see one type for the entire system and classify nothing — and it would fail silently, in whichever direction the default happened to point. |
+| Dead letter listener gets its own container factory | Yes | If it inherited the main error handler, a failure while recording would publish to `<topic>.dlt.dlt`, which nothing consumes: not lost exactly, but somewhere nobody will ever look, which is worse than lost because it looks handled. Its handler retries forever and never recovers, so a database outage blocks that partition rather than dropping the last copy. Blocking is the right failure mode for the one listener that has nowhere further to fall. |
+| Payload column | `TEXT`, not `jsonb` | A message can be here *because* it is not valid JSON. A `jsonb` column would reject exactly the rows the table exists to hold, so the insert recording the failure would itself fail. |
+| Backoff ceiling | Bounded, and bounded well below `max.poll.interval.ms` | The default backoff handler sleeps in the listener thread, so `maxAttempts x maxInterval` is time the consumer is not polling. Exceed five minutes and the broker evicts the consumer and rebalances — handing the partition to an instance that starts the retry budget again at zero. An unbounded backoff does not produce patient retries, it produces a rebalance loop. |
+| Sweep the idempotency table, but not the inbox | Only `idempotency_records` | Retention on an idempotency key is a *published contract*: a retry after 24 hours is documented as a new payment, so deleting an expired key changes nothing that was promised. An inbox row has no such contract — the thing that might redeliver is the broker, and its redelivery window is broker retention plus consumer lag plus however long a partition can stall. Delete an inbox row while redelivery is still possible and money moves twice. Retention policy is a statement about what can still happen, not housekeeping. |
+
+**Built**
+
+- `V4__dead_letters.sql` in all three service databases (`V2` in the gateway), each service owning
+  its own table exactly as it owns its own `outbox` and `inbox`.
+- `common-messaging/deadletter/` — the entity and repository, `DeadLetterProperties`,
+  `KafkaErrorHandlingConfig` (the `DefaultErrorHandler`, the `DeadLetterPublishingRecoverer`, the
+  delivery-attempt container customizer, and the separate factory for the dead letter listener),
+  `DeadLetterRecorder`, `DeadLetterConsumer`, and `DeadLetterController` exposing depth, listing,
+  by-key lookup and replay under `/admin/dead-letters`.
+- `RetryClassifier` and `DeadLetterReplayService` — specified, with their tests; implementation
+  follows.
+- `IdempotencySweeper` and `IdempotencySweepScheduler` in the orchestrator, plus three new
+  `dpe.idempotency.*` keys (`sweep-interval`, `sweep-batch-size`, `scheduled`).
+- Each service's `KafkaTopicsConfig` gained a `NewTopic` for its dead letter topics and a
+  `dltTopics` bean. The listener resolves its topic list from that bean via `#{@dltTopics}` rather
+  than from a property, so the names it subscribes to derive from the same constants the admin
+  client creates them with and cannot drift apart.
+
+The web starter is an **optional** dependency of `common-messaging`: `DeadLetterController` needs
+the annotations to compile, but a library that ships the outbox must not force an HTTP stack on
+whatever depends on it. `@ConditionalOnWebApplication` keeps the bean from being registered where
+those classes are absent, and because the condition is read from annotation metadata the class is
+never loaded there at all.
+
+Config choices worth remembering: four deliveries total (not four retries), a 500 ms initial
+interval doubling to a 5 s ceiling, 100 ms of jitter, replay batches of 50, and a five-minute
+sweep of at most 500 expired keys per statement.
+
+**What broke**
+
+1. **`ExponentialBackOffWithMaxRetries` does not exist in Spring Framework 7.** Every Spring Kafka
+   tutorial written before 2025 uses it in exactly this position. It was folded into
+   `ExponentialBackOff.setMaxAttempts(int)`. Note the off-by-one that comes with it:
+   `setMaxAttempts(n)` yields *n* intervals and then stops, so total deliveries are *n + 1* — the
+   first attempt was not a retry.
+
+2. **`ExponentialBackOff.setJitter` takes milliseconds, not a fraction.** `setJitter(0.2)`
+   expecting "20% spread" does not compile, which is the lucky outcome; `setJitter(1)` expecting
+   the same compiles and adds one millisecond of spread, which is indistinguishable from working.
+
+3. **The DLT origin headers are binary, not text.** Spring writes `kafka_dlt-original-partition`
+   and `-offset` as big-endian `int`/`long`, while a header set by hand or by another client
+   library is usually the decimal string. A reader that only parses text does not throw on the
+   binary form — it returns 825373492, which is the ASCII bytes of `"1234"` read as an int. The
+   recorder handles both encodings and the test fixture deliberately writes the binary one.
+
+4. **A dead letter topic left to auto-creation fails in the cruellest available place.** Broker
+   auto-creation is off in this project, so an undeclared `.dlt` topic makes the *recoverer's* own
+   publish fail — and `DefaultErrorHandler` logs and swallows that. The message would be lost by
+   the machinery built to save it, and only ever on a day when something else was already going
+   wrong. Every dead letter topic is now declared with a `NewTopic` alongside the topic it shadows.
+
+**Verified**
+
+The scaffolding compiles, every context starts with the new beans, the dead letter topics are
+created, and the listener is assigned all three of their partitions:
+
+```
+./mvnw -B -ntp compile                                     BUILD SUCCESS
+
+./mvnw -pl account-service -am test -Dtest=DeadLetterRecorderTest \
+       -Dsurefire.failIfNoSpecifiedTests=false
+  account-service: partitions assigned: [dpe.account.commands.v1.dlt-0,
+                                         dpe.account.commands.v1.dlt-1,
+                                         dpe.account.commands.v1.dlt-2]
+  Tests run: 6, Failures: 0, Errors: 0, Skipped: 0         BUILD SUCCESS
+```
+
+The three unwritten methods fail, and fail only for their own reason rather than on a context
+error:
+
+```
+RetryClassifierTest      Tests run: 13, Errors: 13   UnsupportedOperationException
+DeadLetterReplayTest     Tests run:  6, Errors:  6   UnsupportedOperationException
+IdempotencySweepTest     Tests run:  5, Errors:  5   UnsupportedOperationException
+```
+
+Nothing else is claimed as verified yet.
+
+**Open / next**
+
+- `RetryClassifier.isRetryable`, `DeadLetterReplayService.replay` / `replayPending`, and
+  `IdempotencySweeper.sweep`.
+- `PoisonMessageTest` — the end-to-end proof that a poison message leaves its partition and that a
+  good message queued behind it on the same key is still processed — goes green only once the
+  classifier exists, since the error handler consults it on every failure.
+- One question deliberately left open in `IdempotencySweeper`: whether a single transaction around
+  the whole batch loop is right, given that batching exists precisely to avoid one long
+  lock-holding statement against a table that sits on the write path.
+- Not every poison message is reachable by a DLQ. A record whose failure happens inside
+  `consumer.poll()` — a deserializer that throws, or the compression codec that could not load its
+  native library in M2 — fails below the listener with no record attached, so no recoverer runs and
+  the partition spins. The defence there is a deserializer that cannot throw
+  (`ErrorHandlingDeserializer`), which is a different mechanism at a different layer and is not
+  built yet.
+
+---
+
+### M4 (part 2b) — Retry, dead letters and replay, implemented · 2026-09-09
+
+**Goal**
+
+Write the three methods left open by part 2 — the retry classifier, the dead letter replay, and the
+idempotency expiry sweep — and verify the whole path against the real stack rather than only
+against Testcontainers.
+
+**Decisions made**
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Where the sweeper's transaction goes | One per batch, via an injected `TransactionTemplate` | Three shapes were possible and two are wrong. **No transaction** does not run at all: a Spring Data `@Modifying` query without one throws `InvalidDataAccessApiUsageException: No active transaction for update or delete query`. **One around the loop** runs and quietly undoes the batching — every batch's row locks are then held until the last batch finishes, which is exactly the long lock-holding statement against a hot table that `LIMIT` existed to prevent, and it makes the sweep all-or-nothing for rows that have no relationship to each other. **One per batch** commits and releases as it goes, so a failure costs one batch and keeps the progress before it. A `TransactionTemplate` rather than a second `@Transactional` method, because a self-invocation never reaches the proxy and would fail as case one while looking correct. |
+| Classifier walks the cause chain with an identity-set guard | Yes | The container hands over a `ListenerExecutionFailedException` every time, so a classifier reading only the top of the chain sees one type for the whole system. The visited-set is not paranoia: `getCause()` returning `this` is legal, and a naive loop hangs inside a listener while holding a partition — a hang, not a failure, which is the hardest thing to diagnose from outside. |
+| `DataAccessResourceFailureException` listed explicitly | Yes | It sits under `NonTransientDataAccessResourceException`, so an `instanceof TransientDataAccessException` test alone misses it — and would classify an unreachable database as poison and dead-letter it on the first attempt, which is the worst possible answer for the most common transient fault there is. |
+| A letter with no `message_id` is refused, not repaired | Refused, permanently and loudly | Those rows exist by design: a record with a missing or unparseable message id is dropped before any handler sees it, which is how it reaches the table. Replaying it puts a message on the topic that no consumer can dedupe. Minting a replacement id is worse — it makes the message look new to every inbox in the system, which is a deliberate double-spend dressed as a fix. The row stays pending and stays visible; republishing the intent is a decision for a human. |
+| `exception_type` stores the cause, not the caught exception | Cause, falling back to the wrapper | Spring stamps `DLT_EXCEPTION_FQCN` with what it caught, which for anything thrown out of a listener is `ListenerExecutionFailedException`. A column whose purpose is "group failures by kind" would then read identically on every row and answer nothing. `DLT_EXCEPTION_CAUSE_FQCN` carries what actually broke. |
+
+**Built**
+
+- `RetryClassifier.isRetryable` — cause-chain walk with an `IdentityHashMap`-backed visited set,
+  poison checked before transient at each level, defaulting to non-retryable for an unrecognised
+  type.
+- `DeadLetterReplayService.replay` / `replayPending` — original topic, original key, original
+  message id and event type; publish-then-mark with the wait bounded by `sendTimeout`; per-letter
+  failures logged and skipped so one bad row cannot roll back the batch's successes, with an
+  interrupt breaking the loop instead, since that is the JVM shutting down rather than one bad
+  message.
+- `IdempotencySweeper.sweep` — batches until one comes back short, capped at 1000 batches, one
+  transaction per batch.
+- `DeadLetterRecorder` now prefers the exception cause over the listener wrapper.
+- Four new tests covering the refusal path, the bulk-replay skip, and the cause-vs-wrapper column.
+
+**What broke**
+
+1. **A hand-produced test message wedged a partition, in a system whose producers are all correctly
+   configured.** `rpk topic produce` **compresses with snappy by default**. The consumer runs on
+   `eclipse-temurin:21-jre-alpine`, so `libsnappyjava.so` cannot load against musl, and the failure
+   happens inside `consumer.poll()` — below the listener, with no record attached. `DefaultErrorHandler`
+   refuses it outright ("this error handler cannot process `org.apache.kafka.common.KafkaException`s;
+   no record information is available"), the retry policy never runs, the dead letter topic never
+   sees it, and the partition spins on that offset producing roughly 600,000 identical stack traces
+   before it was noticed.
+
+   This is the M2 compression trap arriving from an unexpected direction: not from a producer
+   setting, which is pinned to `none` in all three services, but from the CLI tool used to test
+   them. It is also the live proof of a claim that had until now only been asserted — **not every
+   poison message is reachable by a DLQ.** Recovery is the documented one and it does work: stop the
+   consumer (seek needs an empty group), `rpk group seek <group> --to end --topics <topic>`, start it
+   again. Producing with `--compression none` reproduces the intended payload-level poison instead.
+
+2. **Removing `@Transactional` from the sweeper made it fail, not run unbounded.** See the decisions
+   table. Worth recognising on sight because the message names the symptom rather than the cause.
+
+3. **A test asserting on a global `count(*)` measured the suite's history, not its own behaviour.**
+   `PoisonMessageTest` passed alone and failed after `DeadLetterReplayTest`. A Kafka topic is a log
+   and consumer group offsets outlive a test class, so messages one class published and never
+   consumed are delivered to the next class's listener, fail there, and land in the table under
+   assertion. Fixed by scoping every count to the test's own aggregate id.
+
+4. **A fixture cannot insert an already-expired idempotency key with the default `created_at`.**
+   The table carries `CHECK (expires_at > created_at)` and `created_at` defaults to `now()`. That is
+   the constraint doing its job — in production the pair is always written together as `now()` and
+   `now() + retention` — so the fixture backdates both rather than working around it.
+
+**Verified**
+
+Full suite:
+
+```
+./mvnw -B -ntp verify
+
+common-messaging       Tests run:  13, Failures: 0, Errors: 0
+account-service        Tests run:  54, Failures: 0, Errors: 0
+payment-orchestrator   Tests run:  40, Failures: 0, Errors: 0
+payment-gateway        Tests run:   6, Failures: 0, Errors: 0
+BUILD SUCCESS
+```
+
+Live on Compose — `docker compose build`, `up -d`, all six containers healthy, all eight topics
+present at three partitions each including the four `.dlt` topics.
+
+A poison message produced by hand onto `dpe.account.commands.v1`:
+
+```
+{"pending":1}
+
+  "messageId":      "392d0ee0-5755-4413-81c7-4f5965b77b13",
+  "originalTopic":  "dpe.account.commands.v1",
+  "originalOffset": 0,
+  "payload":        "{\"messageId\":\"392d...\",\"eventType\":\"ReserveFunds\",",
+  "exceptionType":  "tools.jackson.core.exc.StreamReadException",
+  "attempts":       1,
+```
+
+`attempts: 1` is the classifier working: unparseable JSON is poison, so it went straight to the dead
+letter topic without spending the retry budget. `exceptionType` is the cause rather than
+`ListenerExecutionFailedException`, which is the recorder change.
+
+The partition kept moving — a transfer submitted afterwards reached `COMPLETED`, with the money
+where it should be:
+
+```
+alice  457500      bob  42500
+```
+
+Replay, and the case that justifies the dedup key:
+
+```
+POST /admin/dead-letters/{id}/replay   HTTP 202
+POST /admin/dead-letters/{id}/replay   HTTP 409     (already replayed)
+
+original_partition@offset   attempts  replayed_at             replay_count
+1@0                         1         2026-09-09 08:16:08     1
+1@3                         1         NULL                    0
+```
+
+The replayed message failed again — the payload is still broken — at a **new offset**, and produced
+a **second row**. Keying the table on the message id would have swallowed that and left the operator
+looking at an empty queue while the same message kept dying.
+
+The expiry sweep, with a key backdated 48 hours:
+
+```
+swept 1 expired idempotency key(s)
+```
+
+And the invariants, after all of it:
+
+```
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (500000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+All invariants hold.
+```
+
+**Open / next**
+
+- M5: JWT. `/admin/dead-letters` is unauthenticated and one of its endpoints republishes payment
+  commands, so it is first in line behind an authenticated role.
+- The gap this milestone proved rather than assumed: a failure inside `consumer.poll()` is below
+  every error handler and no DLQ can reach it. The defence is a deserializer that cannot throw
+  (`ErrorHandlingDeserializer`, which turns the failure into a poison-pill value the listener can
+  see). Not built, and worth doing before the chaos suite at M7 starts breaking things on purpose.
+- `outbox`, `inbox` and `dead_letters` all still grow without limit. Only `idempotency_records` has
+  a sweeper, and the inbox deliberately cannot share its schedule — see the retention argument in
+  `IdempotencySweeper`.

@@ -162,6 +162,26 @@ dpe:
     # How long a caller that lost the lock waits for the winner answer before going to Postgres
     # regardless. Never refuse, never wait forever.
     lock-wait: 500ms
+    # M4 part 2: garbage collection for expired keys. Frequent and small, because this table
+    # is on the path of every write request and a rare enormous DELETE locks exactly the rows
+    # the gate is trying to read.
+    sweep-interval: 5m
+    sweep-batch-size: 500
+    # Tests turn this off and call sweep() directly, so nothing races them.
+    scheduled: true
+
+  # M4 part 2: retry and dead letter policy. See DeadLetterProperties for what each knob trades.
+  dlq:
+    # Four deliveries total, not four retries. Enough to ride out a pod restart or a brief
+    # database failover; not enough for a poison message to hold its partition for long.
+    max-attempts: 4
+    initial-interval: 500ms
+    multiplier: 2
+    # Ceiling on one wait. maxAttempts x maxInterval is time the consumer is NOT polling, and
+    # exceeding max.poll.interval.ms (5 minutes) makes the broker evict this consumer and
+    # rebalance - which hands the partition to an instance that starts the budget again at zero.
+    max-interval: 5s
+    replay-batch-size: 50
 
 server:
   port: ${SERVER_PORT:8081}

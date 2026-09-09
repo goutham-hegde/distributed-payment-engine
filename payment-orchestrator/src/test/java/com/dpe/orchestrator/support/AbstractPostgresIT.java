@@ -34,7 +34,11 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         // it off must change nothing they assert - which is itself asserted, by
         // IdempotencyCacheTest running the same gate WITH Redis and IdempotencyWithoutRedisTest
         // running it with the cache enabled and pointed at nothing.
-        "dpe.idempotency.cache=false"
+        "dpe.idempotency.cache=false",
+        // M4 part 2: and no sweep timer either. Its 5-minute default would not fire inside a
+        // test run, which is exactly the kind of "works by luck" that stops working the day the
+        // interval is shortened. IdempotencySweepTest calls sweep() directly.
+        "dpe.idempotency.scheduled=false"
 })
 public abstract class AbstractPostgresIT {
 
@@ -63,6 +67,7 @@ public abstract class AbstractPostgresIT {
         jdbc.execute("TRUNCATE TABLE inbox");
         jdbc.execute("TRUNCATE TABLE transfer_projection");
         jdbc.execute("TRUNCATE TABLE outbox");
+        jdbc.execute("TRUNCATE TABLE dead_letters");
         // saga_steps references saga_instances which references transfers, and idempotency_records
         // references transfers as well. Truncating them separately fails on a foreign key no
         // matter which order you pick.

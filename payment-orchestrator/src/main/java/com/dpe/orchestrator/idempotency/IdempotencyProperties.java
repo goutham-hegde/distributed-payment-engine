@@ -25,6 +25,18 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param lockWait  how long a caller that failed to take the lock waits for the winner answer to
  *                  appear in the cache before going to Postgres anyway. Never waits forever, and
  *                  never refuses the request: the database is always allowed to arbitrate.
+ * @param sweepInterval  how often expired keys are deleted. Nothing is CORRECT about this number
+ *                  - a key past its retention is already dead to the gate, whether or not the
+ *                  row still exists - so it is purely a bound on how much garbage the table
+ *                  carries. Frequent and small beats rare and enormous: this table is on the path
+ *                  of every write request, and a nightly delete of a day of keys is a long
+ *                  lock-holding statement against exactly the wrong table.
+ * @param sweepBatchSize  rows deleted per statement. See {@code IdempotencyRepository.deleteExpired}
+ *                  for why an unbounded DELETE is the wrong shape here.
+ * @param scheduled  master switch for the sweep timer. Off in tests, which call {@code sweep()}
+ *                  directly so a background thread cannot race their assertions. Boxed, so that
+ *                  an absent key defaults to ON rather than binding to false - a primitive
+ *                  boolean would ship the sweeper silently disabled wherever the key is unset.
  */
 @ConfigurationProperties(prefix = "dpe.idempotency")
 public record IdempotencyProperties(
@@ -32,7 +44,10 @@ public record IdempotencyProperties(
         Duration cacheTtl,
         Boolean cache,
         Duration lockTtl,
-        Duration lockWait) {
+        Duration lockWait,
+        Duration sweepInterval,
+        int sweepBatchSize,
+        Boolean scheduled) {
 
     public IdempotencyProperties {
         retention = retention == null ? Duration.ofHours(24) : retention;
@@ -42,5 +57,8 @@ public record IdempotencyProperties(
         cache = cache == null || cache;
         lockTtl = lockTtl == null ? Duration.ofSeconds(3) : lockTtl;
         lockWait = lockWait == null ? Duration.ofMillis(500) : lockWait;
+        sweepInterval = sweepInterval == null ? Duration.ofMinutes(5) : sweepInterval;
+        sweepBatchSize = sweepBatchSize <= 0 ? 500 : sweepBatchSize;
+        scheduled = scheduled == null || scheduled;
     }
 }

@@ -64,6 +64,7 @@ public abstract class AbstractPostgresIT {
         jdbc.execute("TRUNCATE TABLE ledger_entries RESTART IDENTITY");
         jdbc.execute("TRUNCATE TABLE outbox");
         jdbc.execute("TRUNCATE TABLE inbox");
+        jdbc.execute("TRUNCATE TABLE dead_letters");
         jdbc.update("DELETE FROM accounts WHERE account_type = 'CUSTOMER'");
         // Both non-customer accounts go back to zero. Missing the CLEARING account here would
         // leave a balance behind from a previous test with no entries to justify it, and every

@@ -67,6 +67,19 @@ dpe:
     send-timeout: 5s
     scheduled: true
 
+  # M4 part 2: retry and dead letter policy. See DeadLetterProperties for what each knob trades.
+  dlq:
+    # Four deliveries total, not four retries. Enough to ride out a pod restart or a brief
+    # database failover; not enough for a poison message to hold its partition for long.
+    max-attempts: 4
+    initial-interval: 500ms
+    multiplier: 2
+    # Ceiling on one wait. maxAttempts x maxInterval is time the consumer is NOT polling, and
+    # exceeding max.poll.interval.ms (5 minutes) makes the broker evict this consumer and
+    # rebalance - which hands the partition to an instance that starts the budget again at zero.
+    max-interval: 5s
+    replay-batch-size: 50
+
 server:
   port: ${SERVER_PORT:8083}
 

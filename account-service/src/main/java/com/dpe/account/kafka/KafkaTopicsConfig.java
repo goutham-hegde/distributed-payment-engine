@@ -69,4 +69,42 @@ public class KafkaTopicsConfig {
                 .replicas(1)
                 .build();
     }
+
+    /**
+     * The dead letter topic for the command topic this service consumes.
+     *
+     * <p>Declared for exactly the same reason as every other topic here, and the failure it
+     * prevents is nastier than usual. A dead letter topic is written to only when something has
+     * already gone wrong, so an undeclared one is discovered on the worst day rather than the
+     * first day - and with broker auto-creation off, the recoverer's own publish fails, which
+     * {@code DefaultErrorHandler} logs and swallows. The message that was being rescued is then
+     * lost by the machinery built to rescue it.
+     *
+     * <p>Same partition count as the source topic. Not required - the recoverer lets the
+     * partitioner choose, keying on the unchanged aggregate id - but a dead letter topic
+     * narrower than its source would serialise the failures of unrelated aggregates behind each
+     * other for no reason.
+     */
+    @Bean
+    NewTopic accountCommandsDltTopic() {
+        return TopicBuilder.name(Topics.ACCOUNT_COMMANDS + Topics.DLT_SUFFIX)
+                .partitions(Topics.ACCOUNT_COMMANDS_PARTITIONS)
+                .replicas(1)
+                .build();
+    }
+
+    /**
+     * The dead letter topics {@code DeadLetterConsumer} subscribes to, resolved by name from its
+     * {@code "#{@dltTopics}"} SpEL expression.
+     *
+     * <p>Derived from the same constants the {@code NewTopic} beans above use, so the list the
+     * listener subscribes to and the list the admin client creates cannot disagree. A topic name
+     * repeated as a literal in {@code application.yml} would drift the first time one of them was
+     * edited, and the symptom - a listener quietly subscribed to a topic nobody writes to - looks
+     * exactly like "nothing has failed yet".
+     */
+    @Bean
+    String[] dltTopics() {
+        return new String[]{Topics.ACCOUNT_COMMANDS + Topics.DLT_SUFFIX};
+    }
 }

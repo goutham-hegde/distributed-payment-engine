@@ -62,6 +62,36 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-json</artifactId>
         </dependency>
+
+        <!-- M4: DeadLetterController needs the web annotations to COMPILE, but a service that
+             depends on this library must not acquire an HTTP stack just by using the outbox.
+
+             'optional' says: put it on MY compile classpath, do not put it on the classpath of
+             anything that depends on me. Every one of the three services already declares
+             spring-boot-starter-webmvc itself, so the controller is live everywhere it matters,
+             and a future headless component can depend on common-messaging without inheriting
+             Tomcat. @ConditionalOnWebApplication is what keeps the bean from being registered
+             where the classes are absent - the condition is read from annotation metadata, so
+             the class is never loaded and no NoClassDefFoundError is possible. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- M4: RetryClassifier is pure logic over exception chains, so it gets a pure unit test
+             here rather than an integration test in a service. JUnit and AssertJ only - no Boot
+             test starter, because there is no context to start and nothing to autoconfigure. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <!-- No spring-boot-maven-plugin: this is a library, not an application. Repackaging it

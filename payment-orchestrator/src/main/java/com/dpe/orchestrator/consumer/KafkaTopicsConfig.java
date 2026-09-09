@@ -77,4 +77,46 @@ public class KafkaTopicsConfig {
                 .replicas(1)
                 .build();
     }
+
+    /**
+     * Dead letter topics for the two event topics this service consumes.
+     *
+     * <p>Declared rather than left to auto-creation, and the failure that prevents is the
+     * unkindest one in the system: with broker auto-creation off, an undeclared dead letter topic
+     * makes the RECOVERER's publish fail, {@code DefaultErrorHandler} logs and swallows that, and
+     * the message the DLQ existed to save is lost by the machinery built to save it. Discovered
+     * on the worst day rather than the first.
+     */
+    @Bean
+    NewTopic accountEventsDltTopic() {
+        return TopicBuilder.name(Topics.ACCOUNT_EVENTS + Topics.DLT_SUFFIX)
+                .partitions(Topics.ACCOUNT_EVENTS_PARTITIONS)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    NewTopic gatewayEventsDltTopic() {
+        return TopicBuilder.name(Topics.GATEWAY_EVENTS + Topics.DLT_SUFFIX)
+                .partitions(Topics.GATEWAY_EVENTS_PARTITIONS)
+                .replicas(1)
+                .build();
+    }
+
+    /**
+     * The dead letter topics {@code DeadLetterConsumer} subscribes to, resolved by name from its
+     * {@code "#{@dltTopics}"} SpEL expression.
+     *
+     * <p>Both inbound topics, because this service consumes both. Derived from the same constants
+     * the {@code NewTopic} beans use so the two lists cannot drift; a literal list in
+     * {@code application.yml} would, and a listener subscribed to a mistyped topic never fires
+     * and never complains.
+     */
+    @Bean
+    String[] dltTopics() {
+        return new String[]{
+                Topics.ACCOUNT_EVENTS + Topics.DLT_SUFFIX,
+                Topics.GATEWAY_EVENTS + Topics.DLT_SUFFIX
+        };
+    }
 }
