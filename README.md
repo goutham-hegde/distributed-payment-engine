@@ -104,11 +104,11 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Environment + multi-module skeleton + Compose stack | ✅ **done** |
-| M1 | Ledger core — double-entry, `FOR UPDATE`, deadlock ordering | ⬜ |
-| M2 | Transactional outbox + Kafka + inbox dedup | ⬜ |
-| M3 | SAGA orchestration + compensation + timeouts | ⬜ |
-| M4 | Idempotency + DLQ | ⬜ |
-| M5 | JWT security | ⬜ |
+| M1 | Ledger core — double-entry, `FOR UPDATE`, deadlock ordering | ✅ **done** |
+| M2 | Transactional outbox + Kafka + inbox dedup | ✅ **done** |
+| M3 | SAGA orchestration + compensation + timeouts | ✅ **done** |
+| M4 | Idempotency + DLQ | ✅ **done** |
+| M5 | JWT security | 🚧 **part 1 done** (HS256; RS256 next) |
 | M6 | Observability — metrics, dashboards, tracing | ⬜ |
 | M7 | Chaos suite — 8 scenarios | ⬜ |
 | M8 | k6 load test to 1,000 concurrent | ⬜ |

@@ -197,7 +197,8 @@ class SagaTimeoutTest extends AbstractPostgresIT {
     }
 
     private Transfer newTransfer() {
-        return new Transfer(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 30_000L, INR);
+        return new Transfer(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 30_000L,
+                INR, "test-owner");
     }
 
     private int outboxCount(UUID transferId, String eventType) {

@@ -154,7 +154,11 @@ if (lockOutcome instanceof IdempotencyCache.LockOutcome.HeldByAnother) {
                     return new IdempotentOutcome(existing.getResponseStatus(), existing.getResponseBody(), true);
                 }
 
-                TransferResponse response = transfers.createTransfer(request);
+                // M5: clientId IS the JWT subject now, so it is also the value recorded as the
+                // transfer's originator. One value, asserted by the issuer, doing both jobs -
+                // where M4 had a caller-supplied header doing the first and nothing doing the
+                // second.
+                TransferResponse response = transfers.createTransfer(request, clientId);
                 String body = objectMapper.writeValueAsString(response);
                 records.complete(clientId, key, 202, body, response.transferId());
                 return new IdempotentOutcome(202, body, false);

@@ -32,13 +32,31 @@ import java.util.UUID;
  *                      account fails without ever creating a hold to compensate.
  * @param amountMinor   a positive magnitude in minor units (paise). Direction is carried by the
  *                      from/to fields, never by the sign.
+ * @param initiatedBy   <b>M5:</b> the authenticated subject that asked for this transfer, carried
+ *                      so account-service can check ownership itself rather than trusting that
+ *                      somebody upstream did.
+ *                      <p>The orchestrator already refuses at the edge, against its local
+ *                      projection of who owns what. This is the same question asked again at the
+ *                      only place that can answer it authoritatively - inside the transaction
+ *                      that locks the account and moves the money. Two checks is not belt and
+ *                      braces for its own sake: the edge one is over data that is a projection
+ *                      and can be stale or absent, and account-service is reachable by a Kafka
+ *                      message from anywhere in the cluster, so "the request came through the
+ *                      front door" is an assumption rather than a fact.
+ *                      <p><b>Nullable, and null must be treated as a refusal.</b> Adding a field
+ *                      to a record is backward compatible on the wire - Jackson leaves it null
+ *                      rather than failing - so during a rolling upgrade a command produced by
+ *                      the old orchestrator arrives at the new account-service without it. Those
+ *                      are exactly the messages nobody authorized, and the safe reading of "I
+ *                      cannot tell who asked" is no.
  */
 public record ReserveFunds(
         UUID transferId,
         UUID fromAccountId,
         UUID toAccountId,
         long amountMinor,
-        String currency) {
+        String currency,
+        String initiatedBy) {
 
     public static final String TYPE = "ReserveFunds";
 }

@@ -32,4 +32,20 @@ public record ReserveRejected(
     public static final String ACCOUNT_NOT_FOUND  = "ACCOUNT_NOT_FOUND";
     public static final String CURRENCY_MISMATCH  = "CURRENCY_MISMATCH";
     public static final String INVALID_TRANSFER   = "INVALID_TRANSFER";
+
+    /**
+     * M5: the subject named in {@link ReserveFunds#initiatedBy()} does not own the account the
+     * money would come out of - or no subject was named at all.
+     *
+     * <p>It is a rejection like any other, which is the point. An authorization failure detected
+     * here is a <b>business</b> outcome: it commits, replies, and lets the saga end in FAILED.
+     * Throwing would roll back the inbox row and redeliver a command whose ownership will never
+     * change, forever - the infinite-retry trap the whole reserve path is written to avoid.
+     *
+     * <p>A caller should essentially never see this: the orchestrator refuses the same request at
+     * the edge with a 403, long before a command is written. A transfer that reaches FAILED with
+     * this reason means something bypassed the API - a replayed command, a hand-produced message,
+     * a compromised producer - and it is worth alerting on rather than merely counting.
+     */
+    public static final String NOT_ACCOUNT_OWNER  = "NOT_ACCOUNT_OWNER";
 }

@@ -26,6 +26,12 @@
             <groupId>com.dpe</groupId>
             <artifactId>common-messaging</artifactId>
         </dependency>
+        <!-- M5: token validation - the decoder, the validators and the role vocabulary. The
+             authorization RULES stay in this service's own SecurityConfig; see JwtConfig. -->
+        <dependency>
+            <groupId>com.dpe</groupId>
+            <artifactId>common-security</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -123,6 +129,23 @@
             <artifactId>awaitility</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- M5: MockMvc, for the HTTP security tests. This service had no web test starter
+             until now because nothing here drove an endpoint from a test - the ledger and the
+             saga are exercised through their services. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- M5: MockMvc's security helpers and the resource-server test support. Boot 4 splits
+             these out per technology, like every other test starter. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
     </dependencies>
 
     <build>

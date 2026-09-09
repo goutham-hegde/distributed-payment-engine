@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dpe</groupId>
+        <artifactId>distributed-payment-engine</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>common-security</artifactId>
+    <name>common-security</name>
+    <description>
+        Token validation shared by all three services, added at M5.
+
+        WHAT IS SHARED AND WHAT IS NOT, which is the same line common-messaging draws:
+        this module holds the MECHANICS of turning a bearer token into a verified set of claims -
+        the key, the decoder, the validators, the claim names. It holds no authorization rule and
+        no domain type. Which endpoints require which role, and who may move money out of which
+        account, are decisions each service makes for itself in its own SecurityConfig, because
+        those decisions are about that service's resources and nobody else's.
+
+        Sharing the decoder is safe for the same reason sharing the outbox was: a token is an
+        opaque string on the way in and a set of claims on the way out, and no business meaning
+        passes through here. Sharing an authorization RULE would be the dangerous kind of reuse -
+        one service loosening a rule for its own endpoint would silently loosen it everywhere.
+
+        See docs/adr/0005-jwt-authentication.md.
+    </description>
+
+    <dependencies>
+        <!-- The resource server: bearer-token filter, NimbusJwtDecoder, and (via
+             spring-security-oauth2-jose) NimbusJwtEncoder for the dev token endpoint.
+
+             VERSION TRAP: Boot 4 renamed this. The Boot 3 coordinate
+             `spring-boot-starter-oauth2-resource-server` still resolves and still works - it is
+             kept as a deprecated alias whose own POM description says "deprecated in favor of
+             spring-boot-starter-security-oauth2-resource-server". Every pre-2025 tutorial uses
+             the old name, so the wrong one is what gets copied, and nothing warns at build time.
+             The whole security family moved under the `security-` prefix: -security-oauth2-client,
+             -security-saml2, -security-oauth2-authorization-server. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security-oauth2-resource-server</artifactId>
+        </dependency>
+
+        <!-- The filter chain DSL. Comes transitively from the starter above; declared because
+             this module compiles against it directly and a transitive dependency is not a
+             contract. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- Same reasoning as common-messaging: a service that wants token validation must not
+             acquire an HTTP stack merely by depending on this module. All three services declare
+             the web starter themselves. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <!-- No spring-boot-maven-plugin: a library, not an application. -->
+
+</project>

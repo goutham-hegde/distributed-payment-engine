@@ -51,7 +51,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         UUID transferId = UUID.randomUUID();
         long baseline = LedgerInvariants.totalCustomerMoney(jdbc);
 
-        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR));
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
 
         assertThat(ledger.balanceOf(sender))
                 .as("the money has genuinely left the sender - a hold is not a promise")
@@ -83,7 +83,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         UUID recipient = ledger.seedAccount(0L);
         UUID transferId = UUID.randomUUID();
 
-        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 20_000L, INR));
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 20_000L, INR, TestLedger.OWNER));
 
         Map<String, Object> message = jdbc.queryForMap(
                 "SELECT event_type, payload->'payload'->>'holdId' AS hold_id, aggregate_id "
@@ -119,7 +119,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         // Must not throw. Throwing would roll back the handler's transaction, take the inbox row
         // with it, and put the message into an infinite redelivery loop over a condition that is
         // never going to change. A business failure has to commit.
-        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 999_999L, INR));
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 999_999L, INR, TestLedger.OWNER));
 
         assertThat(ledger.entryCountFor(transferId))
                 .as("a rejected reserve must post no ledger entries at all")
@@ -150,7 +150,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         UUID transferId = UUID.randomUUID();
         long baseline = LedgerInvariants.totalCustomerMoney(jdbc);
 
-        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR));
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
         UUID holdId = holdIdFor(transferId);
 
         reservations.commit(new CommitFunds(transferId, holdId, recipient));
@@ -180,7 +180,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         UUID transferId = UUID.randomUUID();
         long baseline = LedgerInvariants.totalCustomerMoney(jdbc);
 
-        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR));
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
         UUID holdId = holdIdFor(transferId);
 
         reservations.release(new ReleaseFunds(transferId, holdId, ReleaseFunds.GATEWAY_DECLINED));
@@ -215,7 +215,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         UUID transferId = UUID.randomUUID();
         long baseline = LedgerInvariants.totalCustomerMoney(jdbc);
 
-        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR));
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
         UUID holdId = holdIdFor(transferId);
         reservations.release(new ReleaseFunds(transferId, holdId, ReleaseFunds.SAGA_TIMEOUT));
 

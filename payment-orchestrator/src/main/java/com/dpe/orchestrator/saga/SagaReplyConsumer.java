@@ -1,5 +1,6 @@
 package com.dpe.orchestrator.saga;
 
+import com.dpe.events.AccountOpened;
 import com.dpe.events.EventEnvelope;
 import com.dpe.events.FundsCommitted;
 import com.dpe.events.FundsReleased;
@@ -10,6 +11,7 @@ import com.dpe.events.GatewayDeclined;
 import com.dpe.events.ReserveRejected;
 import com.dpe.events.Topics;
 import com.dpe.orchestrator.consumer.AccountEventHandler;
+import com.dpe.orchestrator.readmodel.AccountOwnerHandler;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -85,15 +87,20 @@ public class SagaReplyConsumer {
     private static final TypeReference<EventEnvelope<FundsTransferred>> FUNDS_TRANSFERRED =
             new TypeReference<>() {
             };
+    private static final TypeReference<EventEnvelope<AccountOpened>> ACCOUNT_OPENED =
+            new TypeReference<>() {
+            };
 
     private final SagaReplyHandler sagaReplies;
     private final AccountEventHandler projections;
+    private final AccountOwnerHandler owners;
     private final ObjectMapper objectMapper;
 
     public SagaReplyConsumer(SagaReplyHandler sagaReplies, AccountEventHandler projections,
-                             ObjectMapper objectMapper) {
+                             AccountOwnerHandler owners, ObjectMapper objectMapper) {
         this.sagaReplies = sagaReplies;
         this.projections = projections;
+        this.owners = owners;
         this.objectMapper = objectMapper;
     }
 
@@ -123,6 +130,18 @@ public class SagaReplyConsumer {
                     objectMapper.readValue(record.value(), FUNDS_TRANSFERRED));
             ack.acknowledge();
             log.debug("projection {} {}", messageId, applied ? "applied" : "skipped as duplicate");
+            return;
+        }
+
+        // M5's ownership projection. A third kind of work on this topic and still the same
+        // consumer group - see AccountOwnerHandler for why that is a rule rather than a habit.
+        // Its own gate, for the same reason the projection above has one: one claim per piece of
+        // work, or the second is skipped as a duplicate of the first.
+        if (AccountOpened.TYPE.equals(eventType)) {
+            boolean applied = owners.handle(messageId, topic,
+                    objectMapper.readValue(record.value(), ACCOUNT_OPENED));
+            ack.acknowledge();
+            log.debug("ownership {} {}", messageId, applied ? "applied" : "skipped as duplicate");
             return;
         }
 

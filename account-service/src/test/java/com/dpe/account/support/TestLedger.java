@@ -21,6 +21,13 @@ public class TestLedger {
 
     private static final String CURRENCY = "INR";
 
+    /**
+     * The owner every seeded account belongs to unless a test says otherwise. Named rather than
+     * repeated as a literal because M5 made it load-bearing: it is the value a ReserveFunds
+     * command's {@code initiatedBy} has to match for the reserve to be authorized.
+     */
+    public static final String OWNER = "test-owner";
+
     private final JdbcTemplate jdbc;
 
     public TestLedger(JdbcTemplate jdbc) {
@@ -28,11 +35,16 @@ public class TestLedger {
     }
 
     public UUID seedAccount(long balanceMinor) {
+        return seedAccountOwnedBy(OWNER, balanceMinor);
+    }
+
+    /** Same, for a named owner - the fixture an ownership test needs. */
+    public UUID seedAccountOwnedBy(String ownerId, long balanceMinor) {
         UUID accountId = UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO accounts (id, owner_id, account_type, currency, balance_minor)
                 VALUES (?, ?, 'CUSTOMER', ?, 0)
-                """, accountId, "test-owner", CURRENCY);
+                """, accountId, ownerId, CURRENCY);
 
         if (balanceMinor > 0) {
             UUID fundingId = UUID.randomUUID();

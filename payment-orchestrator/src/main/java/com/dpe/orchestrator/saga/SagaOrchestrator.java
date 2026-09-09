@@ -118,7 +118,7 @@ public class SagaOrchestrator {
                 ReserveFunds.TYPE,
                 new ReserveFunds(transfer.getId(), transfer.getFromAccountId(),
                         transfer.getToAccountId(), transfer.getAmountMinor(),
-                        transfer.getCurrency()));
+                        transfer.getCurrency(), transfer.getInitiatedBy()));
 
         recordStep(saga, STEP_RESERVE, StepOutcome.STARTED, messageId, null);
         return saga;

@@ -183,6 +183,52 @@ dpe:
     max-interval: 5s
     replay-batch-size: 50
 
+  # M5: token validation. Every service binds this block identically - see common-security.
+  #
+  # NOTE WHAT IS NOT HERE: `secret`. It has no default and no value in this file, on purpose.
+  # A signing key committed to a repository is a published signing key, and "it is only the dev
+  # default" stops being true the first time a deployment inherits it. Supply it as the
+  # environment variable DPE_SECURITY_SECRET (Boot's relaxed binding maps it to
+  # dpe.security.secret with no entry here); infra/docker-compose.yml sets a throwaway one.
+  #
+  # Absent, the service REFUSES TO START, with a message naming the key and the minimum length -
+  # see SecurityProperties. That is the intended behaviour: an authentication system that boots
+  # without a key would have to either invent one or switch itself off, and both are worse than
+  # not starting.
+  security:
+    issuer: dpe
+    audience: dpe-api
+    # Leeway on exp/nbf. Stateless auth makes clock agreement a correctness dependency; without
+    # some leeway a validator whose clock runs fast rejects freshly issued tokens and reports it
+    # as "expired". Small, because every second of it is a second an expired token still works.
+    clock-skew: 30s
+
+  # M5: the ISSUING side, and it exists only in this service. A real deployment replaces this
+  # with an identity provider and changes nothing else - validation is local everywhere.
+  auth:
+    # The revocation policy, stated as a duration. A stateless token cannot be withdrawn, so a
+    # leaked one is valid for exactly this long. Fifteen minutes is the usual compromise between
+    # that exposure and asking a user to log in constantly.
+    token-ttl: 15m
+
+    # DEVELOPMENT DIRECTORY. Fake people, fake passwords, plain text - a real user store holds a
+    # slow hash (bcrypt/argon2) and lives in a database, and nothing here should be mistaken for
+    # one. The subjects are deliberately the same strings as accounts.owner_id, which is what
+    # lets `sub` be compared directly against ownership with no mapping table in between.
+    users:
+      alice:
+        password: ${DEV_PASSWORD_ALICE:alice-password}
+        roles: [USER]
+      bob:
+        password: ${DEV_PASSWORD_BOB:bob-password}
+        roles: [USER]
+      # Reads the operational surfaces and replays dead letters. Cannot move money - not by
+      # policy in a document, but because AccountOwnershipGuard has no role bypass and this
+      # subject owns no accounts.
+      operator:
+        password: ${DEV_PASSWORD_OPERATOR:operator-password}
+        roles: [OPERATOR]
+
 server:
   port: ${SERVER_PORT:8081}
 

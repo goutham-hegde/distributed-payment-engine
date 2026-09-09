@@ -141,6 +141,48 @@ public class ReservationService {
         Account clearing = first.equals(clearingId) ? a.get() : b.get();
         Account recipient = maybeRecipient.get();
 
+        // ------------------------------------------------------------------------------
+        // M5: THE AUTHORITATIVE OWNERSHIP CHECK.
+        // ------------------------------------------------------------------------------
+        //
+        // A rejection COMMITS and replies, exactly like the checks above. Throwing would roll
+        // back the inbox row and redeliver a command whose ownership will never change, forever.
+        //
+        // A null initiatedBy is a rejection too. Adding a field to a record is backward
+        // compatible on the wire, so during a rolling upgrade an old orchestrator's command
+        // arrives without one - and "I cannot tell who asked" is not a reason to move money.
+        //
+        // FOUR THINGS WORTH BEING ABLE TO DEFEND ABOUT THIS CHECK:
+        //
+        // 1. The orchestrator already refused this at the edge, with a 403, against its
+        //    projection of who owns what. This is not that check repeated for comfort - it is
+        //    the same question asked where it can be answered AUTHORITATIVELY: owner_id is a
+        //    column in THIS database, read under the row lock that is about to move the money.
+        //    The edge check is over a copy that can be stale or missing.
+        //
+        // 2. A Kafka command is not proof of an HTTP request. Anything that can produce to
+        //    dpe.account.commands.v1 can ask this service to move money - a replayed dead
+        //    letter, a hand-produced rpk message (M4 proved that path is real), a compromised
+        //    producer. "It came through the API" is an assumption, and this check is what makes
+        //    it unnecessary.
+        //
+        // 3. It goes AFTER the lock is taken, not before. Ownership is immutable so a pre-lock
+        //    read would give the same answer - but the habit of reading a value before locking
+        //    the row it lives on is how the balance check would be got wrong, and there is no
+        //    reason to practise it here.
+        //
+        // 4. A transfer INTO an account needs no such check. Anyone may be paid; consent is only
+        //    required to take money out. That asymmetry is worth stating rather than leaving as
+        //    an omission somebody later "fixes".
+        // ------------------------------------------------------------------------------
+        if (command.initiatedBy() == null
+                || !command.initiatedBy().equals(sender.getOwnerId())) {
+            reject(command, ReserveRejected.NOT_ACCOUNT_OWNER,
+                    "subject '" + command.initiatedBy() + "' does not own account "
+                            + sender.getId());
+            return;
+        }
+
         // All three, including CLEARING - otherwise INR ends up parked in a USD account and
         // nothing notices until someone reconciles.
         if (!sender.getCurrency().equals(command.currency())

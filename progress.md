@@ -11,8 +11,8 @@ and what broke along the way. Newest entries at the bottom.
 | M1 | Ledger core — double-entry, `SELECT FOR UPDATE`, deadlock-safe lock ordering | ✅ **done** |
 | M2 | Transactional outbox + Kafka publishing + inbox dedup | ✅ **done** |
 | M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ✅ **done** |
-| M4 | Idempotency keys + retry/backoff + Dead Letter Queue | 🚧 **in progress** |
-| M5 | JWT authentication and per-account authorization | ⬜ |
+| M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ✅ **done** |
+| M5 | JWT authentication and per-account authorization | 🚧 **part 1 done** (HS256; RS256 next) |
 | M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing | ⬜ |
 | M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ⬜ |
 | M7 | Chaos suite — 8 injected-failure scenarios | ⬜ |
@@ -1368,3 +1368,217 @@ All invariants hold.
 - `outbox`, `inbox` and `dead_letters` all still grow without limit. Only `idempotency_records` has
   a sweeper, and the inbox deliberately cannot share its schedule — see the retention argument in
   `IdempotencySweeper`.
+
+
+---
+
+## Session 9 — 2026-09-09
+
+### Goal
+
+Start M5: authenticate every caller, and make it impossible to move money out of an account you do
+not own. Landed end to end — the mechanism, the schema, the ownership event, the filter chains, the
+two ownership checks and the tests — and verified against the running stack. RS256 is part 2.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Session vs token | Stateless JWT, validated locally in all three services | A session store sits on the hot path of every request in every service and makes instances non-interchangeable. The price is that a token cannot be revoked — mitigated with a 15-minute TTL and a `jti` claim so a denylist is possible later without invalidating tokens already in the wild. |
+| Algorithm | HS256 now, RS256 next | A symmetric key means the verification key and the signing key are the same bytes, so every service that can validate can also forge. Shipping it that way first, visibly, then splitting the key. |
+| Token issuance | A development `/auth/token` endpoint in the orchestrator | Stands in for an identity provider. Because validation is local, replacing it with Keycloak/Auth0 later changes exactly one thing in the other services: which key to trust. |
+| Where ownership is checked | Both: a local projection at the API edge, and the authoritative column under the row lock | A synchronous call to account-service would make *accepting* a transfer depend on account-service being up, which is the coupling the saga exists to remove. Checking only in account-service means the caller gets 202 and then a FAILED saga, with authorization errors indistinguishable from insufficient funds. |
+| Trusting a projection for an authorization decision | Safe **because ownership is immutable** | An account is opened once by one owner and there is no transfer-of-ownership operation, so the projection can only ever be missing a row, never holding a wrong one — and a missing row denies. Staleness fails closed. If ownership ever becomes mutable, the edge check becomes advisory and the decision has to move entirely to account-service. |
+| Roles | `USER` and `OPERATOR`, disjoint | An operator reads operational surfaces and replays dead letters, and cannot move money: no single human should be able to move another human's money by holding a role. No `SERVICE` role — services talk over Kafka, where the trust boundary is the broker's. |
+| Catch-all rule | `denyAll()`, not `authenticated()` | They differ only for an endpoint nobody wrote a rule for, which is next month's new controller. `authenticated()` opens it to every customer holding a token; `denyAll()` opens it to nobody and surfaces as a failing test. |
+| Signing key default | None, anywhere in the repository | A default is a published signing key. `DPE_SECURITY_SECRET` is required and a service without it refuses to start, naming the key and the minimum length — better than inventing one or running open. |
+| account-service `POST /transfers` | Denied to every role | It writes ledger entries with no saga, no idempotency key and no ownership check — a second door into the money that bypasses three milestones of machinery. The service behind it stays (the M1 concurrency tests drive it directly); only the HTTP exposure closes. |
+| Gateway `/admin/simulation` | Now operator-only | Previously open, on the grounds that it is a test affordance on a simulated third party. It can also take the payment path down for every customer at once, and an availability control is a security control. |
+
+### Built
+
+- **`common-security`**, a fourth Maven module holding the *mechanics* of token validation and
+  nothing about authorization: `SecurityProperties` (fails fast on a missing or too-short secret,
+  at startup rather than at first signature), `JwtConfig` (a decoder with timestamp, issuer and
+  audience validators, and the algorithm pinned so a token cannot choose its own), `Roles`, and
+  `TokenIssuer`. Which endpoints require which role stays in each service's own `SecurityConfig` —
+  a shared filter chain would mean loosening one endpoint quietly loosens all three services.
+- **`AccountOpened`** in `common-events`, published by `AccountService.open()` through the outbox in
+  the same transaction as the account row. An account whose ownership never reached the orchestrator
+  would be an account nobody can spend from, with no retry able to fix it.
+- **The ownership projection** — `V5__authorization.sql` (`account_owners`, plus
+  `transfers.initiated_by`), an inbox-gated handler, and a third branch in `SagaReplyConsumer`.
+  Still one consumer group and one listener in the service: the inbox's primary key is the message
+  id alone, so a second group would receive every message and skip everything the first recorded.
+  The repository upserts with `ON CONFLICT DO NOTHING` — ownership is decided once, and an
+  overwrite would let a replayed event hand an account to someone else.
+- **`ReserveFunds.initiatedBy`** and `ReserveRejected.NOT_ACCOUNT_OWNER`, so account-service can
+  answer the ownership question itself rather than assuming the request came through the front door.
+  `dpe.account.commands.v1` is reachable by anything that can produce to it.
+- **A development token endpoint** (`POST /auth/token`), the demo directory in configuration, and
+  `scripts/token.sh` so the chaos scenarios and the k6 run can authenticate in one line.
+- **Filter chains for account-service and payment-gateway**, the `403` error mapping, and the
+  transfer API rewritten to take its identity from the token instead of the `X-Client-Id` header.
+- **`docs/adr/0005-jwt-authentication.md`** — the full argument, including what was rejected.
+- **The orchestrator's filter chain**, the `roles` → `ROLE_` authorities converter, the edge
+  ownership guard, and the authoritative check inside `ReservationService.reserve`. The converter
+  reads the claim defensively rather than with `getClaimAsStringList`: that helper throws when the
+  claim is present but malformed, which would turn an authorization question into a 500 from inside
+  the filter chain. Anything unexpected collapses to no authorities — authenticated, holding
+  nothing, denied by every role rule.
+
+The M4 idempotency namespace is the clearest single change: `idempotency_records.client_id` used to
+come from a header the caller chose, so sending another tenant's client id with their key returned
+*their* stored response body — another customer's transfer receipt. The column is unchanged; the
+value now comes from the token's `sub` claim and cannot be forged without the signing key.
+
+### What broke
+
+1. **Spring Boot 4 renamed the resource-server starter and kept the old name working.**
+   `spring-boot-starter-oauth2-resource-server` still resolves; it is a deprecated alias, and its
+   own POM says so in the description — *"deprecated in favor of
+   spring-boot-starter-security-oauth2-resource-server"*. Nothing warns at build time, and every
+   pre-2025 tutorial uses the old coordinate. The whole security family moved under the `security-`
+   prefix (`-security-oauth2-client`, `-security-saml2`, and so on).
+
+2. **`@AutoConfigureMockMvc` moved package.** It is no longer
+   `org.springframework.boot.test.autoconfigure.web.servlet` — Boot 4 split test autoconfiguration
+   per technology and it now lives at
+   `org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc`, shipped in
+   `spring-boot-webmvc-test`. Same reorganisation that moved `@EntityScan` at M3. Symptom:
+   *"package org.springframework.boot.test.autoconfigure.web.servlet does not exist"*.
+
+3. **`JwtClaimsSet` refuses to build a token whose `exp` is not after its `iat`.** The first
+   expired-token fixture applied one negative offset to both, making them equal:
+   *"expiresAt must be after issuedAt"*. The library is right, and the distinction is worth keeping
+   — an expired token is a different object from an impossible one, and a fixture producing the
+   impossible one would be testing the builder rather than the validator. Rewritten as a token
+   issued an hour ago with a thirty-minute lifetime.
+
+4. **Maven reported `test-compile` SUCCESS with stale test classes.** Changing a constructor in a
+   main source did not trigger recompilation of the test sources that call it — main sources logged
+   *"Recompiling the module because of changed dependency"* and test sources did not, so a test
+   class two hours old kept calling a signature that no longer existed. It surfaces later as a
+   runtime error rather than a compile failure, which is the same trap family as
+   `Unresolved compilation problems` being reported by surefire as a test *error*.
+
+### Verified
+
+Full suite:
+
+```
+./mvnw -B -ntp verify
+
+common-messaging       Tests run:  13, Failures: 0, Errors: 0
+account-service        Tests run:  64, Failures: 0, Errors: 0
+payment-orchestrator   Tests run:  64, Failures: 0, Errors: 0
+payment-gateway        Tests run:   6, Failures: 0, Errors: 0
+BUILD SUCCESS
+```
+
+Live on Compose — `docker compose build`, `up -d`, six containers healthy. The health endpoints
+stayed unauthenticated, which the container healthchecks prove by passing at all.
+
+Tokens, and the four surfaces:
+
+```
+./scripts/token.sh alice        251-byte token
+./scripts/token.sh operator     260-byte token
+
+POST /api/v1/transfers                  no token              401
+POST /accounts            (8082)        operator              201
+POST /accounts            (8082)        customer              403
+POST /transfers           (8082)        operator              403     the direct ledger door
+GET  /admin/dead-letters/depth          anon / customer / operator    401 / 403 / 200   on all three services
+GET  /admin/simulation    (8083)        anon / customer / operator    401 / 403 / 200
+```
+
+The ownership projection arriving over Kafka, seconds after the accounts were opened — outbox to
+relay to broker to inbox-gated handler:
+
+```
+             account_id              | owner_id | account_type |         projected_at
+--------------------------------------+----------+--------------+-------------------------------
+ 438a9787-15f2-441e-b7a7-171a92f071d7 | bob      | CUSTOMER     | 2026-09-09 10:23:55.573877+00
+ e38e6b70-8a3b-48c8-892e-429a0488acfa | alice    | CUSTOMER     | 2026-09-09 10:23:55.116094+00
+```
+
+A transfer alice owns, and the same request against bob's account:
+
+```
+POST /api/v1/transfers  from=alice's account   202  {"status":"PENDING","sagaStatus":"STARTED"}
+                        polled                      {"status":"COMPLETED","sagaStatus":"COMPLETED"}
+
+POST /api/v1/transfers  from=bob's account     403  {"code":"ACCOUNT_FORBIDDEN",
+                                                     "message":"You may not use that account"}
+```
+
+Reads are scoped, and the idempotency namespace still works now that it comes from the token
+rather than a header:
+
+```
+GET  /api/v1/transfers/{id}   as alice              200
+GET  /api/v1/transfers/{id}   as bob                404      not 403 - the id is the secret
+POST /api/v1/transfers        same Idempotency-Key  202  Idempotency-Replayed: true
+```
+
+**The check that matters most**, because it is the one an API-level guard cannot make: a
+`ReserveFunds` command produced straight onto the topic, bypassing the orchestrator entirely, with
+a subject that does not own the account (`rpk topic produce --compression none`, per the M4 trap):
+
+```
+Produced to partition 0 at offset 1
+
+   event_type    |      reason       |                          detail
+-----------------+-------------------+-------------------------------------------------------
+ ReserveRejected | NOT_ACCOUNT_OWNER | subject 'mallory' does not own account e38e6b70-...
+
+ledger_entries for that transfer: 0
+holds for that transfer:          0
+```
+
+Refused, committed, replied — no ledger entry, no hold, no infinite redelivery. Balances after
+everything, showing only the legitimate movement:
+
+```
+ owner_id | balance_minor
+----------+---------------
+ alice    |        457500
+ bob      |         42500
+```
+
+And the invariants. The first run **failed I3 correctly**: opening a funded account issues money
+into the ledger, so the total moved from 500,000 to 1,000,000 while the baseline still held the old
+figure. That is the invariant doing its job — I3 is conservation *across a run*, not a constant —
+so the baseline was re-recorded and money moved across it:
+
+```
+./scripts/verify-invariants.sh baseline      I3 baseline recorded: 1000000
+POST /api/v1/transfers  7500                 202
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (1000000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+All invariants hold.
+```
+
+### Committed
+
+`M5: JWT authentication, and per-account authorization that a valid token is not enough for`
+— one commit, so the history never contains a state in which the API is unreachable.
+
+### Open / next
+
+- **M5 part 2: RS256.** The orchestrator keeps a private key and signs; the other two get a public
+  key and can only verify. Today all three hold the same secret and can therefore mint each other's
+  tokens.
+- `/actuator/prometheus` is operator-only, so the M6 scraper will need a credential or a network
+  exemption. Left closed rather than pre-opened, so the decision is made when the scraper exists.
+- Nothing rate-limits `POST /auth/token`, which is the one endpoint that mints credentials.
+- A newly opened account is briefly unspendable while its `AccountOpened` event is in flight —
+  bounded, and the direction the projection is allowed to be wrong in.
+- Still outstanding from M4: `ErrorHandlingDeserializer`, so a failure inside `consumer.poll()`
+  becomes a poison-pill value the listener can see rather than an unreachable partition stall; and
+  retention for `outbox`, `inbox` and `dead_letters`, which still grow without limit.

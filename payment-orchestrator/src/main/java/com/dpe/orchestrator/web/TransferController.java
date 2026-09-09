@@ -1,5 +1,6 @@
 package com.dpe.orchestrator.web;
 
+import com.dpe.orchestrator.authz.AccountOwnershipGuard;
 import com.dpe.orchestrator.idempotency.IdempotencyGate;
 import com.dpe.orchestrator.idempotency.IdempotentOutcome;
 import com.dpe.orchestrator.transfer.TransferService;
@@ -11,6 +12,8 @@ import jakarta.validation.constraints.Size;
 import java.util.UUID;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -37,6 +40,19 @@ import org.springframework.web.bind.annotation.RestController;
  * into arguments and an outcome into a response. That is on purpose: the gate has to own the
  * transaction boundary, and a controller that decided anything about replaying would be deciding
  * it outside that boundary.
+ *
+ * <h2>M5: two checks now happen before the gate is reached</h2>
+ *
+ * <p>The filter chain has already established <i>who</i> the caller is, and that they hold
+ * {@code ROLE_USER}. What it cannot have checked is <i>which account</i> they named - that value
+ * is in the request body, which no filter has parsed. So the ownership check happens here, in the
+ * request, before anything is written.
+ *
+ * <p><b>Order matters: authorize, then claim the idempotency key.</b> A refused request must not
+ * consume the key, or a client that fixed a typo in the account id and retried with the same key
+ * would be told its intent had already been handled. The gate's own rule is the same one - a
+ * failed request rolls its claim back - and this keeps the ordering honest for a failure that
+ * happens before the gate is even entered.
  */
 @RestController
 @RequestMapping("/api/v1/transfers")
@@ -50,29 +66,32 @@ public class TransferController {
 
     private final TransferService transfers;
     private final IdempotencyGate gate;
+    private final AccountOwnershipGuard ownership;
 
-    public TransferController(TransferService transfers, IdempotencyGate gate) {
+    public TransferController(TransferService transfers, IdempotencyGate gate,
+                              AccountOwnershipGuard ownership) {
         this.transfers = transfers;
         this.gate = gate;
+        this.ownership = ownership;
     }
 
     /**
-     * Accepts a transfer for processing, at most once per {@code Idempotency-Key}.
+     * Accepts a transfer for processing, at most once per {@code Idempotency-Key}, from an account
+     * the caller owns.
      *
-     * <p>Both headers are REQUIRED, and a missing one is a 400 rather than a default.
+     * <h2>What happened to {@code X-Client-Id}</h2>
      *
-     * <p>For {@code Idempotency-Key} that is the entire point: a client that omits it has no way
-     * to retry safely, and quietly accepting the request would let a caller believe it has an
-     * idempotency guarantee it never asked for. This is a money-movement endpoint; there is no
-     * such thing as a request here that is fine to duplicate.
+     * <p>It is gone, and its job is now done by the token's {@code sub} claim. The column it fed -
+     * {@code idempotency_records.client_id} - has not changed shape; only where the value comes
+     * from has. That is the entire security argument in one substitution: the idempotency
+     * namespace used to be <b>chosen by the caller</b>, so anybody could send someone else's
+     * client id with someone else's key and be handed their response body, which here is another
+     * customer's transfer receipt. Now it is <b>asserted by the issuer</b> and unforgeable without
+     * the signing key.
      *
-     * <p>{@code X-Client-Id} is required so that keys live in per-client namespaces. Defaulting
-     * it to something shared would put every caller in one namespace, where a common key like
-     * {@code "1"} collides - and a collision does not merely fail, it replays one client
-     * response body to another. It is a placeholder and it is trust-the-caller: anyone can send
-     * any value. <b>M5 replaces it with the JWT subject</b>, at which point the namespace becomes
-     * something the caller cannot choose. The column does not change, only where the value comes
-     * from.
+     * <p>{@code Idempotency-Key} stays a required header, for the reasons it always was: a client
+     * that omits it has no way to retry safely, and this is a money-movement endpoint where no
+     * request is safe to duplicate.
      *
      * <p>The body is returned as raw JSON text rather than a serialized {@link TransferResponse}
      * because a replay must be the response the first request gave, byte for byte - see
@@ -81,10 +100,16 @@ public class TransferController {
     @PostMapping
     public ResponseEntity<String> create(
             @RequestHeader("Idempotency-Key") @NotBlank @Size(max = 255) String idempotencyKey,
-            @RequestHeader("X-Client-Id") @NotBlank @Size(max = 64) String clientId,
+            @AuthenticationPrincipal Jwt caller,
             @Valid @RequestBody CreateTransferRequest request) {
 
-        IdempotentOutcome outcome = gate.execute(clientId, idempotencyKey, request);
+        String subject = caller.getSubject();
+
+        // Per-resource authorization: a valid token proves who is asking, not what they may
+        // spend. Throws AccountAccessDeniedException -> 403, before any row is written.
+        ownership.requireCanSpendFrom(subject, request.fromAccountId());
+
+        IdempotentOutcome outcome = gate.execute(subject, idempotencyKey, request);
 
         return ResponseEntity.status(outcome.status())
                 .contentType(MediaType.APPLICATION_JSON)
@@ -96,10 +121,15 @@ public class TransferController {
      * The polling endpoint. Deliberately NOT behind the gate: a GET is idempotent by definition,
      * and it must report the transfer as it is NOW - which is the exact opposite of the replay
      * rule on the POST.
+     *
+     * <p>Scoped to the caller. A transfer belonging to somebody else is answered 404, identically
+     * to one that does not exist - see {@link TransferService#findTransfer}. Unguessable ids are
+     * not an authorization model.
      */
     @GetMapping("/{transferId}")
-    public ResponseEntity<TransferResponse> get(@PathVariable UUID transferId) {
-        return transfers.findTransfer(transferId)
+    public ResponseEntity<TransferResponse> get(@PathVariable UUID transferId,
+                                                @AuthenticationPrincipal Jwt caller) {
+        return transfers.findTransfer(transferId, caller.getSubject())
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }

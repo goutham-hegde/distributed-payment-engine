@@ -222,8 +222,11 @@ class SagaFlowTest extends AbstractPostgresIT {
     }
 
     private Transfer newTransfer(long amountMinor) {
+        // M5: transfers now carry the subject that asked for them. Irrelevant to the state
+        // machine under test, and stated anyway - a transfer with no initiator is a row this
+        // service can no longer produce.
         return new Transfer(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
-                amountMinor, INR);
+                amountMinor, INR, "test-owner");
     }
 
     private String transferStatus(UUID transferId) {

@@ -47,6 +47,19 @@ public class Transfer {
     @Column(name = "failure_reason")
     private String failureReason;
 
+    /**
+     * The authenticated subject that asked for this transfer (M5).
+     *
+     * <p>{@code updatable = false}: who asked is a fact about the request, decided once. A column
+     * that can be rewritten is not an audit trail, and this one is read to decide whether a
+     * caller may see the transfer at all.
+     *
+     * <p>Nullable only because rows written before M5 have no identity to record - see
+     * {@code V5__authorization.sql}. Every row created from here on has one.
+     */
+    @Column(name = "initiated_by", updatable = false, length = 64)
+    private String initiatedBy;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
@@ -60,13 +73,14 @@ public class Transfer {
     }
 
     public Transfer(UUID id, UUID fromAccountId, UUID toAccountId, long amountMinor,
-                    String currency) {
+                    String currency, String initiatedBy) {
         this.id = id;
         this.fromAccountId = fromAccountId;
         this.toAccountId = toAccountId;
         this.amountMinor = amountMinor;
         this.currency = currency;
         this.status = TransferStatus.PENDING;
+        this.initiatedBy = initiatedBy;
     }
 
     public void complete() {
@@ -105,6 +119,10 @@ public class Transfer {
 
     public String getFailureReason() {
         return failureReason;
+    }
+
+    public String getInitiatedBy() {
+        return initiatedBy;
     }
 
     public OffsetDateTime getCreatedAt() {
