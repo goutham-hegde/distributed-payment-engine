@@ -183,24 +183,13 @@ dpe:
     max-interval: 5s
     replay-batch-size: 50
 
-  # M5: token validation. Every service binds this block identically - see common-security.
-  #
-  # NOTE WHAT IS NOT HERE: `secret`. It has no default and no value in this file, on purpose.
-  # A signing key committed to a repository is a published signing key, and "it is only the dev
-  # default" stops being true the first time a deployment inherits it. Supply it as the
-  # environment variable DPE_SECURITY_SECRET (Boot's relaxed binding maps it to
-  # dpe.security.secret with no entry here); infra/docker-compose.yml sets a throwaway one.
-  #
-  # Absent, the service REFUSES TO START, with a message naming the key and the minimum length -
-  # see SecurityProperties. That is the intended behaviour: an authentication system that boots
-  # without a key would have to either invent one or switch itself off, and both are worse than
-  # not starting.
+  # M5: token verification. This service is the ISSUER, so it verifies with the key it signs
+  # with - directly, in memory, rather than fetching its own JWKS endpoint over HTTP. Hence
+  # neither jwk-set-uri nor public-key here: AuthConfig supplies the decoder. See JwtConfig for
+  # the two configured paths the other services use.
   security:
     issuer: dpe
     audience: dpe-api
-    # Leeway on exp/nbf. Stateless auth makes clock agreement a correctness dependency; without
-    # some leeway a validator whose clock runs fast rejects freshly issued tokens and reports it
-    # as "expired". Small, because every second of it is a second an expired token still works.
     clock-skew: 30s
 
   # M5: the ISSUING side, and it exists only in this service. A real deployment replaces this
@@ -210,6 +199,20 @@ dpe:
     # leaked one is valid for exactly this long. Fifteen minutes is the usual compromise between
     # that exposure and asking a user to log in constantly.
     token-ttl: 15m
+
+    # THE SIGNING KEY. RSA private key (base64 PKCS#8) and its public half (base64 X.509).
+    #
+    # No default and no value in this file - the same rule the HS256 secret had, and for a
+    # stronger reason: this one key is the ability to mint any identity in the system.
+    #
+    # Left unset, SigningKeys GENERATES a pair at startup and logs a warning. That keeps
+    # `docker compose up` working with no key ceremony, and it is safe in a way a committed key
+    # would not be, because the key never existed before the process and does not outlive it.
+    # What a generated key cannot do: survive a restart (every token in flight is invalidated),
+    # or be shared by two instances (each would sign with its own, and validators would reject
+    # tokens from whichever one they had not fetched from). Configure a pair for anything real.
+    private-key: ${DPE_AUTH_PRIVATE_KEY:}
+    public-key: ${DPE_AUTH_PUBLIC_KEY:}
 
     # DEVELOPMENT DIRECTORY. Fake people, fake passwords, plain text - a real user store holds a
     # slow hash (bcrypt/argon2) and lives in a database, and nothing here should be mistaken for

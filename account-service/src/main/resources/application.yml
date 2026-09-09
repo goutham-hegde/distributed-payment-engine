@@ -123,19 +123,18 @@ dpe:
     max-interval: 5s
     replay-batch-size: 50
 
-  # M5: token validation. Every service binds this block identically - see common-security.
+  # M5: token verification. account-service and payment-gateway trust payment-orchestrator's
+  # signing key and fetch its PUBLIC half from the JWK set it publishes.
   #
-  # NOTE WHAT IS NOT HERE: `secret`. It has no default and no value in this file, on purpose.
-  # A signing key committed to a repository is a published signing key, and "it is only the dev
-  # default" stops being true the first time a deployment inherits it. Supply it as the
-  # environment variable DPE_SECURITY_SECRET (Boot's relaxed binding maps it to
-  # dpe.security.secret with no entry here); infra/docker-compose.yml sets a throwaway one.
+  # Part 1 had a shared HS256 secret here, which meant every service that could verify a token
+  # could also mint one - so a compromised gateway could issue itself an operator token for the
+  # whole system. Part 2 split the key: what is configured below cannot sign anything.
   #
-  # Absent, the service REFUSES TO START, with a message naming the key and the minimum length -
-  # see SecurityProperties. That is the intended behaviour: an authentication system that boots
-  # without a key would have to either invent one or switch itself off, and both are worse than
-  # not starting.
+  # The fetch is lazy and cached, so this service boots fine while the orchestrator is still
+  # starting, and only re-fetches when a token names a key id it has not seen - which is what
+  # makes key rotation work without a coordinated restart.
   security:
+    jwk-set-uri: ${DPE_SECURITY_JWK_SET_URI:http://localhost:8081/.well-known/jwks.json}
     issuer: dpe
     audience: dpe-api
     # Leeway on exp/nbf. Stateless auth makes clock agreement a correctness dependency; without

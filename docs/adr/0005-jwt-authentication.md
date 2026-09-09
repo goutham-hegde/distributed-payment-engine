@@ -1,6 +1,6 @@
 # ADR 0005 — Stateless JWT authentication, and where authorization actually happens
 
-**Status:** accepted (M5, part 1)
+**Status:** accepted (M5, parts 1 and 2)
 **Supersedes in part:** the `X-Client-Id` header introduced in [ADR 0002](0002-idempotency.md)
 
 ---
@@ -48,16 +48,16 @@ Three claims are checked beyond the signature, and each answers a question the s
 **pinned by the decoder**, never read from the token — which is what makes `alg: none` and the
 RS256-verified-as-HS256 confusion attacks structurally impossible rather than merely unlikely.
 
-### 2. HS256 now, RS256 in part 2
+### 2. HS256 now, RS256 in part 2 — *superseded below by part 2*
 
-A shared secret, distributed to all three services. This is knowingly wrong in one specific way:
+A shared secret, distributed to all three services. This was knowingly wrong in one specific way:
 **with a symmetric algorithm the verification key and the signing key are the same bytes, so every
-service that can validate a token can also forge one.** `TokenIssuer` lives in the shared library
-and is registered in all three services precisely so that this is visible rather than hidden.
+service that can validate a token can also forge one.** `TokenIssuer` lived in the shared library
+and was registered in all three services precisely so that this was visible rather than hidden.
 
-Part 2 moves to RS256: the orchestrator holds a private key and signs; the others hold only a
-public key and can check but not produce. The difference stops being a convention and becomes
-mathematics.
+Part 2 moved to RS256 — see the section at the end of this document. The orchestrator holds a
+private key and signs; the others hold only a public key and can check but not produce. The
+difference stopped being a convention and became mathematics.
 
 ### 3. A development token endpoint, not an auth service
 
@@ -153,9 +153,108 @@ inventing a key or running open.
 
 **What got worse, or is still owed**
 
-- Three services now share a signing secret (until part 2).
+- ~~Three services now share a signing secret~~ — removed by part 2.
 - `/actuator/prometheus` is operator-only, so the M6 scraper will need a credential or a network
   exemption. Left closed rather than pre-opened.
 - The chaos suite (M7) and k6 (M8) must obtain a token; `scripts/token.sh` exists for that.
 - Nothing rate-limits `/auth/token`.
 - A newly opened account is briefly unspendable while its `AccountOpened` event is in flight.
+
+---
+
+## Part 2 (accepted, same milestone): RS256 and a JWK set
+
+Part 1 shipped a known defect: a shared HS256 secret means the verification key and the signing key
+are the same bytes, so **every service that could validate a token could also mint one**. Part 2
+removes it.
+
+### What changed
+
+- **payment-orchestrator holds an RSA private key** and is the only component that can sign.
+  `TokenIssuer` moved out of `common-security` into that service — the class needs a private key,
+  and no arrangement of imports brings one into the other two. The move follows the fix rather than
+  substituting for it.
+- **The public half is published** at `GET /.well-known/jwks.json`, unauthenticated.
+- **account-service and payment-gateway hold no key material at all.** They fetch the key set,
+  cache it, and verify. Configuration is a URL, so replacing this issuer with Keycloak or Auth0
+  changes that URL and nothing else.
+- **Every decoder is pinned to RS256.**
+- **Tokens carry `kid`**, the RFC 7638 thumbprint of the signing key.
+
+### Why a JWK set rather than a configured public key
+
+Both work. Only one supports rotation: the issuer publishes the outgoing and incoming keys
+together, tokens name which one signed them, and validators follow along with no restart and no
+synchronised deploy. A statically configured key can only be changed by deploying every service at
+the same moment.
+
+The cost is a runtime dependency on the issuer being reachable — bounded, because the fetch is lazy
+and cached and only repeats when an unknown `kid` appears. The honest phrasing is: *trusting an
+issuer means being able to reach it occasionally.*
+
+This is **not** the availability coupling rejected earlier in this ADR for the ownership check.
+That one sat on the write path of every transfer and would have made accepting a payment depend on
+another service being up right then. This one is a cached key fetch that happens roughly never.
+
+### Why the orchestrator does not fetch its own JWKS endpoint
+
+It verifies with the key it signs with, in memory. Fetching from itself would be symmetrical and
+would make verification depend on its own HTTP port being up — turning an in-memory operation into
+a startup-ordering question.
+
+Consequence in the wiring: the decoder is chosen by an **explicit import**
+(`JwtDecoderConfig`), not by `@ConditionalOnMissingBean`. Outside auto-configuration that condition
+is evaluated in bean-registration order, and ordering that decides which key verifies your tokens
+is not something to leave to processing order.
+
+### Why the JWKS endpoint is public, and what that rests on
+
+A JWK set is modulus and exponent: it verifies signatures and cannot produce them. Publishing it is
+required by anything that wants to validate a token.
+
+It rests on one call — `toPublicJWK()` in `SigningKeys`. Without it the endpoint serves the private
+key, and the failure is invisible: still valid JSON, still a 200, still passes every test that only
+checks that a token verifies. `JwksEndpointTest` therefore asserts the private fields (`d`, `p`,
+`q`, `dp`, `dq`, `qi`) are absent by name.
+
+### Why pinning the algorithm matters more now than it did in part 1
+
+The verification key is a public download. A verifier that read `alg` from the token would accept
+one HMAC-signed with the published key bytes as the secret — the RS256/HS256 confusion attack,
+which is trivial when the key is fetchable by anyone. Pinning RS256 is what stops the public key
+from being a signing key, and there is a test that presents exactly that forgery.
+
+### Where the signing key comes from
+
+Configured (`dpe.auth.private-key` / `dpe.auth.public-key`) if present. Otherwise **generated at
+startup**, with a WARN.
+
+That keeps `git clone && docker compose up` working with no key ceremony, and it is safe in a way a
+committed key would not be — it never existed before the process and does not outlive it. Two
+things it cannot do, both stated in the log line:
+
+- **Survive a restart.** Every token in flight is invalidated. Bounded by the 15-minute TTL.
+- **Be shared by two instances.** Each would sign with its own key and publish only that one, so a
+  validator that fetched from instance A rejects tokens minted by instance B — intermittently, by
+  load-balancer luck, which is the worst way for anything to fail. Horizontal scaling requires a
+  configured key.
+
+### What rotation does and does not do
+
+Demonstrated live by restarting the issuer so its ephemeral key changed. A token minted before the
+restart was still accepted by account-service, because its cached JWK set still held the old key.
+Once a token carrying the new `kid` forced a re-fetch, the old key was gone and that same
+pre-restart token began failing 401 — still well inside its lifetime.
+
+So **rotation is not revocation** (tokens signed by a retired key survive in warm caches), and
+**retiring a key can cut valid tokens short** (once caches turn over they fail early). A real
+rotation publishes both keys for an overlap of at least one token TTL and removes the old one only
+afterwards. This system publishes one key at a time and is therefore rotation-*capable*, not
+rotation-*practising* — an honest gap, not a solved problem.
+
+### What did not change
+
+Everything above the key: the claim checks, the role model, the ownership guard, the two-place
+authorization argument, the 403/404 distinction. `AuthController` did not change at all — the
+tokens it hands out became RS256 and it never had to know, which is the clearest evidence that
+issuance is one bean deep.

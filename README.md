@@ -108,7 +108,7 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 | M2 | Transactional outbox + Kafka + inbox dedup | ✅ **done** |
 | M3 | SAGA orchestration + compensation + timeouts | ✅ **done** |
 | M4 | Idempotency + DLQ | ✅ **done** |
-| M5 | JWT security | 🚧 **part 1 done** (HS256; RS256 next) |
+| M5 | JWT security | ✅ **done** |
 | M6 | Observability — metrics, dashboards, tracing | ⬜ |
 | M7 | Chaos suite — 8 scenarios | ⬜ |
 | M8 | k6 load test to 1,000 concurrent | ⬜ |

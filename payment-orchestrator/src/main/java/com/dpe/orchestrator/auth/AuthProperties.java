@@ -20,15 +20,31 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *                 constantly. Making it hours is the mistake that turns a single leaked token
  *                 into a day-long breach; making it seconds means building refresh tokens, which
  *                 is a second mechanism with its own storage and its own revocation problem.
- * @param users    the demo directory. See {@link AuthController} for why this is configuration
- *                 rather than a table, and what that rules out.
+ * @param users      the demo directory. See {@link AuthController} for why this is configuration
+ *                   rather than a table, and what that rules out.
+ * @param privateKey the RSA private key that signs every token in this system, base64 of its
+ *                   PKCS#8 encoding (PEM armour tolerated). <b>Only this service has it</b> - that
+ *                   is what M5 part 2 bought. Absent, {@link SigningKeys} generates an ephemeral
+ *                   pair and says so loudly; see that class for the two things a generated key
+ *                   cannot do.
+ * @param publicKey  its public half, base64 of the X.509 encoding. Configured alongside the
+ *                   private key rather than derived from it: deriving is possible for RSA, and
+ *                   requiring both means a mismatched pair fails at startup instead of at the
+ *                   first token somebody tries to verify.
  */
 @ConfigurationProperties("dpe.auth")
-public record AuthProperties(Duration tokenTtl, Map<String, User> users) {
+public record AuthProperties(Duration tokenTtl, Map<String, User> users,
+                             String privateKey, String publicKey) {
 
     public AuthProperties {
         tokenTtl = tokenTtl == null ? Duration.ofMinutes(15) : tokenTtl;
         users = users == null ? Map.of() : Map.copyOf(users);
+    }
+
+    /** True when a key pair was configured, false when one has to be generated. */
+    public boolean hasKeyPair() {
+        return privateKey != null && !privateKey.isBlank()
+                && publicKey != null && !publicKey.isBlank();
     }
 
     /**

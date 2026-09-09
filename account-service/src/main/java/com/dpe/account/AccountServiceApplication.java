@@ -2,6 +2,7 @@ package com.dpe.account;
 
 import com.dpe.messaging.MessagingConfig;
 import com.dpe.security.JwtConfig;
+import com.dpe.security.JwtDecoderConfig;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.persistence.autoconfigure.EntityScan;
@@ -19,7 +20,7 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
  * reasoning.
  */
 @SpringBootApplication
-@Import({MessagingConfig.class, JwtConfig.class})
+@Import({MessagingConfig.class, JwtConfig.class, JwtDecoderConfig.class})
 @EntityScan({"com.dpe.account", "com.dpe.messaging"})
 @EnableJpaRepositories({"com.dpe.account", "com.dpe.messaging"})
 public class AccountServiceApplication {

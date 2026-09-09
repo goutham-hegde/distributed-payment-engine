@@ -13,17 +13,19 @@ name: dpe
 
 # Hoisted out of the service blocks so the heap cap is stated once. As of M3 all three
 # services speak Kafka - the gateway joined the saga and got its KAFKA_BOOTSTRAP here.
-# M5: the HS256 signing key, shared by all three services because with a symmetric algorithm
-# the verification key and the signing key ARE the same bytes - which is the defect part 2 fixes
-# by moving to RS256, not a shortcut taken here.
+# M5 part 2: the other two services trust payment-orchestrator's signing key and fetch its
+# PUBLIC half from the JWK set it publishes. There is no shared secret any more - part 1 had one,
+# and it meant every service that could verify a token could also mint one.
 #
-# There is no default for this anywhere in application.yml, on purpose: a signing key committed
-# to a repository is a published signing key. This value is a throwaway for local Compose, and a
-# service started without it refuses to boot rather than inventing one or silently running open.
-# Override it for anything reachable from outside this machine:
-#     DPE_SECURITY_SECRET=$(openssl rand -base64 48) docker compose up -d
-x-security-env: &security-env
-  DPE_SECURITY_SECRET: ${DPE_SECURITY_SECRET:-local-compose-only-signing-key-not-a-secret}
+# Lazy and cached: account-service and payment-gateway boot fine before the orchestrator is up,
+# and only fetch when they are first asked to verify a token.
+#
+# The orchestrator does NOT get this - it verifies with the key it signs with. Its private key is
+# unset here on purpose, so SigningKeys generates an ephemeral pair and says so in the log. That
+# is right for a laptop and wrong for anything with two instances or an uptime requirement; a real
+# deployment sets DPE_AUTH_PRIVATE_KEY / DPE_AUTH_PUBLIC_KEY from a secret store.
+x-jwks-env: &jwks-env
+  DPE_SECURITY_JWK_SET_URI: http://payment-orchestrator:8081/.well-known/jwks.json
 
 x-jvm-env: &jvm-env
   # Explicit heap cap. Three JVMs at default sizing will each claim a quarter
@@ -218,7 +220,7 @@ services:
       redis:
         condition: service_started
     environment:
-      <<: [*jvm-env, *security-env]
+      <<: *jvm-env
       DB_URL: jdbc:postgresql://postgres:5432/payments_db
       DB_USER: payments
       DB_PASSWORD: payments
@@ -243,7 +245,7 @@ services:
       redpanda:
         condition: service_healthy
     environment:
-      <<: [*jvm-env, *security-env]
+      <<: [*jvm-env, *jwks-env]
       DB_URL: jdbc:postgresql://postgres:5432/accounts_db
       DB_USER: accounts
       DB_PASSWORD: accounts
@@ -268,7 +270,7 @@ services:
       redpanda:
         condition: service_healthy
     environment:
-      <<: [*jvm-env, *security-env]
+      <<: [*jvm-env, *jwks-env]
       DB_URL: jdbc:postgresql://postgres:5432/gateway_db
       DB_USER: gateway
       DB_PASSWORD: gateway

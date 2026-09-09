@@ -22,6 +22,7 @@ import org.springframework.security.web.SecurityFilterChain;
  *
  * <pre>
  *   POST /auth/token          permitAll        the login endpoint cannot require a login
+ *   GET  /.well-known/jwks.json  permitAll     public keys, readable by anyone by design
  *   GET  /actuator/health**   permitAll        probes have no credentials
  *   GET  /actuator/info       permitAll
  *        /actuator/**         OPERATOR         metrics, env, mappings
@@ -84,6 +85,13 @@ public class SecurityConfig {
                         // The one endpoint that hands out credentials, and therefore the one that
                         // cannot require one. POST only.
                         .requestMatchers(HttpMethod.POST, "/auth/token").permitAll()
+
+                        // M5 part 2: the public half of the signing key. Open on purpose - a JWK
+                        // set is modulus and exponent, it verifies signatures and cannot produce
+                        // them, and every service that validates a token needs to read it. What
+                        // it relies on is SigningKeys.publicJwkSet() having actually stripped the
+                        // private half; see the note there.
+                        .requestMatchers(HttpMethod.GET, "/.well-known/jwks.json").permitAll()
 
                         // Probes. Unauthenticated because the Compose healthcheck and (at M10) the
                         // kubelet have no credentials, and an expiring secret must not be able to

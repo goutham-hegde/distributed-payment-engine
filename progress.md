@@ -12,7 +12,7 @@ and what broke along the way. Newest entries at the bottom.
 | M2 | Transactional outbox + Kafka publishing + inbox dedup | ✅ **done** |
 | M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ✅ **done** |
 | M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ✅ **done** |
-| M5 | JWT authentication and per-account authorization | 🚧 **part 1 done** (HS256; RS256 next) |
+| M5 | JWT authentication and per-account authorization | ✅ **done** |
 | M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing | ⬜ |
 | M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ⬜ |
 | M7 | Chaos suite — 8 injected-failure scenarios | ⬜ |
@@ -1579,6 +1579,177 @@ All invariants hold.
 - Nothing rate-limits `POST /auth/token`, which is the one endpoint that mints credentials.
 - A newly opened account is briefly unspendable while its `AccountOpened` event is in flight —
   bounded, and the direction the projection is allowed to be wrong in.
+- Still outstanding from M4: `ErrorHandlingDeserializer`, so a failure inside `consumer.poll()`
+  becomes a poison-pill value the listener can see rather than an unreachable partition stall; and
+  retention for `outbox`, `inbox` and `dead_letters`, which still grow without limit.
+
+
+---
+
+## Session 10 — 2026-09-09
+
+### Goal
+
+M5 part 2: replace the shared HS256 secret with RS256, so that the ability to *verify* a token
+stops implying the ability to *mint* one. Part 1 shipped that defect deliberately and visibly;
+this session removes it.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Key distribution | A JWKS endpoint on the orchestrator, fetched by the other two | It is what every identity provider serves and every resource server knows how to consume, so replacing this issuer with Keycloak later changes a URL and nothing else. It is also the only mechanism that supports rotation: the issuer publishes old and new keys together and validators follow by `kid`, with no coordinated restart. |
+| Where `TokenIssuer` lives | Moved out of `common-security` into payment-orchestrator | Under HS256 it belonged in the shared library and was a bean in all three services — that was honest, because the verification key and the signing key were the same bytes. Under RS256 it would be a lie. The move follows the fix rather than substituting for it: the class needs a private key, and there is no import that brings one into the other services. |
+| How the orchestrator verifies | Directly, with its own public key in memory | It could fetch its own JWKS endpoint over HTTP and be symmetrical with the others. That would make verification depend on its own HTTP port being up, turning an in-memory operation into a startup-ordering question. |
+| Choosing the decoder | An explicit `@Import`, not `@ConditionalOnMissingBean` | Outside auto-configuration, `@ConditionalOnMissingBean` is evaluated in bean-registration order. Ordering that decides which key verifies your tokens is not something to leave to processing order. |
+| Where the signing key comes from | Configured if present, generated at startup otherwise, with a WARN | Keeps `git clone && docker compose up` working with no key ceremony, and is safe in a way a committed key is not: it never existed before the process and does not outlive it. What it cannot do is survive a restart or be shared by two instances — both are stated in the log line and in `SigningKeys`. |
+| Algorithm pinning | `RS256` pinned on every decoder | Now that the verification key is *public*, a verifier that let a token choose its own algorithm would accept one HMAC-signed with the published key. Pinning is not defence in depth here; it is the thing that stops a public key being a signing key. |
+| Test key material | Generated per JVM, injected via `@DynamicPropertySource` | No private key is committed to this repository, including test fixtures. account-service and payment-gateway generate a pair, hand the public half to the application as `dpe.security.public-key`, and mint with the private half — which is exactly what an operator pointing these services at a different issuer would do. |
+
+### Built
+
+- **`SigningKeys`** — the system's private key, in payment-orchestrator and nowhere else. Loads a
+  configured PEM/base64 pair or generates RSA-2048 at startup. `kid` is the RFC 7638 thumbprint,
+  derived from the key material, so two processes given the same key agree on its id without
+  coordinating.
+- **`JwksController`** — `GET /.well-known/jwks.json`, unauthenticated. The load-bearing line in
+  the whole change is `toPublicJWK()`: it strips the private exponent and the primes. Serving the
+  full key would still be valid JSON, still return 200, and still pass every test that only checks
+  that a token verifies.
+- **`TokenIssuer`**, moved, now signing RS256 and stamping `kid` into the header.
+- **`JwtDecoderConfig`**, split out of `JwtConfig`: one decoder bean that branches on whether a
+  JWK set URI or a static public key is configured, imported only by the services whose key comes
+  from configuration.
+- **`SecurityProperties`** rewritten around a public key — the type no longer has a method that
+  returns anything capable of signing.
+- **`JwksEndpointTest`** — four tests, two of which are the milestone: the served key set contains
+  no private field (`d`, `p`, `q`, `dp`, `dq`, `qi`), and a token HMAC-signed with the published
+  public key is rejected.
+
+### What broke
+
+1. **`@ComponentScan` in a shared library swept up the configuration class it was meant to opt
+   into.** `JwtConfig` carried `@ComponentScan(basePackageClasses = JwtConfig.class)` to register
+   its one component. A `@Configuration` class *is* a component, so the scan also registered
+   `JwtDecoderConfig` in every service — including the issuer, which supplies its own decoder —
+   producing two `jwtDecoder` definitions and a `BeanDefinitionOverrideException` at startup.
+
+   Loud, and it could have been much worse: with bean overriding enabled, one decoder would have
+   silently replaced the other and the service would have verified tokens with a key nobody chose.
+   **An "import this to opt in" design is not opt-in if a scan can find the class anyway.** Fixed
+   by dropping the scan and declaring the one component as a `@Bean`.
+
+2. **Two sources of truth for a verification key, introduced by the test harness.** The test base
+   added `dpe.security.public-key` via `@DynamicPropertySource` while `application.yml` still
+   configured `dpe.security.jwk-set-uri`, so both were set. `SecurityProperties` refuses that
+   combination at startup by design — the failure was the check working. The test now blanks the
+   URI explicitly.
+
+3. **A retired key keeps working until the validator's cache turns over, and then stops
+   abruptly.** Restarting the orchestrator generated a new key. A token minted before the restart
+   was still accepted by account-service, because its cached JWK set still held the old key; once
+   a token carrying the new `kid` forced a re-fetch, the old key was gone and the same pre-restart
+   token began failing with 401 — while still being well within its 15-minute lifetime.
+
+   Both halves are worth keeping in mind. **Rotating a key is not revocation** (tokens signed by a
+   retired key survive in warm caches), and **retiring one can also cut valid tokens short**
+   (once the cache turns over, they fail early). Real rotation therefore publishes both keys for
+   an overlap window at least as long as the token TTL, and removes the old one only afterwards.
+
+### Verified
+
+Full suite — 151 tests:
+
+```
+./mvnw -B -ntp verify
+
+common-messaging       Tests run:  13, Failures: 0, Errors: 0
+account-service        Tests run:  64, Failures: 0, Errors: 0
+payment-orchestrator   Tests run:  68, Failures: 0, Errors: 0
+payment-gateway        Tests run:   6, Failures: 0, Errors: 0
+BUILD SUCCESS
+```
+
+Live on Compose, all six containers healthy. The orchestrator says what it did with its key:
+
+```
+WARN  com.dpe.orchestrator.auth.SigningKeys : no dpe.auth.private-key configured - generated an
+ephemeral RSA key (kid y0cF2k1GIb04DXpkZKHnSa2TGawDQQ6UO7aKXSWbDVY). Tokens will not survive a
+restart, and a second instance would sign with a different key. Configure a key pair for anything
+real.
+```
+
+What the endpoint publishes, and what it does not:
+
+```
+GET /.well-known/jwks.json          200, no credential
+fields served: ['e', 'kid', 'kty', 'n', 'use']
+private fields present: none
+```
+
+Tokens are RS256 and name the key that signed them:
+
+```
+{'kid': 'y0cF2k1GIb04DXpkZKHnSa2TGawDQQ6UO7aKXSWbDVY', 'alg': 'RS256'}
+```
+
+**The property the milestone was for:** account-service and payment-gateway hold no key material at
+all, and verify tokens the orchestrator issued using a public key they fetched over HTTP:
+
+```
+POST /accounts            (8082)  operator token   201
+GET  /admin/simulation    (8083)  operator token   200
+```
+
+The rest of M5 still holds, on the new algorithm:
+
+```
+POST /api/v1/transfers   from alice's own account   202 -> polled COMPLETED
+POST /api/v1/transfers   from bob's account         403
+```
+
+Rotation, demonstrated by restarting the issuer so its ephemeral key changed:
+
+```
+old kid: y0cF2k1GIb04DXpkZKHnSa2TGawDQQ6UO7aKXSWbDVY
+new kid: WSz5LnLqUS2dFFj0IoDMZGk0asSmZcnOvuq-kX8I8EE
+
+a token issued BEFORE the restart, presented afterwards:
+  to the issuer (in-memory key)          401
+  to account-service (cached JWK set)    200, then 401 once a new kid forced a re-fetch
+
+a freshly issued token, at account-service, which was never restarted:   200
+```
+
+That last line is the point: account-service picked up a brand-new signing key with no restart, no
+redeploy and no configuration change.
+
+And the invariants, after all of it:
+
+```
+./scripts/verify-invariants.sh baseline      I3 baseline recorded: 1300000
+POST /api/v1/transfers  5000                 202
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (1300000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+All invariants hold.
+```
+
+### Committed
+
+`M5 (part 2): RS256 — the ability to verify a token stops implying the ability to mint one`
+
+### Open / next
+
+- **M6: observability.** Metrics, dashboards, tracing. Note the debt M5 left it:
+  `/actuator/prometheus` is operator-only, so the scraper needs a credential or a network
+  exemption — a decision deliberately deferred to when the scraper exists.
+- Key rotation is *possible* but not *practised*: the orchestrator publishes one key at a time. A
+  real rotation publishes the outgoing and incoming keys together for at least one token lifetime.
+- Nothing rate-limits `POST /auth/token`.
 - Still outstanding from M4: `ErrorHandlingDeserializer`, so a failure inside `consumer.poll()`
   becomes a poison-pill value the listener can see rather than an unreachable partition stall; and
   retention for `outbox`, `inbox` and `dead_letters`, which still grow without limit.

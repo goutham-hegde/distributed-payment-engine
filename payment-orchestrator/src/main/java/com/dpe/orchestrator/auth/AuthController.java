@@ -1,6 +1,5 @@
 package com.dpe.orchestrator.auth;
 
-import com.dpe.security.TokenIssuer;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import java.nio.charset.StandardCharsets;
@@ -45,6 +44,10 @@ import org.springframework.web.bind.annotation.RestController;
  *
  * <p>The demo users' subjects are the same strings as {@code accounts.owner_id}, which is what
  * makes {@code sub} usable as an ownership check with no mapping table in between.
+ *
+ * <p>M5 part 2 changed nothing in this file, which is the interesting part: the tokens it hands
+ * out are now RS256, signed with a private key no other service holds, and the controller did not
+ * have to know. Issuance is one bean away - see {@link TokenIssuer}.
  */
 @RestController
 @RequestMapping("/auth")

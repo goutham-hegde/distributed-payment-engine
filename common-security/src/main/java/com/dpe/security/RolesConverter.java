@@ -8,10 +8,12 @@ import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.stereotype.Component;
 
 /**
  * Turns a verified token into an {@code Authentication} carrying Spring Security authorities.
+ *
+ * <p>Registered as a bean by {@link JwtConfig}, not by a stereotype annotation - see the note
+ * there about what a component scan in a shared library sweeps up along the way.
  *
  * <p>Ten lines, and the place a role check silently stops working. Every service's filter chain
  * consumes it, so a mistake here is not local to one endpoint: it reads {@link Roles#CLAIM} - a
@@ -46,7 +48,6 @@ import org.springframework.stereotype.Component;
  * already issued, so the change takes effect only when that token expires. That is the same
  * trade-off as revocation itself, and it is why the TTL is minutes rather than hours.
  */
-@Component
 public class RolesConverter implements Converter<Jwt, AbstractAuthenticationToken> {
 
     @Override
