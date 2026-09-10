@@ -2643,7 +2643,7 @@ Full suite: **209 tests green** (was 173), and the invariants after the run:
 
 ### Committed
 
-`f485c0e` — M6 (part 3): the read path - keyset pages, the timeline, and invariants per database
+`2f6028a` — M6 (part 3): the read path - keyset pages, the timeline, and invariants per database
 
 ### Open / next
 
