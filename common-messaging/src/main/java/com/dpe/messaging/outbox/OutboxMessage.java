@@ -68,18 +68,42 @@ public class OutboxMessage {
     @Column(name = "last_error")
     private String lastError;
 
+    /**
+     * The W3C {@code traceparent} of the span that produced this message, or {@code null} if the
+     * producer had no active span.
+     *
+     * <p>This is the field that makes one payment one trace. Everything else about tracing is
+     * ambient - read off a thread local at the moment of the call - and the outbox is the one
+     * place where that ambience cannot survive, because the send happens on a different thread in
+     * a different transaction some hundreds of milliseconds later. Persisting it turns the context
+     * from something the thread happens to be carrying into something the message owns.
+     *
+     * <p>Immutable like the rest of the message: it describes the write that created the row, and
+     * a republish after a failed send must carry the SAME parent. Re-capturing at publish time
+     * would parent the retry under the relay instead of under the payment, which is the disconnect
+     * this column exists to prevent.
+     */
+    @Column(name = "trace_parent", updatable = false, length = 55)
+    private String traceParent;
+
+    /** W3C {@code tracestate}, carried verbatim. Usually empty; see the V5 migration. */
+    @Column(name = "trace_state", updatable = false)
+    private String traceState;
+
     protected OutboxMessage() {
         // for JPA
     }
 
     OutboxMessage(UUID id, String aggregateType, UUID aggregateId, String topic, String eventType,
-                  String payload) {
+                  String payload, String traceParent, String traceState) {
         this.id = id;
         this.aggregateType = aggregateType;
         this.aggregateId = aggregateId;
         this.topic = topic;
         this.eventType = eventType;
         this.payload = payload;
+        this.traceParent = traceParent;
+        this.traceState = traceState;
         this.attempts = 0;
     }
 
@@ -141,5 +165,13 @@ public class OutboxMessage {
 
     public String getLastError() {
         return lastError;
+    }
+
+    public String getTraceParent() {
+        return traceParent;
+    }
+
+    public String getTraceState() {
+        return traceState;
     }
 }

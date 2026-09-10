@@ -1,6 +1,8 @@
 package com.dpe.messaging.outbox;
 
 import com.dpe.events.EventEnvelope;
+import com.dpe.messaging.tracing.CapturedTrace;
+import com.dpe.messaging.tracing.OutboxTracing;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 import java.time.Instant;
@@ -25,10 +27,12 @@ public class OutboxWriter {
 
     private final OutboxRepository outbox;
     private final ObjectMapper objectMapper;
+    private final OutboxTracing tracing;
 
-    public OutboxWriter(OutboxRepository outbox, ObjectMapper objectMapper) {
+    public OutboxWriter(OutboxRepository outbox, ObjectMapper objectMapper, OutboxTracing tracing) {
         this.outbox = outbox;
         this.objectMapper = objectMapper;
+        this.tracing = tracing;
     }
 
     /**
@@ -61,7 +65,19 @@ public class OutboxWriter {
                     "Could not serialize outbox payload of type " + eventType, e);
         }
 
-        outbox.save(new OutboxMessage(messageId, aggregateType, aggregateId, topic, eventType, json));
+        // M6 part 2. Captured HERE, on the producing thread, and not by the relay - which is the
+        // entire point. This method runs inside the business transaction, where the span that
+        // caused the write is still current; the relay runs minutes later on a scheduled thread
+        // where it is not. Storing the context alongside the message is what makes it survive
+        // that gap, and it commits or rolls back with the message, so a row can never exist
+        // carrying the trace of a transaction that was abandoned.
+        //
+        // NONE is a normal answer - the sweeper and the tests have no span - and it is stored as
+        // NULL rather than treated as a problem.
+        CapturedTrace trace = tracing.capture();
+
+        outbox.save(new OutboxMessage(messageId, aggregateType, aggregateId, topic, eventType, json,
+                trace.traceParent(), trace.traceState()));
         return messageId;
     }
 }

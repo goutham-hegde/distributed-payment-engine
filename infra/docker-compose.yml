@@ -32,6 +32,15 @@ x-jvm-env: &jvm-env
   # of the container's visible RAM and this machine cannot afford that.
   JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+UseSerialGC"
 
+# M6 part 2. Where spans go. Every service gets the same value, because a trace that only some
+# services report is worse than no trace: the gap looks like a service that did not participate
+# rather than one that was not configured.
+#
+# HTTP/4318 rather than gRPC/4317 - one less protocol in the runtime image, and a wrong port
+# fails as a visible connection refused instead of a stream into nothing.
+x-otel-env: &otel-env
+  OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+
 x-build-ctx: &build-ctx
   context: ..
   dockerfile: Dockerfile
@@ -223,7 +232,7 @@ services:
       redis:
         condition: service_started
     environment:
-      <<: *jvm-env
+      <<: [*jvm-env, *otel-env]
       DB_URL: jdbc:postgresql://postgres:5432/payments_db
       DB_USER: payments
       DB_PASSWORD: payments
@@ -251,7 +260,7 @@ services:
       redpanda:
         condition: service_healthy
     environment:
-      <<: [*jvm-env, *jwks-env]
+      <<: [*jvm-env, *jwks-env, *otel-env]
       DB_URL: jdbc:postgresql://postgres:5432/accounts_db
       DB_USER: accounts
       DB_PASSWORD: accounts
@@ -279,7 +288,7 @@ services:
       redpanda:
         condition: service_healthy
     environment:
-      <<: [*jvm-env, *jwks-env]
+      <<: [*jvm-env, *jwks-env, *otel-env]
       DB_URL: jdbc:postgresql://postgres:5432/gateway_db
       DB_USER: gateway
       DB_PASSWORD: gateway
@@ -298,9 +307,13 @@ services:
     deploy: *mem-limit
 
   # ---------------------------------------------------------------------------------------
-  # M6: observability. Both containers are pure consumers of what the services already
-  # publish - stopping either one changes nothing about how a payment behaves, which is the
+  # M6: observability. All three containers are pure consumers of what the services already
+  # publish - stopping any of them changes nothing about how a payment behaves, which is the
   # test of whether monitoring has quietly become load-bearing.
+  #
+  # Note what is NOT here as a result: no service depends_on jaeger, or on prometheus. A payment
+  # must work with the trace backend down, so the exporter is allowed to fail - it retries, logs,
+  # and drops. Adding the dependency would make a stalled collector able to stop a deployment.
   # ---------------------------------------------------------------------------------------
 
   prometheus:
@@ -385,6 +398,50 @@ services:
       resources:
         limits:
           memory: 320M
+
+  # M6 part 2. Where the traces land.
+  #
+  # `all-in-one` is the 1.x line, and it is chosen over the current `jaegertracing/jaeger:2.x`
+  # for one reason: MEMORY_MAX_TRACES. The v2 binary is an OpenTelemetry Collector distribution
+  # whose memory store is configured by a YAML file, and left at its defaults that store is
+  # UNBOUNDED - which on a 16 GB laptop is a memory leak with good intentions, and the container
+  # limit below would turn it into an OOM kill in the middle of a chaos run. Same reasoning as
+  # `--maxmemory 64mb` on Redis: a component that holds a ring buffer of recent data must be told
+  # how much recent it is allowed to keep. Revisit when v2 takes a bound from the environment.
+  #
+  # Also worth saying plainly: this is a demo store. Traces live in the process, so restarting
+  # this container discards every trace, and there is one collector with no queue in front of it.
+  # A real deployment writes to Elasticsearch or Cassandra behind an OTel Collector doing
+  # tail-based sampling. Nothing about the application changes for that - the services speak OTLP
+  # to a hostname, which is the whole point of exporting an open protocol rather than a vendor's.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: dpe-jaeger
+    environment:
+      SPAN_STORAGE_TYPE: memory
+      # About an hour of the load test at M8, and a hard ceiling either way. Oldest are evicted.
+      MEMORY_MAX_TRACES: "20000"
+      # OTLP receivers on 4317/4318. Default since 1.35, stated anyway because it is the entire
+      # contract with the three services and a silent default is a bad place for that to live.
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      # The UI. This is the container the milestone exists to look at.
+      - "16686:16686"
+      # OTLP/HTTP, published so a service run from the IDE with `./mvnw spring-boot:run` - whose
+      # default endpoint is localhost:4318 - reports to the same place as one in Compose.
+      - "4318:4318"
+    healthcheck:
+      # 14269 is the admin port; /  is the health endpoint. Not 16686, which serves the UI and
+      # answers 200 while the collector is still starting.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:14269/ | grep -q Server"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
 
 volumes:
   pgdata:

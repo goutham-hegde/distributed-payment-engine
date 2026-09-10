@@ -1,6 +1,7 @@
 package com.dpe.messaging.outbox;
 
 import com.dpe.events.EventEnvelope;
+import com.dpe.messaging.tracing.OutboxTracing;
 import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.util.HashSet;
@@ -95,6 +96,16 @@ import org.springframework.transaction.annotation.Transactional;
  * {@code claimed_at} column and a reaper for rows claimed by a relay that then died. More
  * machinery, same at-least-once guarantee.
  *
+ * <h2>Why this class has to know about tracing at all</h2>
+ *
+ * Every other component in this system gets distributed tracing for free, because the
+ * instrumentation reads the current span off a thread local at the moment of the outbound call.
+ * This one cannot: the call it makes was decided by a transaction that committed on a different
+ * thread and has already finished. The context was persisted on the row by
+ * {@link OutboxWriter#append}, and it is this method's job to put it back before the send - see
+ * {@link com.dpe.messaging.tracing.OutboxTracing}. Skip it and every payment becomes one trace per
+ * hop, joined by nothing.
+ *
  * @see OutboxRelayScheduler for why the {@code @Scheduled} trigger lives in a different class
  */
 @Component
@@ -105,12 +116,14 @@ public class OutboxRelay {
     private final OutboxRepository outbox;
     private final KafkaTemplate<String, String> kafka;
     private final OutboxProperties properties;
+    private final OutboxTracing tracing;
 
     public OutboxRelay(OutboxRepository outbox, KafkaTemplate<String, String> kafka,
-                       OutboxProperties properties) {
+                       OutboxProperties properties, OutboxTracing tracing) {
         this.outbox = outbox;
         this.kafka = kafka;
         this.properties = properties;
+        this.tracing = tracing;
     }
 
     /**
@@ -135,38 +148,60 @@ public class OutboxRelay {
             if (blocked.contains(message.getAggregateId())) {
                 continue;
             }
-            try {
-                // Blocks for at most sendTimeout. The producer's own delivery.timeout.ms is set
-                // below this value in application.yml, so in practice the future completes on its
-                // own - exceptionally if it must - rather than being abandoned here while the
-                // producer is still retrying in the background and may yet succeed.
-                kafka.send(recordFor(message))
-                        .get(properties.sendTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            ProducerRecord<String, String> record = recordFor(message);
 
-                // Dirty checking flushes this UPDATE at commit; the row is durably published-
-                // marked only if the whole batch's transaction commits, which it does because
-                // nothing below rethrows.
-                message.markPublished(OffsetDateTime.now());
-                published++;
-            } catch (InterruptedException e) {
-                // The JVM is shutting down. Restore the flag the catch cleared, stop claiming
-                // more work, and let the remaining rows be picked up by whoever runs next -
-                // they are still unpublished, which is the safe state.
-                Thread.currentThread().interrupt();
-                message.recordFailure("interrupted while awaiting broker acknowledgement");
-                blocked.add(message.getAggregateId());
-                break;
-            } catch (ExecutionException | TimeoutException | RuntimeException e) {
-                // Not rethrown on purpose - see the class javadoc, step 5. A timeout is the
-                // ambiguous case and is treated as a failure: the message may in fact have
-                // reached the broker, so the retry may duplicate it. That is precisely the
-                // duplicate the consumer's inbox exists to absorb, and it is the right way to
-                // be wrong.
-                log.warn("outbox message {} ({}) failed to publish to {}; leaving it unpublished "
-                                + "for retry (attempt {})", message.getId(), message.getEventType(),
-                        message.getTopic(), message.getAttempts() + 1, e);
-                message.recordFailure(describe(e));
-                blocked.add(message.getAggregateId());
+            // Restores the trace context this message was produced with. The row carries what
+            // OutboxWriter captured on the producing thread - message.getTraceParent() /
+            // getTraceState() - and beginPublish() turns that into a child span (or a root span
+            // when the row has no stored context, e.g. the timeout sweeper). One span per
+            // message, scoped to this loop iteration, closed via try-with-resources so a failure
+            // below can never leak the scope onto the next message on this thread.
+            try (var publish = tracing.beginPublish(message.getTraceParent(),
+                    message.getTraceState(), message.getTopic(), message.getEventType())) {
+
+                // Must happen before send(): the producer serializes the record on this thread,
+                // so a header added after send() has already been handed a copy the broker
+                // never sees.
+                publish.injectInto(record.headers());
+
+                try {
+                    // Blocks for at most sendTimeout. The producer's own delivery.timeout.ms is
+                    // set below this value in application.yml, so in practice the future
+                    // completes on its own - exceptionally if it must - rather than being
+                    // abandoned here while the producer is still retrying in the background and
+                    // may yet succeed.
+                    kafka.send(record)
+                            .get(properties.sendTimeout().toMillis(), TimeUnit.MILLISECONDS);
+
+                    // Dirty checking flushes this UPDATE at commit; the row is durably published-
+                    // marked only if the whole batch's transaction commits, which it does because
+                    // nothing below rethrows.
+                    message.markPublished(OffsetDateTime.now());
+                    published++;
+                } catch (InterruptedException e) {
+                    // The JVM is shutting down. Restore the flag the catch cleared, stop claiming
+                    // more work, and let the remaining rows be picked up by whoever runs next -
+                    // they are still unpublished, which is the safe state.
+                    Thread.currentThread().interrupt();
+                    message.recordFailure("interrupted while awaiting broker acknowledgement");
+                    blocked.add(message.getAggregateId());
+                    // The method swallows this exception, so a span left to infer success from a
+                    // normal return would report a green publish for a message that never left.
+                    publish.error(e);
+                    break;
+                } catch (ExecutionException | TimeoutException | RuntimeException e) {
+                    // Not rethrown on purpose - see the class javadoc, step 5. A timeout is the
+                    // ambiguous case and is treated as a failure: the message may in fact have
+                    // reached the broker, so the retry may duplicate it. That is precisely the
+                    // duplicate the consumer's inbox exists to absorb, and it is the right way to
+                    // be wrong.
+                    log.warn("outbox message {} ({}) failed to publish to {}; leaving it unpublished "
+                                    + "for retry (attempt {})", message.getId(), message.getEventType(),
+                            message.getTopic(), message.getAttempts() + 1, e);
+                    message.recordFailure(describe(e));
+                    blocked.add(message.getAggregateId());
+                    publish.error(e);
+                }
             }
         }
 

@@ -73,6 +73,18 @@
             <artifactId>spring-boot-starter-json</artifactId>
         </dependency>
 
+        <!-- M6 part 2: Tracer and Propagator - the tracing API, and only the API.
+
+             The same line as micrometer-core above: this module INSTRUMENTS, it does not decide
+             where the data goes. No bridge and no exporter here, so a service that brings neither
+             still compiles and still runs - Boot leaves Tracer.NOOP and Propagator.NOOP in the
+             context, OutboxTracing captures null, and the outbox behaves exactly as it did at M5.
+             Tracing is an option the service exercises, never a dependency the outbox has. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing</artifactId>
+        </dependency>
+
         <!-- M4: DeadLetterController needs the web annotations to COMPILE, but a service that
              depends on this library must not acquire an HTTP stack just by using the outbox.
 

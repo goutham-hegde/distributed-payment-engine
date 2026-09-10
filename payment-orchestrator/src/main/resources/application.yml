@@ -114,6 +114,28 @@ spring:
       # has actually been committed.
       ack-mode: manual_immediate
 
+      # M6 part 2. THIS is the half of tracing that is free, and it is worth being clear about
+      # which half. Spring Kafka creates a CONSUMER observation per record and extracts the
+      # `traceparent` header into it, so the handler, its JPA calls and its own outbox write all
+      # land under the producing request's trace - provided the header is there. Putting it there
+      # is the part that is not free, because the outbox sends on a thread that has no context;
+      # see OutboxRelay and OutboxTracing.
+      observation-enabled: true
+
+    template:
+      # OFF, deliberately, and it is the non-obvious setting of the pair.
+      #
+      # With it on, KafkaTemplate injects whatever context the SENDING thread currently holds.
+      # For the outbox that thread is the relay's, so the header would describe the drain rather
+      # than the payment - and it would overwrite the one the relay just injected from the stored
+      # row. Two mechanisms writing the same header, the wrong one winning, and nothing anywhere
+      # reporting a conflict: the trace simply comes out shaped differently from what the code
+      # says.
+      #
+      # The relay injects explicitly instead, because it is the only thing that knows the context
+      # is data on a row and not ambient on a thread.
+      observation-enabled: false
+
 # M3 relay tuning. See OutboxProperties for what each knob trades away.
 dpe:
   outbox:
@@ -256,6 +278,49 @@ management:
       show-details: always
       probes:
         enabled: true
+
+  # M6 part 2: tracing.
+  tracing:
+    sampling:
+      # ONE. Every request is traced, and that is a laptop decision, not a production one.
+      #
+      # Sampling is the cost control for tracing the way cardinality is for metrics: a span is
+      # kilobytes, not a counter increment, and 1.0 through a real payment volume is a bill and a
+      # collector that falls over. Production sits at a few percent, plus tail-based sampling in
+      # the collector so the slow and failed traces - the only ones anybody ever opens - are kept
+      # regardless of the dice.
+      #
+      # What matters for THIS system is that the decision is made ONCE, at the edge, and then
+      # carried: the sampled flag is the last two hex digits of `traceparent`, so it travels in
+      # the outbox row along with everything else. Downstream services do not re-roll. If they
+      # did, a payment would be sampled at the orchestrator and dropped at account-service, and
+      # every trace would be a fragment ending wherever the dice went the other way.
+      probability: ${TRACING_SAMPLE_RATE:1.0}
+
+    propagation:
+      # PINNED, not left to default, because this format is now written into a database column.
+      # `outbox.trace_parent` is a VARCHAR(55) shaped exactly like a W3C traceparent; switching
+      # the propagator to B3 would keep compiling, keep passing tests, and start storing a value
+      # of a different shape that the other end silently fails to extract.
+      type: w3c
+
+  # NOT `management.otlp.tracing.endpoint`, which is what every tutorial and every Boot 3 answer
+  # says. Boot 4.0 moved the whole OTLP family under `management.opentelemetry.*` and marked the
+  # old keys deprecated at level ERROR - they no longer bind. A service left on the old key starts
+  # perfectly happily and exports to the OTLP default of http://localhost:4318, which inside a
+  # container is the container itself: no Jaeger, no error anyone will notice, and an empty UI
+  # that looks like an instrumentation bug rather than a renamed property.
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          # Jaeger ingests OTLP directly - there has been no separate Jaeger wire protocol worth
+          # using since 1.35, and the old route through its Zipkin-compatible port is a
+          # translation nobody needs.
+          #
+          # HTTP (4318) rather than gRPC (4317): one less protocol in the runtime image, and a
+          # wrong port fails as a visible connection refused rather than a stream into nothing.
+          endpoint: ${OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
 
   metrics:
     tags:

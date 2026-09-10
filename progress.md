@@ -2188,3 +2188,251 @@ Invariants, after the compensations:
   per "what broke" item 6.
 - Still outstanding from M4: `ErrorHandlingDeserializer`, and retention for `outbox`, `inbox` and
   `dead_letters`.
+
+## Session 13 — 2026-09-10
+
+### Goal
+
+Start M6 part 2: make one payment one trace. Part 1 added metrics, and metrics answer *how many
+sagas compensated* — they cannot answer *why this one*. That needs the causal chain across three
+processes, and the transactional outbox is precisely the thing that breaks the mechanism which
+would otherwise supply it for free.
+
+Built specification-first, the same shape as M3 and M4 part 2: the mechanism, the schema, the
+configuration, the Jaeger container and the tests went in first, with the restore inside
+`OutboxRelay.drainBatch` left red until it was written against them. It is written, and the suite
+is green. What remains is the live run.
+
+### The problem, stated once
+
+Automatic trace propagation rests on an assumption that is never written down: **the outbound call
+happens on the thread that is currently inside the span.** Spring MVC honours it. `RestClient`
+honours it. Even a plain `kafkaTemplate.send()` honours it — Spring Kafka injects a W3C
+`traceparent` header at send time and the consumer extracts it, and tracing across Kafka costs
+nothing.
+
+The transactional outbox is built to make that assumption false, and that is the entire point of the
+pattern. Nothing is sent on the request thread. A *row* is written inside the business transaction,
+and `OutboxRelay` turns it into a Kafka record later, on a scheduled thread, in a different
+transaction, possibly after a restart. By then the producing span has ended.
+
+Both ways of ignoring that are silent:
+
+| What the relay does | What Jaeger shows |
+|---|---|
+| Sends with no `traceparent` | The consumer starts a **new root trace**. One payment becomes four traces, one per hop, joined by nothing. Each looks healthy in isolation. |
+| Sends with **its own** context | Every message in one drained batch becomes a child of one `drainBatch` span, so unrelated payments are parented under each other — and it renders as a real trace, which is worse. |
+
+Neither logs anything. Neither fails a test. It is found by opening Jaeger during an incident and
+discovering the thing you came for is not there.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Where the context lives between write and send | Two columns on `outbox` — `trace_parent`, `trace_state` | It has to survive a thread, a transaction and possibly a restart. Only a row does that, and putting it on *this* row makes it atomic with the message it describes: a row can never carry the trace of a transaction that rolled back. The outbox pattern applied to itself. |
+| Named columns vs a `jsonb` carrier | Two named W3C columns | A jsonb map accepts whatever keys the propagator of the day emits, so a later switch to B3 would leave old and new rows silently disagreeing with nobody obliged to notice. Named columns make a propagator change a migration. `management.tracing.propagation.type: w3c` is pinned to match. |
+| What the relay puts on the record | A **child** publish span, not a verbatim copy of `trace_parent` | The copy is two lines and erases the relay hop, which deletes relay lag — the interval between the row committing and the send — from the timeline. A broker stall would then read as a slow producer. |
+| Consumer side | `spring.kafka.listener.observation-enabled: true` | This half genuinely is free: Spring Kafka extracts `traceparent` into a consumer observation, so the handler, its JPA calls and its own outbox write all continue the producing trace. |
+| Producer side | `spring.kafka.template.observation-enabled: false` | It injects whatever the *sending* thread holds — the relay context, not the payment one — and would overwrite the header the relay just set from the row. Two mechanisms writing one header, the wrong one winning, nothing logged. |
+| Behaviour with no tracing bridge | Full no-op, and asserted by a test | The rule Redis is already held to. `Tracer.NOOP` / `Propagator.NOOP`, no service `depends_on` Jaeger, and `OutboxTracingWithoutABridgeTest` proves capture, inject and close are all inert. If deleting the trace backend could fail a payment, the instrumentation has joined the payment path. |
+| Sampling | 1.0 locally; decided once at the edge and carried, never re-rolled downstream | The sampled flag is the last byte of `traceparent`, so it rides in the column with everything else. A payment sampled at the orchestrator and dropped at account-service would produce a trace that lies about where the work stopped. |
+| Jaeger image | `all-in-one:1.76.0`, not `jaeger:2.x` | The v2 binary configures its memory store from a YAML file and leaves it unbounded by default, which under a 384M container limit is an OOM kill in the middle of a chaos run. `MEMORY_MAX_TRACES=20000` is the same decision as `--maxmemory 64mb` on Redis. |
+| Dependencies | `spring-boot-micrometer-tracing-opentelemetry` + `micrometer-tracing-bridge-otel` + `opentelemetry-exporter-otlp`, not the starter | `spring-boot-starter-opentelemetry` also brings `micrometer-registry-otlp`: a second live metrics registry pushing to localhost:4318 on a timer, in a system that is scraped by Prometheus. |
+
+### Built
+
+**In `common-messaging`:**
+
+- `OutboxTracing` — `capture()` for the producing side, `beginPublish(...)` returning an
+  `AutoCloseable` `PublishSpan` with `injectInto(Headers)`, `error(Throwable)` and `close()` for the
+  relay side. `io.micrometer:micrometer-tracing` at compile scope: the API only, exactly as
+  `micrometer-core` was added at part 1. The module instruments; it does not decide where the data
+  goes, and a service with no bridge still builds and still runs.
+- `CapturedTrace`, a two-field record with a `NONE` constant. The two values are meaningless apart —
+  a `tracestate` without its `traceparent` names a sampling decision for a trace nobody can identify
+  — so keeping them together makes it impossible to persist half of one.
+- `OutboxMessage.traceParent` / `traceState`, both `updatable = false`. A republish after a failed
+  send must carry the *same* parent; re-capturing at publish time would parent the retry under the
+  relay instead of under the payment.
+- `OutboxWriter.append` now captures, inside the business transaction, on the producing thread.
+- `OutboxRelay` takes `OutboxTracing`, and its javadoc records why this class is the one component
+  in the system that cannot get tracing for free.
+
+**Schema:** `account-service V5`, `payment-gateway V3`, `payment-orchestrator V6` — the same two
+columns in each. Nullable (a message written by the timeout sweeper has no span, and that is normal
+rather than exceptional) and unindexed: nothing ever queries *by* trace context, since the row is
+already claimed by primary key, and an index on a high-cardinality column no predicate mentions is
+write amplification on the busiest table in the service.
+
+**Infrastructure:** Jaeger on `localhost:16686`, OTLP/HTTP receiver published on 4318 so a service
+run from an IDE reports to the same collector as one in Compose. No service depends on it, by
+design.
+
+**Configuration:** sampling probability, `propagation.type: w3c`, the OTLP endpoint, and both Kafka
+observation switches, in all three services. The test classpath sets sampling to 1.0 (a
+probabilistic sampler makes a propagation assertion flaky in the worst way — green locally, red
+once in ten runs in CI, for a reason that looks like the code) and turns export off, so no test JVM
+opens a batch exporter against a port nothing is listening on.
+
+**Docs:** ADR 0006 — the trace context is a column, not a thread local.
+
+**Tests:** `OutboxTracingWithoutABridgeTest` (3) and `OutboxTracePropagationTest` (5). 165 → 173.
+
+### What broke
+
+1. **Boot 4.0 moved the entire OTLP property family and deprecated the old keys at level ERROR.**
+   `management.otlp.tracing.endpoint` is now
+   `management.opentelemetry.tracing.export.otlp.endpoint`, and
+   `management.otlp.tracing.export.enabled` is now `management.tracing.export.otlp.enabled`. The
+   old names are what every tutorial and every pre-2025 answer uses, and they are what I wrote
+   first.
+
+   The failure is the quiet kind. The key does not bind, so the exporter falls back to the OTLP
+   **default** of `http://localhost:4318` — which inside a container is the container itself. The
+   service starts happily, exports into nothing, and Jaeger stays empty in a way that looks like an
+   instrumentation bug rather than a renamed property. Found by reading the deprecation level out of
+   the jar's `spring-configuration-metadata.json` instead of assuming a deprecated key still works;
+   "deprecated" and "still binds" are different claims, and at level `error` only the first is true.
+
+2. **There is no `spring-boot-starter-micrometer-tracing`.** Metrics got
+   `spring-boot-starter-micrometer-metrics`, so the symmetric guess is the natural one — and it 404s
+   on Maven Central. Boot 4 names the tracing starter after the *backend* instead:
+   `spring-boot-starter-opentelemetry`. Same split-by-technology reorganisation that moved
+   `@EntityScan`, `@AutoConfigureMockMvc` and `TestRestTemplate`, but with a naming asymmetry that
+   makes it harder to guess than any of those.
+
+3. **A specification test that fails with a `NullPointerException` teaches nothing.** The first
+   draft of `thePublishSpanIsAChildAndNotACopy` split the `traceparent` header without first
+   checking it existed, so against an unwritten relay it errored inside `String.split` rather than
+   reporting the missing header. Fixed by asserting presence first, with a message naming which of
+   the three failures to fix first. The failure message is the whole product of a test written
+   before the code.
+
+4. **A stale `target/test-classes` presented as a missing third-party class.** Once the relay
+   landed, `payment-orchestrator` failed at test *discovery* with `NoClassDefFoundError: RSAKey`,
+   thrown out of `TestTokens` — a class untouched since M5. Reproducible across two runs;
+   `mvn clean` on that module fixed it with no source change.
+
+   Worth recording for two reasons. The name in the error is the **bare** `RSAKey`, not
+   `com.nimbusds.jose.jwk.RSAKey`, and `nimbus-jose-jwt` was on the dependency tree at compile
+   scope throughout — so the error is not describing a real missing dependency, and investigating
+   it as one costs time. And it surfaced immediately after a POM change added three tracing
+   artifacts, which is exactly when the instinct is to blame the new dependency. The rule that
+   generalises: **when a module fails and its sources did not change, `clean` it before believing
+   anything the error says.**
+
+5. **Two mistakes made while verifying, both in the harness around the system rather than in it.**
+
+   `FAILED` is not the opposite of `COMPENSATED`. The declined transfer returned
+   `status: FAILED, sagaStatus: COMPENSATED, failureReason: GATEWAY_DECLINED`, and those answer
+   different questions: the transfer status is the customer-facing outcome (the payment did not
+   happen), the saga status is what the mechanism did (it compensated, the money came back). A poll
+   loop watching only `status` cannot distinguish "compensated cleanly" from "rejected outright" —
+   a distinction the chaos scenarios at M7 will need.
+
+   And I3 fails legitimately if a funded account is opened *after* the baseline is recorded. I3 is
+   money conserved; funding issues new money into the ledger, debited from the SYSTEM account, which
+   is why I1 still passed while I3 reported 3600000 against a 3400000 baseline that predated the new
+   account. The rule, which M7 and M8 both have to follow: **record the I3 baseline once the account
+   set is fixed and before any transfer runs.**
+
+### Verified
+
+```
+./mvnw -B -ntp clean test
+
+  common-messaging       Tests run: 16, Failures: 0, Errors: 0, Skipped: 0
+  account-service        Tests run: 69, Failures: 0, Errors: 0, Skipped: 0
+  payment-orchestrator   Tests run: 82, Failures: 0, Errors: 0, Skipped: 0
+  payment-gateway        Tests run:  6, Failures: 0, Errors: 0, Skipped: 0
+
+BUILD SUCCESS          173 total
+
+docker compose -f infra/docker-compose.yml config -q     -> OK
+```
+
+`OutboxTracePropagationTest` is green in both halves: a message written inside a span stores that
+span's `traceparent` on the row, a message written outside one stores NULL, and the relay puts the
+stored context back onto the record as a **child** span — the test asserts the trace id matches the
+row and the span id does *not*, which is what separates a real publish span from a verbatim header
+copy.
+
+### Verified live
+
+Nine containers healthy, Jaeger among them, three migrations applied against the real databases.
+One transfer, `COMPLETED`, and **one trace: 23 spans across all three services**, read back from
+the Jaeger API:
+
+```
+SPAN                                       SERVICE                   START     DURATION
+http post /api/v1/transfers                payment-orchestrator     +0.0ms     275.56ms
+  dpe.account.commands.v1 publish          payment-orchestrator   +437.3ms      89.91ms
+    dpe.account.commands.v1 process        account-service        +530.3ms     101.49ms
+      dpe.account.events.v1 publish        account-service       +1061.8ms       9.97ms
+        dpe.account.events.v1 process      payment-orchestrator  +1073.6ms      48.16ms
+          dpe.gateway.commands.v1 publish  payment-orchestrator  +1553.9ms      12.91ms
+            dpe.gateway.commands.v1 proc.  payment-gateway       +1597.8ms     205.27ms
+              dpe.gateway.events.v1 publ.  payment-gateway       +2225.9ms      84.78ms
+                dpe.gateway.events.v1 pr.  payment-orchestrator  +2296.6ms      27.72ms
+                  dpe.account.commands.v1  payment-orchestrator  +2588.9ms       8.60ms
+                    ... process            account-service       +2600.3ms      35.52ms
+                      ... events publish   account-service       +3105.6ms       8.48ms
+                        ... process        payment-orchestrator  +3115.7ms      18.78ms
+```
+
+The interesting number is the **first gap**. The HTTP span ends at 275ms; the reserve command is not
+published until +437ms. That 162ms is relay lag — the row sitting committed in the outbox waiting
+for the next poll — and every later hop shows the same 500ms poll interval as a span of its own. A
+verbatim copy of `trace_parent` onto the record would have hidden all of it: the consumer would hang
+directly off the request, and there would be no span to hold the interval. That was the argument for
+making the relay open a child span, and it is now the observed behaviour rather than an argument.
+
+The compensation branch, forced with `failureRate: 1.0`, is a second complete trace (22 spans), the
+`dpe.event.type` tag naming each hop:
+
+```
+http post /api/v1/transfers              payment-orchestrator     +0.0ms
+  dpe.account.commands.v1 publish        payment-orchestrator    +98.8ms  ReserveFunds
+    dpe.account.commands.v1 process      account-service        +107.9ms
+      dpe.account.events.v1 publish      account-service        +131.7ms  FundsReserved
+        dpe.account.events.v1 process    payment-orchestrator   +140.3ms
+          dpe.gateway.commands.v1 publ.  payment-orchestrator   +617.0ms  ChargeGateway
+            dpe.gateway.commands.v1 pr.  payment-gateway        +626.6ms
+              dpe.gateway.events.v1 pub. payment-gateway        +836.0ms  GatewayDeclined
+                dpe.gateway.events.v1 p. payment-orchestrator   +843.6ms
+                  dpe.account.commands.. payment-orchestrator  +1138.7ms  ReleaseFunds
+                    ... process          account-service       +1148.8ms
+                      ... events publish account-service       +1660.9ms  FundsReleased
+                        ... process      payment-orchestrator  +1669.5ms
+```
+
+Every outbox row written during the run carries a trace context — all three services, every event
+type, no exceptions:
+
+```
+payments_db   ChargeGateway 5/5   CommitFunds 4/4   ReleaseFunds 1/1   ReserveFunds 5/5
+accounts_db   FundsReserved 5/5   FundsCommitted 4/4  FundsReleased 1/1
+              AccountOpened 4/4   FundsTransferred 2/2
+gateway_db    GatewayApproved 4/4  GatewayDeclined 1/1
+```
+
+Invariants after three further transfers, checked at quiescence:
+
+```
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (3600000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+```
+
+### Open / next
+
+- **M6 part 3:** the read endpoints M6.5 needs.
+- Alert rules. Every threshold on the dashboard is still a colour, not a rule — outbox age, DLQ
+  depth above zero, and a compensation rate step change are the obvious first three.
+- Note for M7: chaos scenarios must wait for terminal sagas before restoring an injected fault.
+- Still outstanding from M4: `ErrorHandlingDeserializer`, and retention for `outbox`, `inbox` and
+  `dead_letters`.

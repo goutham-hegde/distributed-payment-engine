@@ -53,6 +53,39 @@
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
+
+        <!-- M6 part 2: tracing. Three artifacts, and it is worth knowing why there is no single
+             starter to reach for.
+
+             Boot 4 split the old monolithic actuator autoconfiguration per technology, and the
+             naming came out asymmetric: metrics got `spring-boot-starter-micrometer-metrics`, but
+             `spring-boot-starter-micrometer-tracing` DOES NOT EXIST - the tracing starter is named
+             after the backend instead (`spring-boot-starter-opentelemetry`). That starter is the
+             documented path and it is not used here, because it also drags in
+             micrometer-registry-otlp: a second, live metrics registry that would push to
+             localhost:4318 on a timer, in a system that is scraped over Prometheus. An unused
+             exporter quietly retrying against a port nothing listens on is not free, and it is not
+             explicable to a reader. So: the starter's contents minus that.
+
+               - spring-boot-micrometer-tracing-opentelemetry  the autoconfiguration (SDK, Tracer,
+                                                               Propagator, the observation bridge)
+               - micrometer-tracing-bridge-otel                the Micrometer -> OTel implementation
+               - opentelemetry-exporter-otlp                   the wire format Jaeger ingests
+
+             Versions come from micrometer-tracing-bom and opentelemetry-bom, both imported by
+             spring-boot-dependencies. Do not pin them by hand. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-micrometer-tracing-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
