@@ -20,6 +20,18 @@ global:
   external_labels:
     cluster: dpe-local
 
+# M6 part 4. The alert rules live in their own file rather than inline, for the same reason the
+# Grafana dashboard is provisioned from JSON: a rule is a thing you diff, review and argue about,
+# and burying it in the scrape config makes it invisible in a pull request.
+#
+# There is no `alerting:` block below it. Prometheus evaluates these rules and holds the firing
+# state itself; with no Alertmanager configured it simply has nowhere to send the notification.
+# That is a deliberate stop short of the full pipeline - see alerts.yml for why - and it is worth
+# knowing that a rule with no receiver still evaluates, still shows in the UI, and still publishes
+# the `ALERTS` series. Silence here means the rule is not firing, not that alerting is off.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: dpe
     metrics_path: /actuator/prometheus

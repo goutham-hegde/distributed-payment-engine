@@ -333,6 +333,8 @@ services:
       # already the secure default: no reload endpoint, and no admin API that could delete series.
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Mounted as its own file, so editing a threshold does not touch the scrape config.
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - promdata:/prometheus
     ports:
       - "9090:9090"
@@ -442,6 +444,53 @@ services:
       resources:
         limits:
           memory: 384M
+
+  # M6.5. The demo console.
+  #
+  # The FOURTH container, and the one that had to justify itself on a 16 GB machine. nginx-alpine
+  # idles around 15 MB because it serves static files and proxies - the React build stage that
+  # produced those files is discarded in ui/Dockerfile and never ships. A node process serving the
+  # app at runtime would have cost ~100 MB and bought nothing: there is no server-side rendering
+  # here and nothing to render on a server.
+  #
+  # Note there is no `context: ..` and no MODULE arg. `ui/` is NOT a Maven module - it is absent
+  # from the parent POM and from the root Dockerfile's COPY lists on purpose, and adding it to
+  # either breaks the reactor.
+  ui:
+    build:
+      context: ../ui
+      dockerfile: Dockerfile
+    container_name: dpe-ui
+    ports:
+      # The only origin the browser needs. The three service ports stay published for curl and for
+      # the IDE, but nothing in the console uses them - it calls /api/orchestrator, /api/accounts
+      # and /api/gateway on this port, which is what keeps CORS out of three SecurityConfigs.
+      - "5173:80"
+    depends_on:
+      # service_started, not service_healthy, and for the same reason Prometheus uses it: the
+      # console must come up and SHOW a service as unreachable. Waiting for health would hide the
+      # startup window, and would make the UI unavailable during exactly the outage somebody
+      # opened it to look at.
+      payment-orchestrator:
+        condition: service_started
+      account-service:
+        condition: service_started
+      payment-gateway:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    healthcheck:
+      # 127.0.0.1, not localhost: nginx listens on IPv4 only and `localhost` resolves to ::1
+      # first inside the container, so busybox wget is refused and never retries over IPv4.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/index.html > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 96M
 
 volumes:
   pgdata:

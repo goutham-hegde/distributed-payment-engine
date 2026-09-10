@@ -81,8 +81,38 @@ spring:
       # which on a fresh deployment means losing every event already in the log.
       auto-offset-reset: earliest
 
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # M6 part 4. The deserializer is WRAPPED, and this is the one layer of the poison-message
+      # story M4 left open.
+      #
+      # Where a deserializer throws matters more than that it throws. It runs inside
+      # `consumer.poll()`, BELOW the listener - so the exception arrives at the container with no
+      # record attached, DefaultErrorHandler refuses it ("no record information is available"),
+      # the DeadLetterPublishingRecoverer never runs, and the partition retries the same bytes
+      # forever. It is the same shape as the compression trap in the producer block above: a
+      # failure underneath the machinery built to catch failures.
+      #
+      # ErrorHandlingDeserializer catches it there instead and hands the container a record whose
+      # value is null and whose headers carry the exception, which the container rethrows ABOVE
+      # the listener - where the error handler can see it and route it to the dead letter topic.
+      # It converts an unrecoverable partition stall into an ordinary dead letter.
+      #
+      # Be precise about what this does NOT buy, because the honest version is the defensible one:
+      #
+      #   * TODAY IT IS INERT. The delegate is StringDeserializer, which decodes bytes as UTF-8
+      #     and substitutes replacement characters rather than throwing - there is no input it
+      #     rejects. Malformed JSON already fails one layer higher, in Jackson inside the handler,
+      #     where the error handler has always been able to see it (RetryClassifier files
+      #     JacksonException as poison). So this changes no behaviour that can be observed now.
+      #     It is here for the day somebody switches the delegate to JsonDeserializer to "clean
+      #     up the handler" - a one-line change that silently moves parsing below the listener and
+      #     re-opens the stall. Wrapping now makes that change safe instead of catastrophic.
+      #
+      #   * IT DOES NOT COVER DECOMPRESSION. Snappy/lz4/zstd fail while the batch is being
+      #     decompressed, which is below the deserializer as well as below the listener. Nothing
+      #     configured here can intercept that; only `compression.type: none` and a glibc base
+      #     image can. See the producer block.
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
 
       # THE setting that decides whether this system can lose money.
       #
@@ -106,6 +136,11 @@ spring:
         # Two thirds of the traffic silently goes unread until a metadata refresh five minutes
         # later. Nothing throws; the system just appears quiet. See KafkaTopicsConfig.
         allow.auto.create.topics: false
+        # The real deserializers, named as delegates. Both halves are wrapped: a key that will
+        # not deserialize stalls the partition exactly as a value does, and the key is the half
+        # people forget because it is "just a string".
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
 
     listener:
       # Hands the listener an Acknowledgment and commits only when it is used.

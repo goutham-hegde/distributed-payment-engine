@@ -109,7 +109,8 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 | M3 | SAGA orchestration + compensation + timeouts | ✅ **done** |
 | M4 | Idempotency + DLQ | ✅ **done** |
 | M5 | JWT security | ✅ **done** |
-| M6 | Observability — metrics, dashboards, tracing | ⬜ |
+| M6 | Observability — metrics, dashboards, tracing, read endpoints | ✅ **done** |
+| M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ✅ **done** |
 | M7 | Chaos suite — 8 scenarios | ⬜ |
 | M8 | k6 load test to 1,000 concurrent | ⬜ |
 | M9 | Docs + README polish | ⬜ |
@@ -123,13 +124,25 @@ Requires Docker. Nothing else — the Maven wrapper is committed, and k6/psql ru
 docker compose -f infra/docker-compose.yml up -d --build
 ```
 
-Brings up PostgreSQL and all three services. Health checks gate startup, so the command returns
-only once everything is actually serving:
+Brings up PostgreSQL, Redpanda, Redis, all three services, Prometheus, Grafana, Jaeger and the
+console. Health checks gate startup, so the command returns only once everything is serving.
+
+| | |
+|---|---|
+| **Console** | <http://localhost:5173> — sign in as `alice` / `alice-password` |
+| Grafana | <http://localhost:3000> (anonymous, lands on the payments dashboard) |
+| Prometheus | <http://localhost:9090> |
+| Jaeger | <http://localhost:16686> |
+
+Each service also listens on a **management port** — 9091/9092/9093 — carrying the actuator
+including `/actuator/prometheus`. Compose deliberately does **not** publish those: Prometheus
+scrapes them across the Compose network and that network boundary is the scrape credential. So a
+health check has to go through a container rather than the host:
 
 ```bash
-curl -s localhost:8081/actuator/health   # payment-orchestrator
-curl -s localhost:8082/actuator/health   # account-service
-curl -s localhost:8083/actuator/health   # payment-gateway
+docker exec dpe-orchestrator wget -qO- http://localhost:9091/actuator/health
+docker exec dpe-account      wget -qO- http://localhost:9092/actuator/health
+docker exec dpe-gateway      wget -qO- http://localhost:9093/actuator/health
 ```
 
 To build or test without Docker Compose:
@@ -137,6 +150,19 @@ To build or test without Docker Compose:
 ```bash
 ./mvnw -B -ntp compile     # no Maven install needed — wrapper included
 ./mvnw -B -ntp verify      # full build + tests (requires Docker for Testcontainers)
+```
+
+The console is a separate build (`ui/` is not a Maven module — it has its own Dockerfile and is
+absent from the parent POM on purpose):
+
+```bash
+cd ui && npm ci && npm run dev    # dev server on :5173, proxying to the three services
+```
+
+Every invariant, on demand:
+
+```bash
+./scripts/verify-invariants.sh
 ```
 
 ## Engineering log

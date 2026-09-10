@@ -13,8 +13,8 @@ and what broke along the way. Newest entries at the bottom.
 | M3 | SAGA orchestration — compensation, state machine, timeout sweeper | ✅ **done** |
 | M4 | Idempotency keys + retry/backoff + Dead Letter Queue | ✅ **done** |
 | M5 | JWT authentication and per-account authorization | ✅ **done** |
-| M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing | ⬜ |
-| M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ⬜ |
+| M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing, read endpoints | ✅ **done** |
+| M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ✅ **done** |
 | M7 | Chaos suite — 8 injected-failure scenarios | ⬜ |
 | M8 | Load test — k6 to 1,000 concurrent transfers | ⬜ |
 | M9 | Documentation, ADRs, README polish | ⬜ |
@@ -2657,3 +2657,244 @@ Full suite: **209 tests green** (was 173), and the invariants after the run:
 - The transfer list has no status or account filter. When one is wanted it arrives *with the index
   that serves it*, not before — a filter over the existing index returns short pages and makes the
   cursor's meaning depend on the filter.
+
+---
+
+## Session 15 — 2026-09-10
+
+### Goal
+
+Close two items carried forward from earlier milestones — Prometheus alert rules and
+`ErrorHandlingDeserializer` — then build M6.5, the demo console, on the read endpoints M6 part 3
+landed.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Alerting pipeline | Rules only, **no Alertmanager** | A notification pipeline with nowhere to notify is theatre, and RAM is the binding constraint. Prometheus evaluates the rules itself, shows them under Status → Rules, and publishes the synthetic `ALERTS` series — queryable, graphable and testable. Routing is configuration downstream of the judgement, and the judgement is what these rules carry. |
+| Outbox alert signal | **Age**, not backlog | Depth measures load; age measures liveness. A backlog of 5,000 that is draining is a busy system; a backlog of one that is not draining is a stopped relay. Picking depth is the commonest way to build a dashboard that stays green through an outage. Backlog still gets a warning-level rule, at a threshold that means "cannot keep up" rather than "has stopped". |
+| DLQ threshold | `> 0` | The only rule in the file whose number needs no defence but needs an argument for why there is no number to pick. A dead letter is a message that exhausted its full retry budget. There is no healthy rate of that; "alert above 10" would mean nine lost payments are fine. |
+| Compensation alert | Relative step change, not an absolute rate | The healthy compensation rate is a property of the payment mix, not of the code — a portfolio with more declining cards legitimately compensates more, and a threshold tuned for one is either deaf or screaming for the other. What is always abnormal is the rate *changing*. Compares the last 5m against the preceding hour and fires on a doubling, with `clamp_min` on both denominators and a throughput floor so an idle system cannot alert. |
+| Stuck-saga alert | `min_over_time(...)[15m:] > 0`, excluding `STARTED` | Any in-flight level is legitimate under load, so a threshold on the gauge is meaningless. What is not legitimate is the level never coming *down*. `STARTED` is excluded because the timeout sweeper is the designed answer for a saga stuck there, and a sweeper doing its job would otherwise page every time it worked. |
+| `ErrorHandlingDeserializer` | Added, wrapping `StringDeserializer` on **both** key and value, and documented as inert today | See "What broke" — the honest finding is that it changes no observable behaviour in the current configuration. It guards a layer that is currently unreachable, and the reason to place it now is that the change which makes the layer reachable is a one-liner somebody will make for tidiness. |
+| Console framework | React + Vite + TypeScript, hand-written CSS | TypeScript so `tsc -b` fails the image build on a type error rather than shipping one. No component library and no CDN: ~80 KB gzipped total, and the console renders with no network access beyond its own origin. |
+| Console to services | **nginx, one origin**, prefixes stripped | The alternative was CORS on three services. Rejected because it puts a browser concern into three server configurations, and because CORS is a policy about who may *read a response* and is routinely mistaken for an authorization mechanism — this repo has spent M5 putting every such decision in one place per service. |
+| Token handling in the UI | Never parsed | Roles and lifetime come from the `POST /auth/token` body, which the server populates precisely so a client need not open its own credential. Decoding the JWT would be one line and would create a second, subtly different reading of a claim the server already interpreted — the `ROLE_` prefix is exactly where such readings diverge. |
+| Role to UI | Tabs **disabled**, not hidden | "OPERATOR sees every operational surface and cannot move money" is a true and interesting statement about this system. Hiding the tab replaces it with the impression that different users get a different product. |
+| Invariants panel | Two endpoints, joined in the browser | No service can answer all five, and building one that could would mean a process holding credentials to both databases — a shared-database architecture reintroduced through the monitoring door. `Promise.allSettled`, so one service being down still shows the other half. |
+| I3 and I4 in the UI | I3 a total with no light; I4 never red | Conservation compares two instants and a page sees one. I4 counts sagas in flight, which is what a working system under load looks like. Five green lights with a sixth that quietly asserts something it could not check would be a lie in the one place this system claims to prove something. |
+| Console metrics tiles | PromQL, not repository calls | Same rule as the M6 gauge budget, one level up: a console querying the payment write path every five seconds would be the observability becoming the outage. Costs one unauthenticated nginx route to Prometheus — accepted and bounded in ADR 0007. |
+| Updates | Polling, re-armed after each response | Pushing these numbers would mean a publisher on the write path — a second write beside the business transaction, which is the dual-write problem arriving through the UI door. Re-arming after the response rather than on a fixed interval means a slow backend gets *fewer* requests, not more. |
+| Pagination UI | Cursor **stack**, no page numbers | Keyset pagination gives you forward, and back to where you have been, and no "page 7". Offering numbered pages would promise something the API cannot do — and over an OFFSET API, something the database cannot do correctly while rows are being inserted above the window. |
+
+### Built
+
+**`infra/prometheus/alerts.yml`** — six rules in three groups. `OutboxRelayStalled` (age > 30s for
+1m, critical), `OutboxBacklogGrowing` (> 1000 for 5m, warning), `DeadLettersPresent` (> 0 for 2m,
+critical), `CompensationRateStepChange` (5m against the preceding hour, warning),
+`SagasStuckInFlight` (`min_over_time` over 15m, warning), and `TargetDown` — the last of which is
+what makes the other five trustworthy, since a crashed service produces no series at all and every
+rule written over its metrics then goes silent, which renders identically to healthy.
+
+Mounted as its own file (`rule_files:` in `prometheus.yml`, a second read-only bind in Compose) so
+that editing a threshold does not touch the scrape config.
+
+**`ErrorHandlingDeserializer`** on all three consumers, wrapping `StringDeserializer` as the
+delegate for both key and value. The full argument is in `payment-orchestrator`'s
+`application.yml`; the short version is that a deserializer throws *inside* `consumer.poll()`,
+below the listener, so the exception reaches the container with no record attached — the same shape
+as the compression trap, and equally uncatchable by `DefaultErrorHandler`. Wrapping converts it
+into a record whose headers carry the exception, which the container rethrows *above* the listener
+where the error handler can dead-letter it.
+
+**`ui/`** — a React + Vite + TypeScript console, served by nginx as a fourth Compose container
+(~15 MB resident; the node build stage is discarded). Not a Maven module: absent from the parent
+POM and from the root `Dockerfile`'s `COPY` lists, with its own `ui/Dockerfile`.
+
+- **Transfers** — send a payment; the keyset-paged list; and per transfer the stage timeline built
+  from `saga_steps`, each stage carrying the outbox row that took the command out (with its relay
+  lag) and the inbox row that absorbed the reply, plus a deep link into the Jaeger trace. Below it
+  the money view: both accounts' ledger rows, with this transfer's legs highlighted.
+- **System** — the five invariants from both services, the I3 conservation total, non-terminal
+  sagas broken down by state, four messaging tiles from PromQL, and a panel listing whatever is
+  currently firing out of the `ALERTS` series.
+- **Chaos** — the gateway's simulation knobs as sliders, plus five named scenario presets whose
+  button text is the claim each one makes about the system.
+
+The idempotency gate is demonstrated in the UI rather than described: the key is generated once per
+*attempt* and held across retries, and pressing Send twice with one key returns the first response
+with `Idempotency-Replayed: true`. That header is the only place the fact exists, because the body
+of a replay is the first request's response byte for byte and therefore cannot mention that it is
+one.
+
+**`docs/adr/0007-the-console-is-a-reader.md`** — the four decisions above, with the bound on the
+unauthenticated Prometheus route written down rather than left as an oversight.
+
+### What broke
+
+**`main` was already red at `08bc85f`, and `clean` was the whole fix.** `./mvnw verify` failed in
+`payment-gateway` with `ClassNotFoundException: ImmutableJWKSet` — and it reproduced with the
+working tree stashed, so it predated this session's changes. Two details make it worth recording.
+The exception carries the **simple** name, not the fully-qualified one, which is the signature of
+an incrementally compiled class whose constant pool holds an unresolved reference; and it surfaces
+during surefire's **discovery** phase, so the module reports `Tests run: 0` and `BUILD FAILURE`
+with no failing test to look at. Nimbus was on the classpath the entire time (`dependency:tree`
+confirms `nimbus-jose-jwt:10.9.1` transitively via `common-security`). `./mvnw clean test` on the
+same tree passes. Same family as the two traps already recorded about believing the build's
+cheerfulness over the source — with the new wrinkle that the *category* is wrong too: it is not a
+test failure and it is not a compile failure, and it is reported as neither.
+
+**`ErrorHandlingDeserializer` turned out to close nothing that is currently open.** This was
+carried forward from M4 as a real gap and it is not one. The delegate is `StringDeserializer`,
+which decodes bytes as UTF-8 and substitutes replacement characters rather than throwing — there is
+no input it rejects. Malformed JSON already fails one layer higher, in Jackson inside the handler,
+where `DefaultErrorHandler` has always been able to see it and `RetryClassifier` already files
+`JacksonException` as poison. It is still worth having, for one reason stated in the config: the
+change that makes the layer reachable is somebody switching the delegate to `JsonDeserializer` to
+"clean up the handler", which silently moves parsing below the listener and re-opens a partition
+stall. It also does **not** cover decompression, which fails below the deserializer as well —
+nothing configured in Spring can intercept that, only `compression.type: none` and a glibc base
+image. The general lesson is the one worth keeping: *an item on a to-do list is a hypothesis about
+the code, and it ages.*
+
+**The console came up healthy and reported itself unhealthy.** The container healthcheck
+(`wget http://localhost/index.html`) failed with `can't connect to remote host` while nginx was
+listening correctly on `0.0.0.0:80` — confirmed with `netstat` inside the container, and `nginx -T`
+was clean. The cause is IPv6: the config has one `listen 80;` and no `listen [::]:80;`, so nginx
+binds IPv4 only, while `localhost` inside the container resolves to `::1` first. busybox wget gets
+`ECONNREFUSED` and does not fall back to IPv4. Fixed by using `127.0.0.1` in both the Dockerfile
+`HEALTHCHECK` and the Compose healthcheck. Worth remembering because the symptom accuses the wrong
+component — it reads as "nginx failed to start", and nginx had started perfectly.
+
+**The README's health-check commands had been wrong since M6.** They still said
+`curl localhost:8081/actuator/health`, from before the actuator moved to the unpublished management
+ports. Nothing failed, because nothing ran them. Corrected to go through a container. The same
+correction is still due for the K8s probes at M10.
+
+**One flaky test, confirmed as a flake rather than assumed to be one.**
+`IdempotencyCacheTest.releasingIsConditionalOnTheToken` errored with
+`RedisCommandTimeoutException: Connection initialization timed out after 200 millisecond(s)` during
+a `verify` run that was sharing the machine with an npm install and a Vite build. Re-run alone:
+6/6 green. The 200ms connect timeout is deliberate elsewhere in this system, but it does mean this
+class is sensitive to machine load, which is worth knowing before M8 runs k6 on the same laptop.
+
+### Verified
+
+All six alert rules load and evaluate, and one of them was already correct about the system:
+
+```
+$ docker exec dpe-prometheus wget -qO- http://localhost:9090/api/v1/rules
+  dpe-messaging   OutboxRelayStalled           inactive   health ok
+  dpe-messaging   OutboxBacklogGrowing         inactive   health ok
+  dpe-messaging   DeadLettersPresent           PENDING    health ok
+  dpe-saga        CompensationRateStepChange   inactive   health ok
+  dpe-saga        SagasStuckInFlight           inactive   health ok
+  dpe-platform    TargetDown                   inactive   health ok
+```
+
+`DeadLettersPresent` pending is not a bug — it is the rule correctly seeing dead letters left in
+the table by an earlier poison-message run. Both config files pass `promtool`:
+
+```
+$ promtool check config /etc/prometheus/prometheus.yml
+  SUCCESS: 1 rule files found
+  SUCCESS: /etc/prometheus/prometheus.yml is valid prometheus config file syntax
+  Checking /etc/prometheus/alerts.yml
+  SUCCESS: 6 rules found
+```
+
+The deserializer is live, read out of the running container's own startup log:
+
+```
+$ docker logs dpe-account | grep deserializer
+  key.deserializer   = class org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+  value.deserializer = class org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+```
+
+Full suite after a `clean`: **209 tests, 0 failures**, plus the one Redis flake above that passes
+on re-run.
+
+Console build: `tsc -b && vite build` clean — 254 KB raw, **79 KB gzipped**, plus 5.6 KB of CSS.
+
+Every console route exercised through nginx on `:5173`, not against the services directly:
+
+```
+index.html                                     200 text/html
+POST /api/orchestrator/auth/token   (alice)    200
+GET  /api/orchestrator/api/v1/transfers        200
+GET  /api/orchestrator/admin/invariants        403   <- alice is USER, not OPERATOR
+POST /api/orchestrator/auth/token   (operator) 200
+GET  /api/orchestrator/admin/invariants        200   I4 holds, 0 in flight
+GET  /api/accounts/admin/invariants            200   I1 I2 I5 hold, conservation 4200000
+GET  /api/gateway/admin/simulation             200
+GET  /api/prom/api/v1/query?query=...          200   success
+```
+
+The idempotency gate, twice with one key:
+
+```
+POST 1   HTTP/1.1 202   Idempotency-Replayed: false
+POST 2   HTTP/1.1 202   Idempotency-Replayed: true
+$ diff r1.json r2.json   ->   BODIES IDENTICAL BYTE FOR BYTE
+```
+
+A live transfer read back through the timeline endpoint — three stages, each with its outbox hop,
+its relay lag and the inbox row that absorbed the reply, and a trace id for the Jaeger link:
+
+```
+transfer 600ffb68  COMPLETED   saga COMPLETED   traceId 4eba7c02924ba0d3fd2608f47b9a9822
+
+  ReserveFunds   SUCCEEDED -> RESERVED   1741ms
+      out  ReserveFunds    -> dpe.account.commands.v1   relay lag 679ms
+      in   FundsReserved   <- dpe.account.events.v1
+  ChargeGateway  SUCCEEDED -> CHARGED     602ms
+      out  ChargeGateway   -> dpe.gateway.commands.v1   relay lag  67ms
+      in   GatewayApproved <- dpe.gateway.events.v1
+  CommitFunds    SUCCEEDED -> COMPLETED   315ms
+      out  CommitFunds     -> dpe.account.commands.v1   relay lag  83ms
+      in   FundsCommitted  <- dpe.account.events.v1
+```
+
+The compensation path forced through the console's own chaos route (`failureRate: 1.0`), then
+reset:
+
+```
+transfer 2efa139e  status FAILED   saga COMPENSATED   reason GATEWAY_DECLINED
+  ReserveFunds   SUCCEEDED -> RESERVED
+  ChargeGateway  FAILED    -> COMPENSATING
+  ReleaseFunds   SUCCEEDED -> COMPENSATED
+```
+
+and the money visibly returned to the sender in the ledger — a `-5000` DEBIT followed by a `+5000`
+CREDIT against the same `transfer_id`, which is the point: nothing was rolled back, a second and
+opposite pair of entries was written.
+
+Invariants after all of it:
+
+```
+$ ./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (4200000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+```
+
+### Open / next
+
+- **M7, the chaos suite.** The console now makes the scenarios watchable, which was the reason to
+  build it first. The standing note applies: a scenario must wait for sagas to reach a terminal
+  state before restoring an injected fault, or the result describes neither the fault nor the
+  healthy system.
+- Retention for `outbox`, `inbox` and `dead_letters` is still outstanding from M4, and is not a
+  copy of `IdempotencySweeper`: an `inbox` row is not deletable on the same reasoning an
+  `idempotency_records` row is, because the thing that might redeliver is the broker. The policy
+  has to be argued per table before any code is written.
+- `OutboxBacklogGrowing`'s threshold of 1000 is the weakest number in `alerts.yml` and is honestly
+  a placeholder. M8's k6 run is what should set it, by measuring what the relay actually sustains.
+- The wire types in `ui/src/api/types.ts` are hand-transcribed from the Java records and nothing
+  checks them against the server — a renamed field is `undefined` at runtime, not a build failure.
+  If M9 produces an OpenAPI document, generate them from it.
+- The transfer list still has no status or account filter, and still only gets one together with
+  the `(initiated_by, status, created_at DESC, id DESC)` index that serves it.

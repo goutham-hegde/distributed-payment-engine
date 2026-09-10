@@ -1,0 +1,190 @@
+# M6 part 4. The rules that turn the M6 metrics into something that can wake somebody up.
+#
+# There is deliberately NO Alertmanager container. Two reasons, and the second is the honest one:
+# RAM is the binding constraint on this machine, and a notification pipeline with no destination
+# to notify is theatre. Prometheus evaluates these rules on its own and exposes the result both in
+# its UI (Status -> Rules, and the Alerts tab) and as the synthetic `ALERTS` series, which is
+# queryable and graphable like any other. That is enough to demonstrate, and enough to test:
+#
+#   curl -s localhost:9090/api/v1/rules
+#   ALERTS{alertstate="firing"}
+#
+# Adding Alertmanager later changes nothing here - these rules are the part that carries the
+# judgement, and routing is configuration downstream of it.
+#
+# Every threshold below is written next to the reason it is that number rather than another one.
+# An alert whose threshold nobody can defend is an alert that gets silenced during its first
+# incident and never comes back.
+
+groups:
+  # ---------------------------------------------------------------------------------------------
+  - name: dpe-messaging
+    # Evaluated every 10s (matching the global evaluation_interval). `for:` is what separates a
+    # spike from a condition: without it, a single scrape landing mid-drain fires the page.
+    interval: 10s
+    rules:
+
+      # THE alert for the outbox pattern. Backlog is the wrong signal and age is the right one:
+      # a backlog of 5,000 rows that is draining is a busy system, and a backlog of ONE row that
+      # is not draining is a stopped relay. Depth measures load; age measures liveness. This is
+      # the same distinction as queue length versus oldest-message-age in any queue system, and
+      # picking depth is the commonest way to build a dashboard that stays green through an
+      # outage.
+      #
+      # 30s: the relay's poll interval is sub-second, so a row older than 30 seconds has been
+      # skipped by dozens of drains. `for: 1m` on top means the relay has to be genuinely stuck,
+      # not merely behind after a restart.
+      - alert: OutboxRelayStalled
+        expr: max by (application) (dpe_outbox_age_seconds) > 30
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.application }}: outbox not draining"
+          description: >-
+            Oldest un-relayed outbox row is {{ $value | printf "%.0f" }}s old. The business
+            transactions committed, so no money is lost and nothing needs replaying by hand - but
+            no event has left this service since, so every saga waiting on one is stalled and will
+            eventually be compensated by the timeout sweeper. Check the relay thread and the
+            broker connection.
+
+      # Depth still earns an alert, at a level that means something different: not "the relay is
+      # stopped" but "the relay cannot keep up". Warning, not critical - age is the one that means
+      # data has stopped moving. The number is the weakest in this file and is honestly a
+      # placeholder until M8 measures what the relay actually sustains; it is written here rather
+      # than omitted so that the k6 run has something to falsify.
+      - alert: OutboxBacklogGrowing
+        expr: sum by (application) (dpe_outbox_backlog) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.application }}: outbox backlog sustained above 1000"
+          description: >-
+            Backlog {{ $value | printf "%.0f" }} rows for 5m with age still under the stall
+            threshold, so the relay is running and losing ground. Raise dpe.outbox.batch-size or
+            add a relay instance.
+
+      # Depth above zero, and the threshold is zero ON PURPOSE. Every other rule in this file needs
+      # a defensible number; this one needs the argument for why there is no number to pick. A dead
+      # letter is a message this system could not process after its full retry budget. There is no
+      # healthy rate of that. "Alert above 10" would mean nine lost payments are fine.
+      #
+      # `for: 2m` rather than 0s only because the DLQ depth gauge is refreshed on a timer and a
+      # replay clears it asynchronously - the two-minute wait stops a message that is being
+      # replayed right now from paging anyone.
+      - alert: DeadLettersPresent
+        expr: sum by (application) (dpe_dlq_depth) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.application }}: unreplayed dead letters"
+          description: >-
+            {{ $value | printf "%.0f" }} message(s) exhausted the retry budget and left their
+            partition. They are safe where they are - a replay goes through the inbox, which makes
+            it safe in both directions - but nothing will happen to them until an operator replays
+            them. Read the failure reason in the dead_letters table first: a poison payload will
+            simply die again.
+
+  # ---------------------------------------------------------------------------------------------
+  - name: dpe-saga
+    interval: 10s
+    rules:
+
+      # The compensation-rate step change.
+      #
+      # An ABSOLUTE threshold is wrong here and it is worth being able to say why: the healthy
+      # compensation rate is a property of the payment mix, not of the code. A portfolio with more
+      # declining cards legitimately compensates more, and a threshold tuned for one is either deaf
+      # or screaming for the other. What is always abnormal is the rate CHANGING - the gateway
+      # starting to decline everything, a downstream timing out, someone's fault injection left
+      # switched on after a demo.
+      #
+      # So: compare the last 5 minutes against the hour before it, and fire on a doubling. The
+      # `offset` form is the cheap version of what a real deployment would do with a recording
+      # rule; it is spelled out here because the arithmetic is the point.
+      #
+      # Three guards, all load-bearing:
+      #   * clamp_min on both denominators. A ratio is undefined at zero traffic, and an undefined
+      #     ratio in PromQL is not an error - the series simply vanishes, which reads as "not
+      #     firing" and is indistinguishable from healthy.
+      #   * `> 0.05` on the current ratio, so a system that compensated once an hour ago and twice
+      #     now does not page anybody. A ratio over tiny numerators is noise amplified.
+      #   * a floor on total throughput (~3 sagas/min), so an idle system cannot alert at all.
+      - alert: CompensationRateStepChange
+        expr: |
+          (
+            sum(rate(dpe_saga_terminal_total{status="COMPENSATED"}[5m]))
+              /
+            clamp_min(sum(rate(dpe_saga_terminal_total[5m])), 0.001)
+          ) > 0.05
+          and
+          (
+            sum(rate(dpe_saga_terminal_total{status="COMPENSATED"}[5m]))
+              /
+            clamp_min(sum(rate(dpe_saga_terminal_total[5m])), 0.001)
+          ) >
+          2 *
+          (
+            sum(rate(dpe_saga_terminal_total{status="COMPENSATED"}[1h] offset 5m))
+              /
+            clamp_min(sum(rate(dpe_saga_terminal_total[1h] offset 5m)), 0.001)
+          )
+          and
+          sum(rate(dpe_saga_terminal_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compensation rate has more than doubled against the last hour"
+          description: >-
+            {{ $value | humanizePercentage }} of sagas are now compensating. Compensation itself is
+            correct behaviour - money is being returned to senders and the invariants still hold -
+            so this is a warning, not a page. What it means is that something downstream started
+            saying no: check the gateway's simulation settings first, since a decline rate left
+            injected after a demo looks exactly like this.
+
+      # A saga sitting in one non-terminal state is not a violation of I4 - I4 is a statement about
+      # QUIESCENCE, and a RESERVED saga is correct now and a problem later. That is precisely why
+      # this cannot be a threshold on dpe_saga_inflight: any level is legitimate under load. What
+      # is not legitimate is the level never coming DOWN, so the rule is on the minimum over 15
+      # minutes: if even the lowest reading in a quarter of an hour was non-zero for a given state,
+      # sagas are entering that state and not leaving it.
+      #
+      # STARTED is excluded: the timeout sweeper is the designed answer for a saga stuck there, and
+      # a sweeper doing its job would otherwise page every time it worked.
+      - alert: SagasStuckInFlight
+        expr: min_over_time((sum by (state) (dpe_saga_inflight{state!="STARTED"}))[15m:]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sagas parked in {{ $labels.state }} for 15m"
+          description: >-
+            The count of sagas in {{ $labels.state }} has not touched zero in 15 minutes, so this is
+            a state they enter and do not leave rather than a busy window. The reply that would
+            advance them is missing: check the other service's outbox age and its dead letters. Do
+            NOT read this as an I4 failure - I4 is only meaningful after quiescence.
+
+  # ---------------------------------------------------------------------------------------------
+  - name: dpe-platform
+    interval: 10s
+    rules:
+
+      # The alert that makes every alert above trustworthy. Without it, a service that has crashed
+      # produces no series at all, so every rule written over its metrics stops evaluating and the
+      # dashboard goes quiet - which renders identically to healthy. `up` is Prometheus's own
+      # synthetic per-target series and exists precisely because absence cannot alert on itself.
+      - alert: TargetDown
+        expr: up{job="dpe"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} is not being scraped"
+          description: >-
+            The scrape has failed for a minute. Until this clears, every other rule in this file is
+            silent for that service - not passing, silent. Note the target is a MANAGEMENT port
+            (9091/9092/9093), unpublished to the host by design, so this can also mean the
+            management connector failed to bind while the API stayed up.

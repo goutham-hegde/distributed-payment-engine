@@ -45,8 +45,12 @@ spring:
     consumer:
       group-id: payment-gateway
       auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Wrapped, so a deserializer failure surfaces ABOVE the listener where the error handler can
+      # dead-letter it instead of stalling the partition. Inert while the delegate is
+      # StringDeserializer, and does not cover decompression - see payment-orchestrator's
+      # application.yml for the full argument.
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       # Nothing is committed until the handler's transaction has committed. Auto-commit would
       # acknowledge a charge command on a timer, with no idea whether the charge happened.
       enable-auto-commit: false
@@ -55,6 +59,11 @@ spring:
         # A consumer must never conjure a topic. See KafkaTopicsConfig in any service for the
         # silent one-partition failure this prevents.
         allow.auto.create.topics: false
+        # The real deserializers, named as delegates. Both halves are wrapped: a key that will
+        # not deserialize stalls the partition exactly as a value does, and the key is the half
+        # people forget because it is "just a string".
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
 
     listener:
       ack-mode: manual_immediate
