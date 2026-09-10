@@ -3,9 +3,15 @@ package com.dpe.account.service;
 import com.dpe.account.domain.Account;
 import com.dpe.account.domain.AccountType;
 import com.dpe.account.repository.AccountRepository;
+import com.dpe.account.repository.LedgerEntryRepository;
+import com.dpe.account.web.LedgerCursor;
+import com.dpe.account.web.dto.LedgerEntryResponse;
+import com.dpe.account.web.dto.LedgerPage;
 import com.dpe.events.AccountOpened;
 import com.dpe.events.Topics;
+import com.dpe.account.domain.LedgerEntry;
 import com.dpe.messaging.outbox.OutboxWriter;
+import java.util.List;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,13 +23,21 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class AccountService {
 
+    /** See {@code TransferService.MAX_PAGE_SIZE} in the orchestrator - a cap, not a default. */
+    public static final int MAX_PAGE_SIZE = 200;
+
+    /** Enough to fill a screen of history without a second request in the common case. */
+    public static final int DEFAULT_PAGE_SIZE = 50;
+
     private final AccountRepository accounts;
+    private final LedgerEntryRepository ledger;
     private final TransferService transfers;
     private final OutboxWriter outbox;
 
-    public AccountService(AccountRepository accounts, TransferService transfers,
-                          OutboxWriter outbox) {
+    public AccountService(AccountRepository accounts, LedgerEntryRepository ledger,
+                          TransferService transfers, OutboxWriter outbox) {
         this.accounts = accounts;
+        this.ledger = ledger;
         this.transfers = transfers;
         this.outbox = outbox;
     }
@@ -84,5 +98,88 @@ public class AccountService {
     @Transactional(readOnly = true)
     public Account get(UUID accountId) {
         return accounts.findById(accountId).orElseThrow(() -> new AccountNotFoundException(accountId));
+    }
+
+    /**
+     * <b>M6 part 3.</b> Reads an account, if this caller is allowed to see it.
+     *
+     * <h2>The check is against the authoritative row, and that is the difference worth noticing</h2>
+     *
+     * <p>The orchestrator answers the same shape of question - "is this account this subject's?" -
+     * from {@code account_owners}, a projection fed by events, and it has to reason carefully about
+     * what staleness can do to the answer. Here there is no projection: {@code accounts.owner_id}
+     * IS the fact, read in the transaction. So this check cannot be stale and needs no argument
+     * about immutability.
+     *
+     * <p>That is not an argument for moving the orchestrator's check here. It is the same pairing
+     * the write path already has - an edge check over a copy for a fast, local refusal, and the
+     * authoritative check where the data lives - and it is the reason the two are not redundant.
+     *
+     * <h2>404, not 403</h2>
+     *
+     * <p>An account that exists but belongs to someone else is answered exactly like one that does
+     * not exist. This is a read keyed on an id the caller supplied, so a 403 would confirm the
+     * account is real to anyone walking ids - and account ids are not secret, they are handed to
+     * whoever is meant to send you money. Folding both cases into
+     * {@link AccountNotFoundException} means there is no code path that can tell them apart and
+     * therefore none that can leak the difference later.
+     *
+     * @param operator whether the caller holds the OPERATOR role. Operators may read any account,
+     *                 and only read - nothing on this path can move money, which is the whole
+     *                 content of the role. The write path grants no such bypass.
+     */
+    @Transactional(readOnly = true)
+    public Account getVisibleTo(UUID accountId, String subject, boolean operator) {
+        Account account = accounts.findById(accountId)
+                .orElseThrow(() -> new AccountNotFoundException(accountId));
+
+        if (!operator && !account.getOwnerId().equals(subject)) {
+            throw new AccountNotFoundException(accountId);
+        }
+        return account;
+    }
+
+    /**
+     * <b>M6 part 3.</b> One page of an account's ledger history, newest first, with the
+     * authoritative balance alongside it.
+     *
+     * <p>Authorized by the same {@link #getVisibleTo} call that fetches the account, so there is
+     * exactly one place the rule is written and no way to reach the entries without passing it.
+     * Reading the entries first and checking afterwards would work identically and would be one
+     * refactor away from a leak.
+     *
+     * <p>Both queries run in one read-only transaction, which is what makes the balance and the
+     * entries consistent with each other: without it, a posting committing between the two reads
+     * would produce a page whose newest entry is not reflected in the balance shown above it - and
+     * a ledger view that does not add up is the one thing this screen exists to disprove.
+     *
+     * @param cursor where the previous page stopped, or null for the newest page
+     * @param size   requested page size, clamped to {@link #MAX_PAGE_SIZE}
+     */
+    @Transactional(readOnly = true)
+    public LedgerPage ledgerFor(UUID accountId, String subject, boolean operator,
+                                LedgerCursor cursor, Integer size) {
+        Account account = getVisibleTo(accountId, subject, operator);
+
+        int pageSize = Math.clamp(size == null ? DEFAULT_PAGE_SIZE : size, 1, MAX_PAGE_SIZE);
+        int fetch = pageSize + 1;
+
+        List<LedgerEntry> rows = cursor == null
+                ? ledger.findFirstPageFor(accountId, fetch)
+                : ledger.findPageAfter(accountId, cursor.entryId(), fetch);
+
+        boolean hasMore = rows.size() > pageSize;
+        List<LedgerEntry> page = hasMore ? rows.subList(0, pageSize) : rows;
+
+        String nextCursor = hasMore
+                ? new LedgerCursor(page.get(page.size() - 1).getId()).encode()
+                : null;
+
+        return new LedgerPage(
+                account.getId(),
+                account.getBalanceMinor(),
+                account.getCurrency(),
+                page.stream().map(LedgerEntryResponse::of).toList(),
+                nextCursor);
     }
 }

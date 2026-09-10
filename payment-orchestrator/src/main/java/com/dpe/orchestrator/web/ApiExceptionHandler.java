@@ -71,6 +71,19 @@ public class ApiExceptionHandler {
                 "Required header is missing: " + e.getHeaderName());
     }
 
+    /**
+     * M6: a {@code cursor} query parameter this service did not issue.
+     *
+     * <p>400 and a message that does not say which of the four ways it was malformed. The detail
+     * would only ever be read by somebody constructing cursors by hand, which is the thing the
+     * opaque encoding exists to discourage.
+     */
+    @ExceptionHandler(InvalidCursorException.class)
+    ResponseEntity<Map<String, Object>> onInvalidCursor(InvalidCursorException e) {
+        return body(HttpStatus.BAD_REQUEST, "INVALID_CURSOR",
+                "The cursor is not one this API issued");
+    }
+
     private static ResponseEntity<Map<String, Object>> body(HttpStatus status, String code,
                                                             String message) {
         return ResponseEntity.status(status).body(Map.of(

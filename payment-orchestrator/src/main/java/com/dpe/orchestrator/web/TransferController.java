@@ -5,6 +5,8 @@ import com.dpe.orchestrator.idempotency.IdempotencyGate;
 import com.dpe.orchestrator.idempotency.IdempotentOutcome;
 import com.dpe.orchestrator.transfer.TransferService;
 import com.dpe.orchestrator.web.dto.CreateTransferRequest;
+import com.dpe.orchestrator.web.dto.TimelineResponse;
+import com.dpe.orchestrator.web.dto.TransferPage;
 import com.dpe.orchestrator.web.dto.TransferResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -20,6 +22,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -130,6 +133,46 @@ public class TransferController {
     public ResponseEntity<TransferResponse> get(@PathVariable UUID transferId,
                                                 @AuthenticationPrincipal Jwt caller) {
         return transfers.findTransfer(transferId, caller.getSubject())
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * <b>M6 part 3.</b> The caller's own transfers, newest first, keyset-paged.
+     *
+     * <p>There is no {@code accountId} or {@code status} filter parameter, and both are the kind
+     * of thing that gets added without thinking. A status filter would need its own index -
+     * {@code (initiated_by, status, created_at DESC, id DESC)} - or it becomes a filter over the
+     * existing one that returns short pages and makes the cursor's meaning depend on the filter.
+     * When a filter is genuinely wanted it arrives with the index that serves it, not before.
+     *
+     * <p>{@code cursor} is opaque; hand back exactly the {@code nextCursor} from the previous
+     * page. A cursor that is not one this service issued is a 400 - see
+     * {@link InvalidCursorException} for why it is not a silent restart from the top.
+     */
+    @GetMapping
+    public TransferPage list(@AuthenticationPrincipal Jwt caller,
+                             @RequestParam(required = false) String cursor,
+                             @RequestParam(required = false) Integer size) {
+        TransferCursor from = cursor == null ? null : TransferCursor.decode(cursor);
+        return transfers.listTransfers(caller.getSubject(), from, size);
+    }
+
+    /**
+     * <b>M6 part 3.</b> Where a transfer got to, stage by stage, with the message behind each one.
+     *
+     * <p>Under {@code /api/v1/transfers/**} and therefore covered by the existing {@code USER}
+     * rule and the existing ownership scoping - no new security rule was written for it, which is
+     * the point of having put the pattern there rather than naming endpoints one at a time.
+     *
+     * <p>404 for a transfer that is not the caller's, identically to one that does not exist. This
+     * response carries more internal detail than any other read in the system, so the argument for
+     * not confirming the id exists is stronger here than on the polling GET, not weaker.
+     */
+    @GetMapping("/{transferId}/timeline")
+    public ResponseEntity<TimelineResponse> timeline(@PathVariable UUID transferId,
+                                                     @AuthenticationPrincipal Jwt caller) {
+        return transfers.findTimeline(transferId, caller.getSubject())
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }

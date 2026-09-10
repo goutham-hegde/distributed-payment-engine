@@ -2436,3 +2436,224 @@ Invariants after three further transfers, checked at quiescence:
 - Note for M7: chaos scenarios must wait for terminal sagas before restoring an injected fault.
 - Still outstanding from M4: `ErrorHandlingDeserializer`, and retention for `outbox`, `inbox` and
   `dead_letters`.
+
+---
+
+## Session 14 — 2026-09-10
+
+### Goal
+
+M6 part 3: the read endpoints. Everything built so far makes *writes* correct — the saga, the
+outbox, the idempotency gate, the ownership checks. Nothing yet lets anyone see the result except
+by opening psql. These are the endpoints the demo console is built on, and they are landed now
+rather than during the UI build so they get designed rather than improvised.
+
+Reads turn out to have three constraints the write path never raised:
+
+1. **Offset pagination is broken on a table that is still being written to.** `OFFSET 5000` makes
+   Postgres produce and discard five thousand rows, so the deepest page is the most expensive one
+   — and, worse, a row inserted between page 1 and page 2 shifts every row down a position, so one
+   row is returned twice and one is never returned at all.
+2. **A read endpoint queries the write path's tables.** Same rule as the M6 gauges, different
+   budget: a gauge runs every 10s forever, an operator query runs on demand. The difference has to
+   be *stated*, or somebody turns the invariants endpoint into a gauge.
+3. **A read endpoint is an authorization surface.** The timeline exposes topics, message ids and a
+   trace id — operational detail about one customer's money.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Pagination | Keyset, opaque base64 cursor | An offset names a *count of rows*; a keyset names a *place in the data*. Only the second still means the same thing after a concurrent insert. Opaque so the cursor's shape is not a published API. |
+| Transfer cursor | `(created_at, id)` | `created_at` alone is not unique. Two transfers committed in the same microsecond are ordered arbitrarily and a boundary between them loses or repeats one. |
+| Ledger cursor | `id` alone | `ledger_entries.id` is a BIGSERIAL, already a total order. No tiebreak needed — and the table is append-only, so a cursor can never point at a row that moved. |
+| Cursor codecs shared? | No — one per service | They encode different things. A shared abstraction would be the union of both and would couple two services' pagination contracts to save about fifteen lines. |
+| List response shape | Summary, no `sagaStatus` | Including it means joining `saga_instances` for every row of every page. A list answers "which ones"; a detail endpoint answers "what happened to this one". |
+| Total count | Omitted | An unbounded `COUNT` on every page request, for a number that is stale as it is rendered. |
+| Page size | Clamped, not rejected | `?size=1000000` is a denial-of-service parameter with a friendly name. Clamping still returns data and a cursor. |
+| Invariants endpoint | One per service, per database | I1/I2/I3/I5 are statements about `accounts_db`; I4 about `payments_db`. A single endpoint answering all five needs one process with credentials to both — a shared-database architecture reintroduced through the monitoring door. |
+| I3 on that endpoint | A total, not a verdict | Conservation is a statement about *two instants*; the endpoint only sees one. Returning `holds: true` would show five green lights and be a lie in the one place this system claims to prove something. |
+| Reading an account | Opened to customers, scoped in-request | The role rule says a customer may read *some* account; which one is a path variable no matcher has bound. `AccountService.getVisibleTo` decides, so a second caller of the service cannot skip it. |
+| Not-yours on a read | 404, not 403 | Same call as `GET /transfers/{id}`. Folding "not yours" into "not found" means no code path can tell them apart, so none can leak the difference later. |
+| Timeline assembly | Pure function, no Spring | The pairing rule is the only real logic on the read path, and its interesting inputs are the shapes a *broken* system produces — which an integration test cannot easily create. |
+
+### Built
+
+**payment-orchestrator**
+
+- `GET /api/v1/transfers?cursor=&size=` — keyset-paged, scoped by `initiated_by` **in the WHERE
+  clause**. Filtering after the LIMIT would return short pages, and the number of rows removed is
+  itself information about other people's traffic.
+- `GET /api/v1/transfers/{id}/timeline` — the saga row, the stages, and the message behind each.
+  `saga_steps` is append-only with two rows per step, so per-step latency comes for free and a
+  stage with a start and no end *is* the stall. Each stage carries the outbox row (with
+  `publishedAt − createdAt` as relay lag) and the inbox row that closed it, joined in one query by
+  `message_id` — a left join to both tables fills in exactly one side, and which side it filled in
+  is the direction of the message. The W3C trace id is parsed off `outbox.trace_parent` for a
+  Jaeger deep link.
+- `GET /admin/invariants` — I4, flagged `requiresQuiescence`, with the in-flight breakdown by state.
+- `V7__read_paths.sql` — `idx_transfers_initiated_by` rebuilt as `(initiated_by, created_at DESC,
+  id DESC)`; new `idx_outbox_aggregate (aggregate_id, created_at, id)`.
+
+**account-service**
+
+- `GET /accounts/{id}` now scoped to the owner (operator may read any).
+- `GET /accounts/{id}/ledger?cursor=&size=` — signed amounts passed through exactly as stored, with
+  the authoritative `balance_minor` alongside. Both queries in one read-only transaction, so the
+  balance and the entries are consistent with each other.
+- `GET /admin/invariants` — I1, I2, I5 as checks; I3 as a `conservation` block
+  (`customerBalanceMinor + activeHoldsMinor = totalMinor`).
+- `V6__read_paths.sql` — `idx_ledger_entries_account (account_id, id DESC)` replacing the
+  `account_id`-only index.
+- The `/accounts/**` security rule split: `POST /accounts` stays OPERATOR; the two GETs are
+  `hasAnyRole(USER, OPERATOR)` with the resource check inside the request.
+
+### What broke
+
+**Postgres plans the row-value comparison as an index condition and the hand-expanded OR as a
+filter.** This was an argument in a comment until it was measured. `(created_at, id) < (?, ?)` and
+`created_at < ? OR (created_at = ? AND id < ?)` are logically identical; the planner will not
+reassemble the second into a range scan:
+
+```
+-- row-value form
+Index Scan using idx_transfers_initiated_by on transfers
+  Index Cond: ((initiated_by = 'alice') AND (ROW(created_at, id) < ROW(now(), '000...'::uuid)))
+
+-- hand-expanded OR form
+Index Scan using idx_transfers_initiated_by on transfers
+  Index Cond: (initiated_by = 'alice')
+  Filter: ((created_at < now()) OR ((created_at = now()) AND (id < '000...'::uuid)))
+```
+
+Same answer, different cost, and the difference only appears once the table is large enough that
+nobody is watching. It is also why the query is native: HQL cannot express a row-value comparison.
+
+**Two schema constraints refused the test fixtures, and both were right.** A helper inserting
+`saga_instances` rows for the I4 test was rejected by `saga_completed_at_iff_terminal`
+(`completed_at` must be set exactly when the status is terminal — a *seventh* place the terminal
+set is written down) and then by `saga_compensation_needs_a_hold` (a saga that compensated must
+name the hold it released). Both are the schema refusing to hold a state the system could never
+reach. That is the payoff of putting correctness in constraints: a fixture cannot fabricate an
+impossible row, so an assertion cannot accidentally be about one.
+
+**I5 cannot be forced red from outside the service — `accounts_customer_balance_non_negative`
+enforces it in the database.** A test written to corrupt a balance and watch the check fail was
+refused by the constraint. The test now asserts the true and more interesting fact: the overdraft
+I5 looks for is *structurally impossible*, and the endpoint is a second, independent read of
+something already enforced. I1 and I2 are the opposite — their enforcement is the discipline of
+writing balanced pairs, so they *can* be broken by going around the service, and the test does
+exactly that to prove the check is real.
+
+**Three services crashed on startup with `No resolvable bootstrap urls given in
+bootstrap.servers`.** Compose recreated Redpanda while the services were already starting, so DNS
+for `redpanda` failed at exactly the wrong moment. Not a code fault and not a `depends_on` gap —
+the containers came up clean on a plain restart. Worth recognising because the message sounds like
+a configuration error and is a startup race.
+
+### Verified
+
+Nine containers healthy, `V7` and `V6` applied against the real databases.
+
+Keyset paging, live, `size=3` over one subject's history — page 2 shares nothing with page 1 and
+the order is strictly newest-first:
+
+```
+page 1  9818cdd7 COMPLETED 40000  2026-09-10T09:56:43.766786Z
+        c33611eb COMPLETED 30000  2026-09-10T09:56:43.559571Z
+        e5bcf166 COMPLETED 20000  2026-09-10T09:56:43.261293Z
+page 2  53e31917 COMPLETED 10000  2026-09-10T09:56:42.891219Z
+        cf4c9b1b COMPLETED 15000  2026-09-10T09:03:15.166505Z
+        46057471 COMPLETED 15000  2026-09-10T09:03:14.979173Z
+```
+
+A completed transfer's timeline — three stages, per-step latency, and relay lag as its own number:
+
+```
+saga COMPLETED   traceId 3ac18056097ec9309567d762724f37df
+STAGE           OUTCOME    TO           LAT ms  RELAY ms  COMMAND        REPLY
+ReserveFunds    SUCCEEDED  RESERVED        738       149  ReserveFunds   FundsReserved
+ChargeGateway   SUCCEEDED  CHARGED        1223       488  ChargeGateway  GatewayApproved
+CommitFunds     SUCCEEDED  COMPLETED       828       321  CommitFunds    FundsCommitted
+```
+
+The compensation branch, forced with `failureRate: 1.0` — the same shape, and the decline visible
+as a `FAILED` stage that moves the saga to `COMPENSATING`:
+
+```
+transfer FAILED  saga COMPENSATED  reason GATEWAY_DECLINED
+ReserveFunds    SUCCEEDED  RESERVED      608 ms  ReserveFunds  -> FundsReserved
+ChargeGateway   FAILED     COMPENSATING  639 ms  ChargeGateway -> GatewayDeclined
+ReleaseFunds    SUCCEEDED  COMPENSATED   382 ms  ReleaseFunds  -> FundsReleased
+```
+
+That transfer in the sender's ledger, as the money view will draw it — out and back, same transfer
+id:
+
+```
+ 370 CREDIT    25000  c66fa6f3-aa47-4419-87ed-0fd605718fa5
+ 367 DEBIT    -25000  c66fa6f3-aa47-4419-87ed-0fd605718fa5
+```
+
+Authorization, live:
+
+```
+alice -> bob's ledger                404
+bob   -> bob's ledger                200
+operator -> bob's ledger             200
+alice -> bob's transfer timeline     404
+malformed cursor                     400
+no token on the list                 401
+customer token on /admin/invariants   403
+```
+
+Both invariants endpoints, with the conservation total agreeing with the baseline the shell script
+recorded before the run:
+
+```
+account-service / accounts_db
+  I1  holds   sum 0 over 370 entries
+  I2  holds   0 of 17 accounts drifted
+  I5  holds   0 customer account(s) negative
+  conservation  customerBalance 4200000 + activeHolds 0 = 4200000
+
+payment-orchestrator / payments_db
+  I4  holds   0 saga(s) in flight   (requiresQuiescence: true)
+```
+
+Query plans for all four new read shapes are index scans — see "What broke" for the row-value
+comparison, and:
+
+```
+Index Scan using idx_outbox_aggregate on outbox
+Index Scan using idx_ledger_entries_account on ledger_entries
+  Index Cond: ((account_id = '...') AND (id < 400))
+```
+
+Full suite: **209 tests green** (was 173), and the invariants after the run:
+
+```
+./scripts/verify-invariants.sh
+  PASS  I1  global ledger sum is zero
+  PASS  I2  every account balance equals the sum of its ledger entries
+  PASS  I3  total money conserved (4200000)
+  PASS  I4  no saga left in a non-terminal state
+  PASS  I5  no customer account holds a negative balance
+```
+
+### Committed
+
+`f485c0e` — M6 (part 3): the read path - keyset pages, the timeline, and invariants per database
+
+### Open / next
+
+- **M6 is done.** Next is M6.5, the demo console — every endpoint it was specified to need now
+  exists.
+- Alert rules are still outstanding from part 1: outbox age, DLQ depth above zero, and a
+  compensation-rate step change.
+- Note for M7: chaos scenarios must wait for terminal sagas before restoring an injected fault.
+- Still outstanding from M4: `ErrorHandlingDeserializer`, and retention for `outbox`, `inbox` and
+  `dead_letters`.
+- The transfer list has no status or account filter. When one is wanted it arrives *with the index
+  that serves it*, not before — a filter over the existing index returns short pages and makes the
+  cursor's meaning depend on the filter.

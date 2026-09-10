@@ -6,6 +6,7 @@ import com.dpe.security.RolesConverter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.core.annotation.Order;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -87,7 +88,29 @@ public class SecurityConfig {
                         // own in this system, and the request body names the owner, so leaving it
                         // to any authenticated caller would let one customer create an account in
                         // another's name.
-                        .requestMatchers("/accounts/**").hasRole(Roles.OPERATOR)
+                        //
+                        // Pinned to POST as of M6, because the rule below now needs the reads to
+                        // fall through to it. Method-specific matchers are how a resource gets
+                        // two different answers for two different verbs; a path-only rule cannot.
+                        .requestMatchers(HttpMethod.POST, "/accounts").hasRole(Roles.OPERATOR)
+
+                        // M6 part 3: reading an account and its ledger history is open to
+                        // customers as well as operators, because the demo console shows a
+                        // customer their own money.
+                        //
+                        // What this rule says is only "a customer MAY read some account" - it
+                        // cannot say which, because the account id is a path variable and this
+                        // matcher is comparing patterns, not binding them. WHICH account is
+                        // decided in AccountService.getVisibleTo, inside the request. The role
+                        // check narrows the population; the resource check is the one that
+                        // protects the data, and neither substitutes for the other.
+                        //
+                        // Note the two patterns are written out rather than trusting "/accounts/**"
+                        // to also cover a POST that is not matched above - it does not, and that is
+                        // the point: any verb on /accounts that nobody wrote a rule for falls to
+                        // denyAll below.
+                        .requestMatchers(HttpMethod.GET, "/accounts/*", "/accounts/*/ledger")
+                                .hasAnyRole(Roles.USER, Roles.OPERATOR)
 
                         // /transfers - the direct ledger endpoint from M1 - is deliberately
                         // absent, and therefore denied by the rule below.

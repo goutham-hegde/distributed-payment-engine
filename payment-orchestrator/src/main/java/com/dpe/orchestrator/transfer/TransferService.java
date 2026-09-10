@@ -4,8 +4,16 @@ import com.dpe.orchestrator.authz.AccountOwnershipGuard;
 import com.dpe.orchestrator.saga.SagaInstance;
 import com.dpe.orchestrator.saga.SagaInstanceRepository;
 import com.dpe.orchestrator.saga.SagaOrchestrator;
+import com.dpe.orchestrator.saga.SagaStepRepository;
+import com.dpe.orchestrator.saga.SagaStepTrail;
+import com.dpe.orchestrator.saga.SagaTimelineAssembler;
+import com.dpe.orchestrator.web.TransferCursor;
 import com.dpe.orchestrator.web.dto.CreateTransferRequest;
+import com.dpe.orchestrator.web.dto.TimelineResponse;
+import com.dpe.orchestrator.web.dto.TransferPage;
 import com.dpe.orchestrator.web.dto.TransferResponse;
+import com.dpe.orchestrator.web.dto.TransferSummary;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
@@ -28,15 +36,32 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class TransferService {
 
+    /**
+     * The largest page {@code GET /api/v1/transfers} will serve, whatever the caller asks for.
+     *
+     * <p>A cap, not a default. Page size is an argument the client controls, and an uncapped one
+     * is a denial-of-service parameter with a friendly name: {@code ?limit=1000000} is a request
+     * for a million rows to be loaded, mapped and serialized, on a connection the caller can
+     * abandon the moment it is sent. Clamped rather than rejected, so a client asking for too much
+     * gets data and a next cursor rather than an error it has to learn about.
+     */
+    public static final int MAX_PAGE_SIZE = 100;
+
+    /** What a caller gets when they do not say. Small enough that the first page is cheap. */
+    public static final int DEFAULT_PAGE_SIZE = 20;
+
     private final TransferRepository transfers;
     private final SagaInstanceRepository sagas;
+    private final SagaStepRepository steps;
     private final SagaOrchestrator orchestrator;
     private final AccountOwnershipGuard ownership;
 
     public TransferService(TransferRepository transfers, SagaInstanceRepository sagas,
-                           SagaOrchestrator orchestrator, AccountOwnershipGuard ownership) {
+                           SagaStepRepository steps, SagaOrchestrator orchestrator,
+                           AccountOwnershipGuard ownership) {
         this.transfers = transfers;
         this.sagas = sagas;
+        this.steps = steps;
         this.orchestrator = orchestrator;
         this.ownership = ownership;
     }
@@ -99,5 +124,81 @@ public class TransferService {
         return transfers.findById(transferId)
                 .filter(t -> ownership.canView(subject, t.getInitiatedBy()))
                 .map(t -> TransferResponse.of(t, sagas.findByTransferId(transferId).orElse(null)));
+    }
+
+    /**
+     * <b>M6 part 3.</b> One page of the caller's own transfers, newest first.
+     *
+     * <h2>The scoping is in the query, not in a filter after it</h2>
+     *
+     * <p>{@link #findTransfer} reads a row and then applies {@link AccountOwnershipGuard#canView},
+     * which is fine for one row. Doing the same thing here - fetch a page, drop the rows that are
+     * not yours - is wrong in two separate ways. It leaks: the number of rows removed tells the
+     * caller how many transfers other people made in that time window. And it is broken: after
+     * dropping rows the page is short, so a client cannot tell "end of your list" from "a lot of
+     * other people's rows sorted nearby", and the next cursor points into someone else's history.
+     * Authorization for a collection belongs in the WHERE clause.
+     *
+     * <h2>The extra row</h2>
+     *
+     * <p>The query asks for {@code size + 1}. If that many come back there is at least one more
+     * page, and the last row is discarded and its predecessor becomes the cursor. The alternative
+     * is a second {@code COUNT} query per page, which costs more than the row it saves and is
+     * racy anyway - the count is taken at a different instant from the page.
+     *
+     * @param cursor where the previous page stopped, or null for the first page
+     * @param size   requested page size; clamped to {@link #MAX_PAGE_SIZE}
+     */
+    @Transactional(readOnly = true)
+    public TransferPage listTransfers(String subject, TransferCursor cursor, Integer size) {
+        int pageSize = Math.clamp(size == null ? DEFAULT_PAGE_SIZE : size, 1, MAX_PAGE_SIZE);
+        int fetch = pageSize + 1;
+
+        List<Transfer> rows = cursor == null
+                ? transfers.findFirstPageFor(subject, fetch)
+                : transfers.findPageAfter(subject, cursor.createdAt(), cursor.id(), fetch);
+
+        boolean hasMore = rows.size() > pageSize;
+        List<Transfer> page = hasMore ? rows.subList(0, pageSize) : rows;
+
+        String nextCursor = null;
+        if (hasMore) {
+            Transfer last = page.get(page.size() - 1);
+            nextCursor = new TransferCursor(last.getCreatedAt(), last.getId()).encode();
+        }
+
+        return new TransferPage(page.stream().map(TransferSummary::of).toList(), nextCursor);
+    }
+
+    /**
+     * <b>M6 part 3.</b> The full history of one transfer: its saga, its stages, and the message
+     * behind each one.
+     *
+     * <p>Scoped exactly like {@link #findTransfer}, and for a stronger reason. This response is a
+     * far richer object than the polling read - it names topics, message ids and the trace id -
+     * and every one of those is a handle on the internals of somebody's payment. It is also the
+     * same {@link Optional#empty()} for "not yours" as for "does not exist", so the controller
+     * answers 404 to both: a timeline endpoint that answered 403 for a real transfer would be a
+     * particularly good oracle, because the caller would then know the id was worth attacking.
+     *
+     * <p>Three queries, all by primary key or by an indexed foreign id, none of them a scan. The
+     * step trail is a single join rather than a lookup per step; see
+     * {@link SagaStepRepository#findTrail}.
+     */
+    @Transactional(readOnly = true)
+    public Optional<TimelineResponse> findTimeline(UUID transferId, String subject) {
+        return transfers.findById(transferId)
+                .filter(t -> ownership.canView(subject, t.getInitiatedBy()))
+                .map(t -> {
+                    SagaInstance saga = sagas.findByTransferId(transferId).orElse(null);
+                    // A transfer with no saga row cannot happen - they are written in one
+                    // transaction - but the timeline renders it rather than throwing, because a
+                    // diagnostic endpoint that fails on impossible data is useless on the one
+                    // day the data is impossible.
+                    List<SagaStepTrail> trail = saga == null
+                            ? List.of()
+                            : steps.findTrail(saga.getId());
+                    return SagaTimelineAssembler.assemble(t, saga, trail);
+                });
     }
 }

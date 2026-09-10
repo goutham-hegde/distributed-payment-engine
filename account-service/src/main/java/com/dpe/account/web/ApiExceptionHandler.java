@@ -35,6 +35,21 @@ public class ApiExceptionHandler {
         return problem;
     }
 
+    /**
+     * M6: a {@code cursor} query parameter this service did not issue.
+     *
+     * <p>A 400 whose detail says nothing about which way it was malformed - the only caller who
+     * would benefit from knowing is one hand-constructing cursors, which the opaque encoding
+     * exists to discourage.
+     */
+    @ExceptionHandler(InvalidCursorException.class)
+    public ProblemDetail onInvalidCursor(InvalidCursorException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST,
+                "The cursor is not one this API issued");
+        problem.setTitle("Invalid cursor");
+        return problem;
+    }
+
     @ExceptionHandler(InsufficientFundsException.class)
     public ProblemDetail onInsufficientFunds(InsufficientFundsException ex) {
         // UNPROCESSABLE_CONTENT, not UNPROCESSABLE_ENTITY: RFC 9110 renamed 422, and Spring
