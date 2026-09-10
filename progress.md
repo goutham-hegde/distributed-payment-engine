@@ -2881,6 +2881,10 @@ $ ./scripts/verify-invariants.sh
   PASS  I5  no customer account holds a negative balance
 ```
 
+### Committed
+
+`4c0deed` - M6.5: the console - and two carried-forward items, one of which was already fixed
+
 ### Open / next
 
 - **M7, the chaos suite.** The console now makes the scenarios watchable, which was the reason to
