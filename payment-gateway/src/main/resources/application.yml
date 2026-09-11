@@ -30,7 +30,7 @@ spring:
   # M3: the gateway joins the saga. It consumes ChargeGateway commands and produces
   # GatewayApproved / GatewayDeclined events out of its own outbox.
   kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
 
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer

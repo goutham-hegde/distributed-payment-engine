@@ -100,8 +100,8 @@ services:
       # connects to whatever `advertise-kafka-addr` told it. Get this wrong and the bootstrap
       # succeeds while every produce and fetch afterwards hangs on an unresolvable host - the
       # single most common Kafka-in-Docker failure, and it looks nothing like a DNS problem.
-      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:29092
       - --smp=1
       # MUST be below the container's memory limit below, not equal to it. Seastar allocates
       # this much up front and refuses to start if the cgroup cannot hand it over:
@@ -127,7 +127,13 @@ services:
       - ./redpanda/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
     ports:
       # Host-facing listener only. Services inside the network use redpanda:9092.
-      - "19092:19092"
+      # 29092, not 19092: another project on this machine publishes its own Kafka on 19092, and a
+      # service started from the IDE would connect to that broker without complaint - wrong topics,
+      # no error naming the cause. The number must agree in four places per broker: the listener and
+      # the advertised address above, and both sides of this mapping (a client dials the bootstrap,
+      # then reconnects to whatever address it was advertised). The fifth is the KAFKA_BOOTSTRAP
+      # default in each service's application.yml.
+      - "29092:29092"
     healthcheck:
       # A broker that accepts TCP is not a broker that can serve a produce request; the
       # controller has to have elected a leader first. Same lesson as pg_isready above.
@@ -139,7 +145,7 @@ services:
     deploy: *mem-limit
 
   # The same broker, for real. Apache Kafka in KRaft mode - no ZooKeeper either, since 3.3.
-  # Profile-gated: `--profile kafka` and stop redpanda first, as both claim host port 19092.
+  # Profile-gated: `--profile kafka` and stop redpanda first, as both claim host port 29092.
   # The point of keeping it is that "works on Redpanda" is not "works on Kafka", and the
   # chaos suite at M7 should be able to prove the difference.
   kafka:
@@ -150,8 +156,8 @@ services:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092"
-      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:19092"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:29092"
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
@@ -163,7 +169,8 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
     ports:
-      - "19092:19092"
+      # Same host port as redpanda's, deliberately - see the comment there.
+      - "29092:29092"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 10s
@@ -467,7 +474,11 @@ services:
       # The only origin the browser needs. The three service ports stay published for curl and for
       # the IDE, but nothing in the console uses them - it calls /api/orchestrator, /api/accounts
       # and /api/gateway on this port, which is what keeps CORS out of three SecurityConfigs.
-      - "5173:80"
+      # 8084, next to the three services - not Vite's 5173, which another project on this machine
+      # pins its own dashboard's dev server to. Docker Desktop publishes this port on IPv6 only, so a
+      # non-Docker process can still bind 127.0.0.1 on the same number without an error; a clash
+      # here is not guaranteed to be loud. The console's dev server (ui/vite.config.ts) is 8085.
+      - "8084:80"
     depends_on:
       # service_started, not service_healthy, and for the same reason Prometheus uses it: the
       # console must come up and SHOW a service as unreachable. Waiting for health would hide the

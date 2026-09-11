@@ -52,7 +52,7 @@ spring:
   # M2: consumes the events account-service relays out of its outbox.
   # M3: also PRODUCES, because the saga issues commands through an outbox of its own.
   kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
 
     # Identical to account-service's producer block, and identical on purpose: these settings
     # are what make the outbox's guarantee true, so they are not a per-service preference.

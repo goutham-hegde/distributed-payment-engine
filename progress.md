@@ -3551,3 +3551,101 @@ The stalled dead-letter consumer's ten records were replayed once it recovered: 
 2. `DeadLetterReplayService` holds a transaction across up to 50 sends; bound it like the relay if
    replays ever become routine.
 3. ~~Commit M7~~ — done, `df330a4`.
+
+---
+
+## Session 19 — 2026-09-11
+
+### Goal
+
+Move the broker's host-facing port off 19092. A Kind cluster from another project on this machine
+publishes its own Kafka on 19092, so the two could not run at the same time (the collision behind
+the port workarounds recorded under M3 part 2 and Session 11), and a service started from the IDE
+while the other cluster held the port would have connected to the wrong broker with nothing saying
+so. Then move the console off 5173 for the same reason: the other project pins its dashboard's dev
+server there.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Which project moves | This one | Nine lines and one container recreate. The other project's port is fixed at Kind cluster creation and is referenced in its scripts, README and five services; moving it means destroying and recreating that cluster. |
+| New port | 29092 | Keeps the `x9092` pattern. Free on this machine, and outside the TCP ranges Windows reserves for Hyper-V (49816–50465 here), where a bind fails with an access-permissions error rather than "port already allocated". |
+| Container side of the mapping | Also 29092 (`29092:29092`) | The advertised address is `localhost:29092`, and a client reconnects to the advertised address after bootstrap. Host and container ports must therefore be equal, or bootstrap succeeds and every produce and fetch after it hangs. |
+| A Compose variable for the port? | No — nine literal lines | `${VAR:-29092}` in Compose cannot reach the `KAFKA_BOOTSTRAP` default in the three `application.yml`s, so overriding it would make Compose and the IDE defaults disagree silently. A literal that one `grep` finds is harder to get wrong. |
+| Services in Compose | Unchanged | They use the internal listener, `redpanda:9092` / `kafka:9092`. Only the host path moved. |
+| Console | 8084 (container), 8085 (Vite dev server) | Beside the services' 8081–8083. The other project's dev server is pinned to 5173 with `strictPort` and a CORS allowlist naming that origin, so this side is the one that can move freely. |
+| Is a port clash always loud? | No — tested, and the answer changed the decision | Docker Desktop here publishes on IPv6 only (`::`, `::1`). With the console on 5173, a plain socket still bound `127.0.0.1:5173` and `0.0.0.0:5173` without error; only `::1` was refused. The other project's Vite happens to bind `::1` (Node resolves `localhost` to it on this machine), so its failure would have been loud — by luck of resolver order, not by design. |
+| Dev server `strictPort` | On | Vite's default on a taken port is to move to the next one quietly. A dev server that is not where the README says is found by opening a different app. |
+
+### Built
+
+- `infra/docker-compose.yml` — external listener, advertised address and port mapping moved to
+  29092 for both `redpanda` and the profile-gated `kafka`, with a comment at the mapping naming all
+  the places that must agree.
+- `KAFKA_BOOTSTRAP` default moved to `localhost:29092` in the `application.yml` of all three
+  services.
+- `infra/docker-compose.kafka.yml` — comment updated.
+- The console: `ui` published on `8084:80`; `ui/vite.config.ts` on 8085 with `strictPort`; README.
+
+### What broke
+
+1. **A one-off transfer failed I3, correctly.** The live check opened a funded account after the
+   stored I3 baseline was taken; funding an account is money entering the ledger, so the total rose
+   by exactly the opening balance (71,500,000 → 71,505,000) and I3 reported it. I1, I2 and S1–S4
+   passed. The chaos harness avoids this by recording the baseline *after* opening its accounts
+   (`record_baseline`); ad-hoc traffic has to follow the same order. Baseline re-recorded.
+
+### Verified
+
+```
+docker compose -f infra/docker-compose.yml config                          renders; 29092 target and published
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.kafka.yml config    renders; same
+grep -rn 29092 --include=*.yml .                                           9 lines, all consistent
+docker compose -f infra/docker-compose.yml up -d redpanda                  recreated, healthy; same data volume
+                                                                           (774dd999...); 8 topics present;
+                                                                           write_caching_default "false",
+                                                                           auto_create_topics_enabled false
+```
+
+With the other project's Kind cluster running on 19092 at the same time, from the Windows host:
+
+```
+kafka-broker-api-versions.sh --bootstrap-server localhost:29092    advertised: localhost:29092 (id: 0)
+kafka-topics.sh --list        --bootstrap-server localhost:29092    dpe.* topics only
+kafka-broker-api-versions.sh --bootstrap-server localhost:19092    advertised: localhost:19092 (id: 1)
+kafka-topics.sh --list        --bootstrap-server localhost:19092    the other project's topics only
+```
+
+After restarting the three services (a Redpanda restart has preceded every silent consumer stall
+seen so far, and a restart of the service clears one):
+
+```
+rpk group describe (all three)     Stable, 2 members each, total lag 0
+one transfer, alice -> bob, 1234   HTTP 202 -> saga COMPLETED in ~3 s; balances 3766 / 1234
+./scripts/verify-invariants.sh     I1-I5 and S1-S4 PASS (after re-recording the baseline, What broke 1)
+```
+
+The console:
+
+```
+docker compose ... up -d ui               recreated alone (services untouched), healthy on 8084
+GET  localhost:8084/                      200
+POST localhost:8084/api/orchestrator/auth/token     token issued (alice)
+GET  localhost:8084/api/orchestrator/api/v1/transfers   200, with that token
+GET  localhost:8084/api/prom/api/v1/query 200
+localhost:5173                            no answer; ::1 and 127.0.0.1 both bindable again
+npm run typecheck (ui)                    exit 0
+npm run dev (ui)                          serves on 8085; /api/prom proxied, 200
+a second npm run dev                      "Error: Port 8085 is already in use" - refused, not moved
+```
+
+### Committed
+
+Not yet committed.
+
+### Open / next
+
+1. The two earlier port workarounds (M3 part 2, Session 11) are history now: both stacks run at once.
+2. Carried over: the consumer stall (only reproduced on Redpanda) and `DeadLetterReplayService`'s
+   unbounded transaction.

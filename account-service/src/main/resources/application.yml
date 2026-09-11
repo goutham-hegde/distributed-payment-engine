@@ -51,8 +51,9 @@ spring:
   # M2: the outbox relay is the only thing in this service that talks to Kafka.
   kafka:
     # In Compose this is redpanda:9092 (the internal listener). From the IDE it is
-    # localhost:19092 (the external one). Same broker, two advertised addresses.
-    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:19092}
+    # localhost:29092 (the external one). Same broker, two advertised addresses. Not 19092:
+    # another project on this machine publishes its own Kafka there (see infra/docker-compose.yml).
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       # The payload was already serialized to JSON inside the business transaction, so the

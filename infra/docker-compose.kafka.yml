@@ -4,7 +4,7 @@
 #
 # Why an override rather than `--profile kafka` alone: the profile only STARTS a Kafka container.
 # Every service still has KAFKA_BOOTSTRAP=redpanda:9092 and depends_on a healthy redpanda, so the
-# profile gave you a broker nobody talked to - and both brokers claim host port 19092, so it could
+# profile gave you a broker nobody talked to - and both brokers claim host port 29092, so it could
 # not even start next to Redpanda. "Works on Redpanda" is not "works on Kafka", and M7's silent
 # consumer stall is exactly the question that needs the difference: it has only ever been seen
 # against Redpanda, and whether the broker or the client is at fault is the whole open question.

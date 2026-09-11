@@ -16,7 +16,12 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5173,
+    // 8085, beside the container's 8084 (infra/docker-compose.yml) - not Vite's default 5173, which
+    // another project on this machine pins its dashboard to. strictPort because Vite's fallback is
+    // to move silently to the next free port, and a dev server that is not where the README says
+    // is found by opening a different app.
+    port: 8085,
+    strictPort: true,
     proxy: {
       "/api/orchestrator": {
         target: "http://localhost:8081",

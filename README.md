@@ -129,7 +129,7 @@ console. Health checks gate startup, so the command returns only once everything
 
 | | |
 |---|---|
-| **Console** | <http://localhost:5173> — sign in as `alice` / `alice-password` |
+| **Console** | <http://localhost:8084> — sign in as `alice` / `alice-password` |
 | Grafana | <http://localhost:3000> (anonymous, lands on the payments dashboard) |
 | Prometheus | <http://localhost:9090> |
 | Jaeger | <http://localhost:16686> |
@@ -156,7 +156,7 @@ The console is a separate build (`ui/` is not a Maven module — it has its own 
 absent from the parent POM on purpose):
 
 ```bash
-cd ui && npm ci && npm run dev    # dev server on :5173, proxying to the three services
+cd ui && npm ci && npm run dev    # dev server on :8085, proxying to the three services
 ```
 
 Every invariant, on demand:
