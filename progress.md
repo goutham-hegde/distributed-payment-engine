@@ -3870,6 +3870,9 @@ needs. Then prove, by switching one off, which fix does what.
    the new file being visible in the container; nothing was logged. A Grafana restart loaded it.
    The cause (most likely change detection on a Docker Desktop bind mount) is not established.
 3. **k6 reported a negative request duration** in the third run: the VM's clock stepped backwards.
+4. **Jaeger was OOM-killed again**, during the second run, with a third of the first run's traffic.
+   Payments were unaffected, as before; it was restarted after the session. Two kills in three runs
+   make its trace-count bound the next thing to fix on the observability side.
 
 ### Verified
 
