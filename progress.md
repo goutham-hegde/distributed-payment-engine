@@ -3642,7 +3642,7 @@ a second npm run dev                      "Error: Port 8085 is already in use" -
 
 ### Committed
 
-Not yet committed.
+`f86e462` — "infra: move the broker to host port 29092 and the console to 8084".
 
 ### Open / next
 
