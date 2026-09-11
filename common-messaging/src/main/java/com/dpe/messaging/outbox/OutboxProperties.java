@@ -22,9 +22,21 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *                     purpose: an unbounded {@code get()} on a wedged broker holds the claim
  *                     transaction open indefinitely, which turns a broker outage into a database
  *                     incident.
+ * @param batchBudget  M7. Wall-clock time after which a drain stops starting new sends and commits
+ *                     what it has; the unsent rows stay unpublished for the next poll. Needed
+ *                     because sendTimeout bounds ONE send and a batch is up to batchSize of them -
+ *                     100 x 5 s against a dead broker is eight minutes with the claim transaction
+ *                     open. To Postgres that whole stretch is one "idle in transaction" (no SQL
+ *                     runs between the claim and the commit), so without this bound no
+ *                     {@code idle_in_transaction_session_timeout} could be set short enough to
+ *                     reap an orphaned transaction without also killing a healthy relay. The
+ *                     ceiling on the relay's idle stretch is batchBudget + sendTimeout +
+ *                     the producer's max.block.ms, and the session timeout in application.yml
+ *                     is set above that sum.
  */
 @ConfigurationProperties(prefix = "dpe.outbox")
-public record OutboxProperties(int batchSize, Duration pollInterval, Duration sendTimeout) {
+public record OutboxProperties(int batchSize, Duration pollInterval, Duration sendTimeout,
+                               Duration batchBudget) {
 
     public OutboxProperties {
         if (batchSize <= 0) {
@@ -35,6 +47,9 @@ public record OutboxProperties(int batchSize, Duration pollInterval, Duration se
         }
         if (sendTimeout == null) {
             sendTimeout = Duration.ofSeconds(5);
+        }
+        if (batchBudget == null) {
+            batchBudget = Duration.ofSeconds(10);
         }
     }
 }

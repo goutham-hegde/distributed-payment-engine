@@ -144,10 +144,27 @@ public class OutboxRelay {
         Set<UUID> blocked = new HashSet<>();
         int published = 0;
 
+        // M7: the batch has a wall-clock budget as well as a size. See OutboxProperties#batchBudget
+        // - it is what lets Postgres reap an orphaned transaction without reaping this one.
+        long deadline = System.nanoTime() + properties.batchBudget().toNanos();
+        int attempted = 0;
+
         for (OutboxMessage message : batch) {
+            // Never before the first send: a budget shorter than one send would otherwise stop
+            // every drain before it started, and a relay that never publishes is an outage that
+            // looks exactly like an idle system.
+            if (attempted > 0 && System.nanoTime() - deadline > 0) {
+                // Stopping is safe for the same reason a blocked aggregate is: every row not
+                // reached is still unpublished and still in order, and the next poll claims it.
+                log.warn("outbox drain spent its {} budget having published {} of {} claimed "
+                        + "messages; the rest wait for the next poll", properties.batchBudget(),
+                        published, batch.size());
+                break;
+            }
             if (blocked.contains(message.getAggregateId())) {
                 continue;
             }
+            attempted++;
             ProducerRecord<String, String> record = recordFor(message);
 
             // Restores the trace context this message was produced with. The row carries what

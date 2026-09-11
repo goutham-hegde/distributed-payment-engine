@@ -48,4 +48,17 @@ public record ReserveRejected(
      * a compromised producer - and it is worth alerting on rather than merely counting.
      */
     public static final String NOT_ACCOUNT_OWNER  = "NOT_ACCOUNT_OWNER";
+
+    /**
+     * M7: the saga for this transfer has already given up on it, so no money may be reserved for
+     * it now or ever.
+     *
+     * <p>Sent in two situations, and they are the same fact seen from each side of a race. A
+     * {@link ReserveFunds} that arrives AFTER the orchestrator's timeout voided the transfer is
+     * refused with it. And a {@link ReleaseFunds} that arrives before any reserve - so there is no
+     * hold to release - is answered with it, because "nothing was reserved, and nothing will be"
+     * is exactly this record's meaning. Either way the saga is already {@code FAILED}; the reply
+     * exists so the participant never answers with silence.
+     */
+    public static final String TRANSFER_VOIDED    = "TRANSFER_VOIDED";
 }

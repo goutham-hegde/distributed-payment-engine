@@ -58,6 +58,14 @@ public class Hold {
     @Column(name = "status", nullable = false, length = 9)
     private HoldStatus status;
 
+    /**
+     * Why a RELEASED hold was released. Set once, with the status. Kept on the row so a repeated
+     * or late question about this hold is answered with the original reason, not with whichever
+     * one the repeat happened to quote (M7, Fix B).
+     */
+    @Column(name = "release_reason", length = 32)
+    private String releaseReason;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
@@ -97,9 +105,10 @@ public class Hold {
     }
 
     /** Marks this hold compensated: the money goes back to {@link #getAccountId()}. */
-    public void release() {
+    public void release(String reason) {
         requireActive("release");
         this.status = HoldStatus.RELEASED;
+        this.releaseReason = reason;
     }
 
     /** True while this hold still counts toward invariant I3. */
@@ -136,6 +145,10 @@ public class Hold {
 
     public HoldStatus getStatus() {
         return status;
+    }
+
+    public String getReleaseReason() {
+        return releaseReason;
     }
 
     public OffsetDateTime getCreatedAt() {

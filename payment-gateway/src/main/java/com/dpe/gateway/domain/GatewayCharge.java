@@ -13,8 +13,10 @@ import org.hibernate.annotations.CreationTimestamp;
 /**
  * One charge attempt against the simulated PSP.
  *
- * <p>Immutable once written. A charge is a record of something that happened at an external
- * party, and rewriting it would be rewriting history that this service does not own.
+ * <p>Immutable once written, with one exception added at M7: an APPROVED charge may be VOIDED,
+ * once, when the saga compensates. That is not a rewrite of history - the approval happened, and
+ * {@link #getVoidedAt()} records when it was undone. A VOIDED row can also be a tombstone written
+ * before any charge existed; see {@code V4__charge_voids.sql}.
  */
 @Entity
 @Table(name = "gateway_charges")
@@ -42,7 +44,7 @@ public class GatewayCharge {
     private String currency;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "status", nullable = false, updatable = false, length = 8)
+    @Column(name = "status", nullable = false, length = 8)
     private ChargeStatus status;
 
     @Column(name = "decline_reason", updatable = false, length = 64)
@@ -54,6 +56,12 @@ public class GatewayCharge {
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
+
+    @Column(name = "voided_at")
+    private OffsetDateTime voidedAt;
+
+    @Column(name = "void_reason", length = 32)
+    private String voidReason;
 
     protected GatewayCharge() {
         // for JPA
@@ -87,8 +95,30 @@ public class GatewayCharge {
                 ChargeStatus.DECLINED, reason, latencyMs);
     }
 
+    /**
+     * M7: reverses an approved charge - the PSP-side compensation. Only an APPROVED charge has
+     * anything to reverse; a decline took nothing, and a void is already done.
+     */
+    public void voidAuthorization(String reason) {
+        if (status != ChargeStatus.APPROVED) {
+            throw new IllegalStateException(
+                    "cannot void charge " + id + ": status is " + status);
+        }
+        this.status = ChargeStatus.VOIDED;
+        this.voidedAt = OffsetDateTime.now();
+        this.voidReason = reason;
+    }
+
     public boolean isApproved() {
         return status == ChargeStatus.APPROVED;
+    }
+
+    public OffsetDateTime getVoidedAt() {
+        return voidedAt;
+    }
+
+    public String getVoidReason() {
+        return voidReason;
     }
 
     public UUID getId() {

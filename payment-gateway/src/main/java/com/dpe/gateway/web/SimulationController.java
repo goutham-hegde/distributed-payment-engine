@@ -17,10 +17,13 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * Turns the failure knobs at runtime. This is the chaos suite's control plane.
  *
- * <p>Deliberately unauthenticated and deliberately not behind the JWT filter M5 adds. It is a
- * test affordance on a simulated third party, not a production API - a real PSP does not offer
- * "please start declining now". If this service were ever deployed anywhere real, this
- * controller would be the first thing deleted.
+ * <p>OPERATOR-only, under the {@code /admin/**} rule in {@code SecurityConfig}. Until M5 this
+ * comment said the endpoint was deliberately unauthenticated; M5 put it behind the token and the
+ * comment outlived the decision. The first M7 chaos run believed it - fired its fault injection
+ * without a token, got a 401 it did not check, and drove thirty transfers through a gateway that
+ * was approving everything. It is a test affordance on a simulated third party, not a production
+ * API - a real PSP does not offer "please start declining now" - and if this service were ever
+ * deployed anywhere real, this controller would be the first thing deleted.
  *
  * <p>It exists so M7 can force the compensation path on demand rather than waiting for a genuine
  * decline, and so the README's demo can show a saga compensating live.

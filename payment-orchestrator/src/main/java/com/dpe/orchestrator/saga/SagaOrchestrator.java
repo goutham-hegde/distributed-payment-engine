@@ -1,6 +1,7 @@
 package com.dpe.orchestrator.saga;
 
 import com.dpe.events.ChargeGateway;
+import com.dpe.events.ChargeVoided;
 import com.dpe.events.CommitFunds;
 import com.dpe.events.FundsCommitted;
 import com.dpe.events.FundsReleased;
@@ -11,11 +12,13 @@ import com.dpe.events.ReleaseFunds;
 import com.dpe.events.ReserveFunds;
 import com.dpe.events.ReserveRejected;
 import com.dpe.events.Topics;
+import com.dpe.events.VoidCharge;
 import com.dpe.messaging.outbox.OutboxWriter;
 import com.dpe.orchestrator.transfer.Transfer;
 import com.dpe.orchestrator.transfer.TransferRepository;
 import java.time.OffsetDateTime;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,6 +76,25 @@ import org.springframework.transaction.annotation.Transactional;
  * hold that does not exist and strand the saga waiting for a reply nobody will send. The schema
  * agrees - {@code saga_compensation_needs_a_hold} rejects a COMPENSATING row with a null
  * {@code hold_id}.
+ *
+ * <h2>What the M7 chaos suite changed</h2>
+ *
+ * <p><b>The gateway charge is the PIVOT.</b> Before it, recovery runs backward (compensate);
+ * after it, only forward (re-send the commit until it lands). A timeout in {@code CHARGED} used to
+ * compensate exactly like {@code RESERVED} - a refund out of our own books while the PSP kept the
+ * charge. See {@link #onTimeout}.
+ *
+ * <p><b>Every compensation commutes with the step it compensates.</b> A timeout is decided from a
+ * clock, not ordered on the partition, so it can overtake the step it undoes. Compensations are
+ * therefore addressed by transfer id, and both participants remember them even when there is
+ * nothing yet to undo: a {@code STARTED} timeout sends a {@link ReleaseFunds} with no hold id, and
+ * a {@code RESERVED} timeout also sends a {@link VoidCharge} to the gateway.
+ *
+ * <p><b>A reply is a statement of fact, not an acknowledgement.</b> Participants now answer every
+ * command with what actually happened, so {@code FundsCommitted} can arrive for a saga that thought
+ * it was compensating, and {@code FundsReleased} for one that thought it had charged. Both are
+ * accepted and the saga finishes where the money actually is - see {@link #onFundsCommitted} and
+ * {@link #onFundsReleased}.
  */
 @Service
 public class SagaOrchestrator {
@@ -83,6 +105,8 @@ public class SagaOrchestrator {
     private static final String STEP_CHARGE = "ChargeGateway";
     private static final String STEP_COMMIT = "CommitFunds";
     private static final String STEP_RELEASE = "ReleaseFunds";
+    private static final String STEP_VOID = "VoidCharge";
+    private static final String STEP_RECONCILE = "Reconcile";
 
     private final SagaInstanceRepository sagas;
     private final SagaStepRepository steps;
@@ -157,6 +181,10 @@ public class SagaOrchestrator {
     @Transactional
     public void onReserveRejected(ReserveRejected event, UUID messageId) {
         SagaInstance saga = load(event.transferId());
+        if (saga != null && ReserveRejected.TRANSFER_VOIDED.equals(event.reason())
+                && settleReconciliation(saga, true, messageId, "no hold was ever taken")) {
+            return;
+        }
         if (saga == null || !expect(saga, SagaStatus.STARTED, STEP_RESERVE, messageId)) {
             return;
         }
@@ -179,12 +207,7 @@ public class SagaOrchestrator {
         saga.transitionTo(SagaStatus.CHARGED);
         recordStep(saga, STEP_CHARGE, StepOutcome.SUCCEEDED, messageId, null);
 
-        Transfer transfer = transfers.findById(saga.getTransferId()).orElseThrow();
-        UUID commandId = outbox.append("Transfer", saga.getTransferId(), Topics.ACCOUNT_COMMANDS,
-                CommitFunds.TYPE,
-                new CommitFunds(saga.getTransferId(), saga.getHoldId(),
-                        transfer.getToAccountId()));
-        recordStep(saga, STEP_COMMIT, StepOutcome.STARTED, commandId, null);
+        emitCommit(saga, StepOutcome.STARTED);
     }
 
     /**
@@ -205,17 +228,39 @@ public class SagaOrchestrator {
         emitRelease(saga, ReleaseFunds.GATEWAY_DECLINED, StepOutcome.STARTED);
     }
 
-    /** The hold settled. Terminal COMPLETED. */
+    /**
+     * The hold settled. Terminal COMPLETED.
+     *
+     * <p>Accepted in {@code COMPENSATING} as well as {@code CHARGED} (M7, Fix B). account-service
+     * now answers a release that finds the hold already committed with {@code FundsCommitted} - the
+     * recipient has the money, and no saga state can make that untrue. Finishing COMPENSATED here
+     * would tell the sender "your money came back" about money that went to somebody else. Since
+     * Fix A a saga never compensates after the pivot, so this path should only ever be reached by a
+     * command this orchestrator did not send in its current state; it is logged as the
+     * reconciliation case it is.
+     */
     @Transactional
     public void onFundsCommitted(FundsCommitted event, UUID messageId) {
         SagaInstance saga = load(event.transferId());
-        if (saga == null || !expect(saga, SagaStatus.CHARGED, STEP_COMMIT, messageId)) {
+        if (saga != null && settleReconciliation(saga, false, messageId, null)) {
+            return;
+        }
+        if (saga == null
+                || !expectOneOf(saga, Set.of(SagaStatus.CHARGED, SagaStatus.COMPENSATING),
+                        STEP_COMMIT, messageId)) {
             return;
         }
 
+        String detail = null;
+        if (saga.getStatus() == SagaStatus.COMPENSATING) {
+            log.error("saga {} was COMPENSATING but its hold had been COMMITTED - the recipient has "
+                    + "the money. Finishing COMPLETED; check the PSP side of transfer {}",
+                    saga.getId(), saga.getTransferId());
+            detail = "hold was already committed; the release lost the race";
+        }
         transfers.findById(saga.getTransferId()).ifPresent(Transfer::complete);
         finish(saga, SagaStatus.COMPLETED, null);
-        recordStep(saga, STEP_COMMIT, StepOutcome.SUCCEEDED, messageId, null);
+        recordStep(saga, STEP_COMMIT, StepOutcome.SUCCEEDED, messageId, detail);
     }
 
     /**
@@ -228,13 +273,110 @@ public class SagaOrchestrator {
     @Transactional
     public void onFundsReleased(FundsReleased event, UUID messageId) {
         SagaInstance saga = load(event.transferId());
-        if (saga == null || !expect(saga, SagaStatus.COMPENSATING, STEP_RELEASE, messageId)) {
+        if (saga != null && settleReconciliation(saga, true, messageId,
+                "hold released (" + event.reason() + ")")) {
+            return;
+        }
+        if (saga == null
+                || !expectOneOf(saga,
+                        Set.of(SagaStatus.COMPENSATING, SagaStatus.RESERVED, SagaStatus.CHARGED),
+                        STEP_RELEASE, messageId)) {
             return;
         }
 
+        // M7, Fix B: the release is a fact about the hold, and it may arrive for a saga that never
+        // asked for it - a replayed dead letter, a hand-produced command. The sender HAS their money
+        // back, so the saga ends COMPENSATED. If it had already reached the gateway, the charge must
+        // not stand either, so the PSP-side compensation goes out with it.
+        String detail = event.reason();
+        if (saga.getStatus() != SagaStatus.COMPENSATING) {
+            log.error("saga {} was {} when its hold was RELEASED; compensating the gateway too",
+                    saga.getId(), saga.getStatus());
+            detail = "released while the saga was " + saga.getStatus() + ": " + event.reason();
+            emitVoid(saga, event.reason());
+        }
         failTransfer(saga, event.reason());
         finish(saga, SagaStatus.COMPENSATED, event.reason());
-        recordStep(saga, STEP_RELEASE, StepOutcome.SUCCEEDED, messageId, event.reason());
+        recordStep(saga, STEP_RELEASE, StepOutcome.SUCCEEDED, messageId, detail);
+    }
+
+    /**
+     * The gateway confirms it holds no money for this transfer. Recorded, and nothing more.
+     *
+     * <p>The void is sent by a saga that is already compensating or finished, so there is no state
+     * left for this reply to move. It is handled at all because a participant always answers, and
+     * the timeline should show the answer: "was the charge reversed, or pre-empted, or was there
+     * nothing to reverse?" is the first question about a timed-out payment.
+     */
+    @Transactional
+    public void onChargeVoided(ChargeVoided event, UUID messageId) {
+        SagaInstance saga = load(event.transferId());
+        if (saga == null) {
+            return;
+        }
+        recordStep(saga, STEP_VOID, StepOutcome.SUCCEEDED, messageId, event.outcome());
+    }
+
+    /**
+     * RECONCILIATION: finish a compensation for a transfer that has already ended FAILED or
+     * COMPENSATED, when a participant still holds money the saga's verdict says it should not.
+     *
+     * <h3>Why this exists</h3>
+     *
+     * <p>Before M7's fixes, three routes stranded money after a saga had finished: a STARTED
+     * timeout that sent nothing and then met a late reserve (an ACTIVE hold under a FAILED saga),
+     * and a CHARGED timeout or a replayed dead letter that left the PSP holding a charge for a
+     * transfer we had refunded (an APPROVED charge under a COMPENSATED saga). The fixes stop new
+     * cases; they do not reach back and repair old ones, because a terminal saga is never swept.
+     *
+     * <h3>Why it does not break "an operator moves no money"</h3>
+     *
+     * <p>That rule is about <i>originating</i> a movement - choosing an amount, a source, a
+     * destination. This chooses none of them. It can only be applied to a transfer the system has
+     * already declared did not happen, and it can only send the compensation that verdict already
+     * implies, to the participants the transfer already named, through the same idempotent
+     * commands the sweeper sends. A COMPLETED transfer is refused: there, reversing anything would
+     * be moving money.
+     *
+     * <h3>Why it is sequenced, not two commands at once</h3>
+     *
+     * <p>The orchestrator cannot see holds, so it cannot know whether the hold was released or -
+     * the case this must never get wrong - committed. So it asks account-service first, with a
+     * transfer-addressed {@link ReleaseFunds}, and lets the reply decide:
+     *
+     * <ul>
+     *   <li>{@code FundsReleased} or {@code ReserveRejected(TRANSFER_VOIDED)} - the sender is
+     *       whole, so the PSP must hold nothing either: a {@link VoidCharge} follows.</li>
+     *   <li>{@code FundsCommitted} - the recipient has the money. Voiding the charge would then pay
+     *       the recipient out of our own books. Nothing more is sent; the step is recorded FAILED
+     *       and logged as the human decision it is.</li>
+     * </ul>
+     *
+     * <p>Safe to repeat: every command involved is idempotent at its participant, so a second
+     * request for the same transfer produces the same end state and a second pair of steps.
+     */
+    @Transactional
+    public ReconcileOutcome reconcile(UUID transferId) {
+        Optional<SagaInstance> maybe = sagas.findByTransferIdForUpdate(transferId);
+        if (maybe.isEmpty()) {
+            return ReconcileOutcome.NO_SUCH_TRANSFER;
+        }
+        SagaInstance saga = maybe.get();
+        if (saga.getStatus() == SagaStatus.COMPLETED) {
+            return ReconcileOutcome.COMPLETED;
+        }
+        if (!isFailedOrCompensated(saga)) {
+            return ReconcileOutcome.STILL_IN_FLIGHT;
+        }
+
+        UUID commandId = outbox.append("Transfer", transferId, Topics.ACCOUNT_COMMANDS,
+                ReleaseFunds.TYPE,
+                new ReleaseFunds(transferId, saga.getHoldId(), ReleaseFunds.RECONCILIATION));
+        recordStep(saga, STEP_RECONCILE, StepOutcome.STARTED, commandId,
+                "operator requested; asking account-service where the money is");
+        log.warn("reconciliation requested for {} saga {} (transfer {})",
+                saga.getStatus(), saga.getId(), transferId);
+        return ReconcileOutcome.REQUESTED;
     }
 
     /**
@@ -253,33 +395,61 @@ public class SagaOrchestrator {
 
         switch (saga.getStatus()) {
             case STARTED -> {
-                // The reserve never replied, so there may be no hold at all - a ReleaseFunds here
-                // would name nothing and never be answered.
+                // The reserve never replied - but that does not mean it never happened, or never
+                // will: the command may be in our outbox, in the topic, or in account-service's dead
+                // letter table. So the saga fails AND sends the compensation, addressed by transfer
+                // id because there is no hold id to quote. account-service releases the hold if the
+                // reserve got there first, or remembers the void and refuses the reserve if it
+                // arrives later. Either order ends with the money where the customer is told it is.
                 //
-                // AND THIS CAN BE WRONG, which is worth saying out loud rather than hiding.
-                // account-service may have reserved successfully and had its reply lost, in which
-                // case a hold is now ACTIVE with no live saga to settle it. I3 still balances -
-                // the money is accounted for - but it is stranded. The honest fix is a
-                // reconciliation job that finds holds with no saga, and it is out of scope here.
-                log.warn("saga {} timed out in STARTED; failing it. If the reserve did in fact "
-                        + "succeed, its hold is now orphaned and needs reconciliation.",
-                        saga.getId());
+                // Before M7 this branch sent nothing and said so in a comment - and chaos scenarios
+                // 1, 2 and 3 each stranded money in CLEARING through exactly this gap.
                 failTransfer(saga, ReleaseFunds.SAGA_TIMEOUT);
                 finish(saga, SagaStatus.FAILED, "timed out before the reserve replied");
                 recordStep(saga, STEP_RESERVE, StepOutcome.TIMED_OUT, null,
                         "no reply before the deadline");
+                emitRelease(saga, ReleaseFunds.SAGA_TIMEOUT, StepOutcome.STARTED);
             }
-            case RESERVED, CHARGED -> {
-                // A hold exists and holds a customer's money. Compensate.
+            case RESERVED -> {
+                // Before the pivot: recovery runs backward. The hold is released - and the gateway
+                // is told too, because the ChargeGateway may yet be acted on (it may be sitting in
+                // the gateway's dead letter table, which is chaos scenario 5 part B). The void
+                // leaves a tombstone there if nothing has been charged yet.
                 saga.transitionTo(SagaStatus.COMPENSATING);
+                saga.extendDeadline(deadlineFromNow());
                 recordStep(saga, STEP_CHARGE, StepOutcome.TIMED_OUT, null,
                         "no reply before the deadline");
                 emitRelease(saga, ReleaseFunds.SAGA_TIMEOUT, StepOutcome.STARTED);
+                emitVoid(saga, ReleaseFunds.SAGA_TIMEOUT);
+            }
+            case CHARGED -> {
+                // AFTER THE PIVOT: forward only. The PSP has taken the money; releasing the hold
+                // now would refund the sender out of our own books while the charge stands - which
+                // is exactly what chaos scenario 2 caught this branch doing before M7. The only
+                // correct outcome is the one already decided, so re-send the commit. It is safe to
+                // repeat: account-service answers a commit on a settled hold with FundsCommitted.
+                //
+                // Not capped by maxSweepAttempts (see claimExpired): a forward step that must
+                // eventually succeed has no alternative to give up in favour of. The deadline is
+                // pushed out instead, so a participant that is down for an hour receives one
+                // commit per step-timeout rather than one per sweep. Past the cap it is still
+                // retried, and it becomes an ERROR - that is the alert.
+                saga.extendDeadline(deadlineFromNow());
+                if (saga.getSweepAttempts() > properties.maxSweepAttempts()) {
+                    log.error("saga {} (transfer {}) is CHARGED and has re-sent CommitFunds {} "
+                            + "times; the PSP has the money and account-service is not settling",
+                            saga.getId(), saga.getTransferId(), saga.getSweepAttempts());
+                }
+                emitCommit(saga, StepOutcome.TIMED_OUT);
             }
             case COMPENSATING -> {
                 // A release was already sent and its reply has not come either. Re-emit it: the
-                // participant's inbox absorbs the repeat, and the UNIQUE ledger constraint
-                // absorbs it again if the inbox somehow does not.
+                // participant's inbox absorbs the repeat, and since M7 a release that finds the hold
+                // already settled answers with how it settled. The deadline moves out so the budget
+                // is maxSweepAttempts x step-timeout - long enough to outlast a restart - rather than
+                // maxSweepAttempts x sweep-interval, which chaos scenario 2 spent entirely while the
+                // participant was still booting.
+                saga.extendDeadline(deadlineFromNow());
                 emitRelease(saga, ReleaseFunds.SAGA_TIMEOUT, StepOutcome.TIMED_OUT);
             }
             default -> log.warn("sweeper reached terminal saga {} in {} - claimExpired should "
@@ -333,6 +503,90 @@ public class SagaOrchestrator {
         recordStep(saga, step, StepOutcome.SKIPPED, messageId,
                 "arrived while the saga was " + saga.getStatus());
         return false;
+    }
+
+    /** {@link #expect}, for a reply that more than one state can truthfully receive. */
+    private boolean expectOneOf(SagaInstance saga, Set<SagaStatus> allowed, String step,
+                                UUID messageId) {
+        if (allowed.contains(saga.getStatus())) {
+            return true;
+        }
+        log.info("saga {} is {} but the reply expected one of {}; skipping",
+                saga.getId(), saga.getStatus(), allowed);
+        recordStep(saga, step, StepOutcome.SKIPPED, messageId,
+                "arrived while the saga was " + saga.getStatus());
+        return false;
+    }
+
+    /**
+     * Handles account-service's answer to a reconciliation's release, if one is outstanding.
+     * Returns {@code false} - touching nothing - when this reply is not that answer, so the
+     * caller's ordinary handling runs.
+     *
+     * <p>"Outstanding" is counted from the steps rather than stored in a column: a reconcile
+     * STARTED row with no SUCCEEDED/FAILED row to match it. Counting rather than ordering, because
+     * the request and its reply can be written in the same microsecond.
+     *
+     * @param senderWhole true when the reply proves the sender has their money (released, or never
+     *                    reserved); false when it proves the recipient does
+     */
+    private boolean settleReconciliation(SagaInstance saga, boolean senderWhole, UUID messageId,
+                                         String detail) {
+        if (!isFailedOrCompensated(saga)) {
+            return false;
+        }
+        long asked = steps.countBySagaIdAndStepNameAndOutcome(saga.getId(), STEP_RECONCILE,
+                StepOutcome.STARTED);
+        long answered = steps.countBySagaIdAndStepNameAndOutcome(saga.getId(), STEP_RECONCILE,
+                StepOutcome.SUCCEEDED)
+                + steps.countBySagaIdAndStepNameAndOutcome(saga.getId(), STEP_RECONCILE,
+                StepOutcome.FAILED);
+        if (asked <= answered) {
+            return false;
+        }
+
+        if (senderWhole) {
+            emitVoid(saga, ReleaseFunds.RECONCILIATION);
+            recordStep(saga, STEP_RECONCILE, StepOutcome.SUCCEEDED, messageId,
+                    detail + "; sender is whole, gateway told to void");
+        } else {
+            log.error("reconciling {} saga {} (transfer {}) found its hold COMMITTED - the "
+                    + "recipient has the money. The PSP charge is left standing; this transfer "
+                    + "needs a person, not a compensation", saga.getStatus(), saga.getId(),
+                    saga.getTransferId());
+            recordStep(saga, STEP_RECONCILE, StepOutcome.FAILED, messageId,
+                    "hold was COMMITTED: recipient has the money; charge NOT voided");
+        }
+        return true;
+    }
+
+    private static boolean isFailedOrCompensated(SagaInstance saga) {
+        return saga.getStatus() == SagaStatus.FAILED
+                || saga.getStatus() == SagaStatus.COMPENSATED;
+    }
+
+    private void emitCommit(SagaInstance saga, StepOutcome outcome) {
+        Transfer transfer = transfers.findById(saga.getTransferId()).orElseThrow();
+        UUID commandId = outbox.append("Transfer", saga.getTransferId(), Topics.ACCOUNT_COMMANDS,
+                CommitFunds.TYPE,
+                new CommitFunds(saga.getTransferId(), saga.getHoldId(),
+                        transfer.getToAccountId()));
+        recordStep(saga, STEP_COMMIT, outcome, commandId,
+                outcome == StepOutcome.TIMED_OUT ? "no reply before the deadline; re-sent" : null);
+    }
+
+    /**
+     * The gateway-side compensation. Sent whenever a saga gives up after ChargeGateway may have
+     * gone out, whether or not the charge happened - the gateway reverses it, or leaves a tombstone
+     * that refuses it later.
+     */
+    private void emitVoid(SagaInstance saga, String reason) {
+        Transfer transfer = transfers.findById(saga.getTransferId()).orElseThrow();
+        UUID commandId = outbox.append("Transfer", saga.getTransferId(), Topics.GATEWAY_COMMANDS,
+                VoidCharge.TYPE,
+                new VoidCharge(saga.getTransferId(), transfer.getAmountMinor(),
+                        transfer.getCurrency(), reason));
+        recordStep(saga, STEP_VOID, StepOutcome.STARTED, commandId, reason);
     }
 
     private void emitRelease(SagaInstance saga, String reason, StepOutcome outcome) {

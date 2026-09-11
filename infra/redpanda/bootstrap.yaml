@@ -1,0 +1,32 @@
+# Redpanda CLUSTER properties, applied once, when the cluster is first created.
+#
+# Mounted at /etc/redpanda/.bootstrap.yaml. It exists because the obvious route does not work:
+# `--set redpanda.<cluster property>=...` on the command line writes the value into the NODE config,
+# and Redpanda logs "Unknown property ..." followed by "Ignoring value for '...' in redpanda.yaml:
+# use `rpk cluster config edit`" and carries on with its default. Nothing fails; the setting simply
+# never happened. Found at M7 while checking why the broker acknowledged writes before fsync.
+#
+# First creation ONLY - and recreating the container is not a new cluster. The image declares
+# /var/lib/redpanda/data as an anonymous VOLUME, and Compose carries anonymous volumes over when it
+# recreates a container, so the controller log (and every topic and consumer offset) survives a
+# `docker compose up` that changes this service. A new cluster is `docker compose down -v`, or
+# `up -d --renew-anon-volumes redpanda`. On a cluster that already exists, set a value live - it is
+# stored in the controller log and survives restarts:
+#   docker exec dpe-redpanda rpk cluster config set write_caching_default false
+# Assumed otherwise for about ten minutes at M7; the startup log's "Current log offsets: start_offset:60"
+# on the controller group is what gave it away.
+#
+# Verify after a fresh start:
+#   docker exec dpe-redpanda rpk cluster config get write_caching_default    -> false
+#   docker exec dpe-redpanda rpk cluster config get auto_create_topics_enabled -> false
+
+# The image starts in developer mode, whose default for this is "true": a produce with acks=all is
+# acknowledged BEFORE the data is fsynced, so on a single node an acknowledged message does not
+# survive a SIGKILL of the broker. The outbox relay marks a row published on exactly that
+# acknowledgement - so with caching on, the chaos suite's broker-kill scenario was testing a weaker
+# broker than the design assumes.
+write_caching_default: "false"
+
+# A topic is a declared artifact, never something the first client to ask for it brings into
+# existence. Already Redpanda's default; stated so it is a decision rather than an accident.
+auto_create_topics_enabled: false

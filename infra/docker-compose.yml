@@ -117,12 +117,14 @@ services:
       - --overprovisioned
       - --node-id=0
       - --check=false
-      # A topic is a declared artifact, never something the first client to ask for it brings
-      # into existence. With auto-creation on, whichever service connects first silently
-      # defines the topic's shape - and a consumer that wins that race creates it with ONE
-      # partition, is assigned only that partition, and then never sees the messages the
-      # producer keys onto the other two. Off, an undeclared topic is an error someone can see.
-      - --set redpanda.auto_create_topics_enabled=false
+      # Cluster properties - auto-creation off, write caching off - are NOT set here. A
+      # `--set redpanda.<cluster property>` on this line lands in the node config, where Redpanda
+      # logs "Ignoring value ... use `rpk cluster config edit`" and keeps its default: the flag
+      # that sat here from M0 disabling auto-creation never did anything (M7). They live in
+      # redpanda/bootstrap.yaml, read when the cluster is FIRST created - which a recreate of this
+      # container is not, since the image's anonymous data volume is carried over. See that file.
+    volumes:
+      - ./redpanda/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
     ports:
       # Host-facing listener only. Services inside the network use redpanda:9092.
       - "19092:19092"

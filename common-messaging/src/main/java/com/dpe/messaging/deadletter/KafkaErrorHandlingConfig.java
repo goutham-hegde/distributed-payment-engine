@@ -125,6 +125,16 @@ public class KafkaErrorHandlingConfig {
         // from a genuinely bad payload - has no answer.
         handler.setLogLevel(org.springframework.kafka.KafkaException.Level.WARN);
 
+        // M7: commit the offset of a record once it has been dead-lettered. Under
+        // ack-mode manual_immediate the container commits only when the LISTENER acknowledges, and
+        // a record that failed never reached ack.acknowledge() - so without this its offset stayed
+        // uncommitted after it was safely in the dead letter topic. The consumer moved past it in
+        // memory, which hid the problem: chaos scenario 5 part B showed it as lag that never fell
+        // with nothing in flight, and a restart in that window redelivers every dead letter as if
+        // it were new - on top of any replay the operator is about to do. Recovery succeeding IS
+        // the record being handled; this makes the offset say so.
+        handler.setCommitRecovered(true);
+
         return handler;
     }
 

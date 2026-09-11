@@ -17,5 +17,13 @@ package com.dpe.gateway.domain;
 public enum ChargeStatus {
     APPROVED,
     DECLINED,
-    FAILED
+    FAILED,
+
+    /**
+     * M7: the saga compensated, so the PSP holds nothing for this transfer. Either an approved
+     * charge that was reversed, or a tombstone written before any charge was attempted - which
+     * one is told by whether a {@code GatewayApproved} was ever published for it. Terminal, and
+     * a ChargeGateway that finds it is answered with a decline.
+     */
+    VOIDED
 }

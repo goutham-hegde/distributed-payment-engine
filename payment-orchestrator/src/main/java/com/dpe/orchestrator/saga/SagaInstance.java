@@ -50,6 +50,13 @@ public class SagaInstance {
      * deadline would be more precise but needs resetting on every transition, and a missed reset
      * produces a saga that can never time out - the exact failure the deadline exists to prevent.
      * One deadline for the whole saga fails safe.
+     *
+     * <p>M7: the SWEEPER moves it, and nothing else does. Once a saga has timed out, each re-sent
+     * command ({@code CommitFunds} after the pivot, {@code ReleaseFunds} while compensating) pushes
+     * the deadline one step-timeout out, which turns the retry budget from "attempts x sweep
+     * interval" - twenty seconds, spent entirely while a participant was restarting in chaos
+     * scenario 2 - into "attempts x step-timeout". A forward transition still never resets it, so
+     * the fail-safe property above is unchanged.
      */
     @Column(name = "deadline_at", nullable = false)
     private OffsetDateTime deadlineAt;
@@ -125,6 +132,11 @@ public class SagaInstance {
         if (this.timedOutAt == null) {
             this.timedOutAt = OffsetDateTime.now();
         }
+    }
+
+    /** Pushes the deadline out after a re-sent command. Only the sweeper calls this. */
+    public void extendDeadline(OffsetDateTime newDeadline) {
+        this.deadlineAt = newDeadline;
     }
 
     public void setHoldId(UUID holdId) {

@@ -2,11 +2,15 @@ package com.dpe.account.saga;
 
 import com.dpe.account.domain.Account;
 import com.dpe.account.domain.AccountType;
+import com.dpe.account.domain.EntryType;
 import com.dpe.account.domain.Hold;
+import com.dpe.account.domain.HoldStatus;
 import com.dpe.account.domain.LedgerEntry;
+import com.dpe.account.domain.TransferVoid;
 import com.dpe.account.repository.AccountRepository;
 import com.dpe.account.repository.HoldRepository;
 import com.dpe.account.repository.LedgerEntryRepository;
+import com.dpe.account.repository.TransferVoidRepository;
 import com.dpe.events.CommitFunds;
 import com.dpe.events.FundsCommitted;
 import com.dpe.events.FundsReleased;
@@ -75,6 +79,18 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>A technical failure - the database is down, a row is deadlocked - is the opposite case and
  * <i>should</i> propagate, because a retry genuinely might succeed. Nothing in this file catches
  * those.
+ *
+ * <h2>Two rules added by the M7 chaos suite</h2>
+ *
+ * <p><b>Every command is answered with the truth.</b> A commit or release that finds its hold
+ * already settled replies with the event describing how it settled, rather than logging and
+ * returning. A saga that gets no reply can only learn from its deadline.
+ *
+ * <p><b>A compensation commutes with the reserve it undoes.</b> Commands are addressed by transfer
+ * id, and a release that finds no hold records a tombstone ({@link TransferVoid}) that refuses the
+ * reserve if it arrives later. Every method takes the per-transfer lock
+ * ({@link TransferVoidRepository#lockTransfer}) before any other, so the check-then-write on each
+ * side cannot interleave with the other.
  */
 @Service
 public class ReservationService {
@@ -84,13 +100,16 @@ public class ReservationService {
     private final AccountRepository accounts;
     private final LedgerEntryRepository ledgerEntries;
     private final HoldRepository holds;
+    private final TransferVoidRepository voids;
     private final OutboxWriter outbox;
 
     public ReservationService(AccountRepository accounts, LedgerEntryRepository ledgerEntries,
-                              HoldRepository holds, OutboxWriter outbox) {
+                              HoldRepository holds, TransferVoidRepository voids,
+                              OutboxWriter outbox) {
         this.accounts = accounts;
         this.ledgerEntries = ledgerEntries;
         this.holds = holds;
+        this.voids = voids;
         this.outbox = outbox;
     }
 
@@ -103,6 +122,17 @@ public class ReservationService {
      */
     @Transactional
     public void reserve(ReserveFunds command) {
+        // M7, Fix C. Serialize with any compensation for this transfer, then honour one that got
+        // here first. This is the half of the tombstone that makes a late reserve harmless: the
+        // saga has already told the customer "failed", so the only correct amount to reserve now
+        // is nothing - and the refusal is still a reply, so the saga hears the truth.
+        voids.lockTransfer(command.transferId());
+        if (voids.existsById(command.transferId())) {
+            reject(command, ReserveRejected.TRANSFER_VOIDED,
+                    "the saga gave up on this transfer before the reserve arrived");
+            return;
+        }
+
         if (command.amountMinor() <= 0) {
             reject(command, ReserveRejected.INVALID_TRANSFER, "amount must be positive");
             return;
@@ -224,27 +254,30 @@ public class ReservationService {
      */
     @Transactional
     public void commit(CommitFunds command) {
-        Optional<Hold> maybeHold = holds.findByIdForUpdate(command.holdId());
-        if (maybeHold.isEmpty()) {
-            // The orchestrator is quoting an id from another database, or from a wiped one.
-            // Logged and dropped rather than thrown: creating a hold here would invent money,
-            // and retrying forever will not make the row appear.
-            log.error("CommitFunds names hold {} which does not exist (transfer {})",
-                    command.holdId(), command.transferId());
+        voids.lockTransfer(command.transferId());
+        Optional<Hold> maybeHold = holds.findByTransferIdForUpdate(command.transferId());
+        if (maybeHold.isEmpty() || !maybeHold.get().getId().equals(command.holdId())) {
+            // The orchestrator is quoting an id from another database, or from a wiped one. A
+            // saga only sends CommitFunds from CHARGED, which it reaches only after this service
+            // replied FundsReserved - so no saga is waiting on an answer to this, and there is no
+            // true answer to give. Logged and dropped rather than thrown: creating a hold here
+            // would invent money, and retrying forever will not make the row appear.
+            log.error("CommitFunds names hold {} which is not transfer {}'s hold ({})",
+                    command.holdId(), command.transferId(),
+                    maybeHold.map(h -> h.getId().toString()).orElse("none"));
             return;
         }
         Hold hold = maybeHold.get();
 
         if (!hold.isActive()) {
-            // The race that actually happens: the sweeper compensated a saga whose approval was
-            // merely slow, and the commit arrived afterwards.
+            // A second copy of a commit the saga re-sent because it had not heard the first
+            // reply (M7, Fix A), or a commit that lost a race to a release.
             //
-            // Deliberately NOT thrown. Throwing would roll back the inbox row and redeliver a
-            // command that can never succeed, forever. The money is safe either way - the UNIQUE
-            // constraint on (transfer_id, clearing, DEBIT) already made the double settlement
-            // impossible - so the only thing left to choose is whether this is loud or infinite.
-            log.error("CommitFunds for hold {} ignored: already {} (transfer {})",
-                    hold.getId(), hold.getStatus(), command.transferId());
+            // Not thrown - throwing would roll back the inbox row and redeliver a command that
+            // can never succeed, forever. And, since M7, not silent either: chaos scenario 2 showed
+            // a saga that got no reply can only learn from its deadline, which had already passed.
+            // The third option is the truth - answer with what actually happened to the hold.
+            answerWithWhatHappened(hold, CommitFunds.TYPE, null);
             return;
         }
 
@@ -290,19 +323,43 @@ public class ReservationService {
      */
     @Transactional
     public void release(ReleaseFunds command) {
-        Optional<Hold> maybeHold = holds.findByIdForUpdate(command.holdId());
+        // Addressed by TRANSFER id (M7). A saga that timed out in STARTED never heard which hold
+        // it got, or whether it got one - so it names the transfer and leaves holdId null.
+        voids.lockTransfer(command.transferId());
+        Optional<Hold> maybeHold = holds.findByTransferIdForUpdate(command.transferId());
         if (maybeHold.isEmpty()) {
-            log.error("ReleaseFunds names hold {} which does not exist (transfer {})",
-                    command.holdId(), command.transferId());
+            // Fix C, the other half of the tombstone. Nothing has been reserved for this transfer
+            // YET - the ReserveFunds may still be in the orchestrator's outbox, in the topic, or in
+            // this service's dead letter table. Remember the void so that the reserve, whenever it
+            // lands, is refused; then answer. "Nothing was reserved, and nothing will be" is
+            // precisely what ReserveRejected means, so it is the reply rather than a new type.
+            if (!voids.existsById(command.transferId())) {
+                voids.save(new TransferVoid(command.transferId(), command.reason()));
+            }
+            log.info("ReleaseFunds for transfer {} arrived before any reserve; transfer voided",
+                    command.transferId());
+            outbox.append("Transfer", command.transferId(), Topics.ACCOUNT_EVENTS,
+                    ReserveRejected.TYPE,
+                    new ReserveRejected(command.transferId(), null,
+                            ReserveRejected.TRANSFER_VOIDED,
+                            "released before any reserve; nothing will be reserved for it"));
             return;
         }
         Hold hold = maybeHold.get();
+        if (command.holdId() != null && !command.holdId().equals(hold.getId())) {
+            // The transfer id is the address; a disagreeing hold id means the sender's state is
+            // corrupt, not that the money should stay put. Release what the transfer holds.
+            log.error("ReleaseFunds for transfer {} quotes hold {} but the transfer's hold is {}; "
+                    + "releasing by transfer id", command.transferId(), command.holdId(),
+                    hold.getId());
+        }
 
         if (!hold.isActive()) {
-            // Either a redelivered release, or a release that lost the race to a commit. Same
-            // reasoning as in commit(): loud, not infinite.
-            log.warn("ReleaseFunds for hold {} ignored: already {} (transfer {})",
-                    hold.getId(), hold.getStatus(), command.transferId());
+            // A redelivered or re-sent release, or one that lost the race to a commit. Not
+            // thrown, for the reason in commit(); answered, for the reason in commit(). If the hold
+            // was COMMITTED the answer is FundsCommitted: the recipient has the money, and a saga
+            // that believed it was compensating needs to learn that.
+            answerWithWhatHappened(hold, ReleaseFunds.TYPE, command.reason());
             return;
         }
 
@@ -324,7 +381,7 @@ public class ReservationService {
         clearing.applyDelta(-amount);
         sender.applyDelta(amount);
 
-        hold.release();
+        hold.release(command.reason());
 
         outbox.append("Transfer", hold.getTransferId(), Topics.ACCOUNT_EVENTS,
                 FundsReleased.TYPE,
@@ -333,6 +390,48 @@ public class ReservationService {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /**
+     * M7, Fix B: replies to a command about a hold that has already settled, with the event that
+     * describes how it settled - whichever command was asked.
+     *
+     * <p>The reply is a statement of fact about the hold, not an acknowledgement of the command, so
+     * a CommitFunds that finds a RELEASED hold is answered FundsReleased and vice versa. The saga
+     * decides what that means for it; this service only refuses to leave it guessing.
+     *
+     * @param fallbackReason used for a hold released before V7 recorded the reason on the row
+     */
+    private void answerWithWhatHappened(Hold hold, String asked, String fallbackReason) {
+        log.warn("{} for transfer {}: hold {} is already {}; replying with that outcome",
+                asked, hold.getTransferId(), hold.getId(), hold.getStatus());
+
+        if (hold.getStatus() == HoldStatus.COMMITTED) {
+            outbox.append("Transfer", hold.getTransferId(), Topics.ACCOUNT_EVENTS,
+                    FundsCommitted.TYPE,
+                    new FundsCommitted(hold.getTransferId(), hold.getId(),
+                            recipientOf(hold), hold.getAmountMinor(), hold.getCurrency()));
+        } else {
+            String reason = hold.getReleaseReason() != null ? hold.getReleaseReason()
+                    : fallbackReason;
+            outbox.append("Transfer", hold.getTransferId(), Topics.ACCOUNT_EVENTS,
+                    FundsReleased.TYPE,
+                    new FundsReleased(hold.getTransferId(), hold.getId(), hold.getAccountId(),
+                            hold.getAmountMinor(), hold.getCurrency(), reason));
+        }
+    }
+
+    /**
+     * Who a committed hold paid. The hold does not record it - the commit's CREDIT leg does, and
+     * it is the only CREDIT for the transfer that did not go to CLEARING.
+     */
+    private UUID recipientOf(Hold hold) {
+        return ledgerEntries.findByTransferIdOrderByIdAsc(hold.getTransferId()).stream()
+                .filter(e -> e.getEntryType() == EntryType.CREDIT)
+                .map(LedgerEntry::getAccountId)
+                .filter(id -> !id.equals(AccountType.CLEARING_ACCOUNT_ID))
+                .findFirst()
+                .orElse(null);
+    }
 
     /**
      * Writes the rejection reply and nothing else. The caller returns immediately afterwards, so

@@ -3,6 +3,7 @@ package com.dpe.gateway.saga;
 import com.dpe.events.ChargeGateway;
 import com.dpe.events.EventEnvelope;
 import com.dpe.events.Topics;
+import com.dpe.events.VoidCharge;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -29,6 +30,9 @@ public class GatewayCommandConsumer {
     private static final TypeReference<EventEnvelope<ChargeGateway>> CHARGE_GATEWAY =
             new TypeReference<>() {
             };
+    private static final TypeReference<EventEnvelope<VoidCharge>> VOID_CHARGE =
+            new TypeReference<>() {
+            };
 
     private final GatewayCommandHandler handler;
     private final ObjectMapper objectMapper;
@@ -53,19 +57,23 @@ public class GatewayCommandConsumer {
         }
         UUID messageId = UUID.fromString(rawMessageId);
 
-        if (!ChargeGateway.TYPE.equals(eventType)) {
+        Object command = switch (eventType == null ? "" : eventType) {
+            case ChargeGateway.TYPE -> objectMapper.readValue(record.value(), CHARGE_GATEWAY).payload();
+            case VoidCharge.TYPE    -> objectMapper.readValue(record.value(), VOID_CHARGE).payload();
+            default -> null;
+        };
+
+        if (command == null) {
             log.warn("ignoring unknown command type '{}' (message {})", eventType, messageId);
             handler.skip(messageId, record.topic(), String.valueOf(eventType));
             ack.acknowledge();
             return;
         }
 
-        ChargeGateway command = objectMapper.readValue(record.value(), CHARGE_GATEWAY).payload();
-
-        boolean applied = handler.handle(messageId, record.topic(), command);
+        boolean applied = handler.handle(messageId, record.topic(), eventType, command);
         ack.acknowledge();
 
-        log.debug("charge command {} {}", messageId, applied ? "applied" : "skipped as duplicate");
+        log.debug("command {} ({}) {}", messageId, eventType, applied ? "applied" : "skipped as duplicate");
     }
 
     private static String header(ConsumerRecord<String, String> record, String name) {

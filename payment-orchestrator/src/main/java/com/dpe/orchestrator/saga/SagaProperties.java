@@ -27,10 +27,14 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *                         dead letter handling is where it gets a home.
  * @param sweepBatchSize   sagas claimed per sweep. Bounded for the same reason the outbox batch
  *                         is: the claim transaction stays open across the whole batch.
+ * @param listenGrace      M7: how long the reply listener must have held its partitions before
+ *                         the sweeper may time anything out - time to drain replies that queued up
+ *                         while this instance could not hear them. See
+ *                         {@link ReplyListenerReadiness}.
  */
 @ConfigurationProperties(prefix = "dpe.saga")
 public record SagaProperties(Duration stepTimeout, Duration sweepInterval, int maxSweepAttempts,
-                             int sweepBatchSize) {
+                             int sweepBatchSize, Duration listenGrace) {
 
     public SagaProperties {
         // Defaults live here as well as in application.yml so a test booting a bare context still
@@ -46,6 +50,9 @@ public record SagaProperties(Duration stepTimeout, Duration sweepInterval, int m
         }
         if (sweepBatchSize <= 0) {
             sweepBatchSize = 100;
+        }
+        if (listenGrace == null) {
+            listenGrace = Duration.ofSeconds(10);
         }
     }
 }

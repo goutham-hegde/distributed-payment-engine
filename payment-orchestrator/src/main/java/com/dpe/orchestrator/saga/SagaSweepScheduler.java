@@ -19,6 +19,11 @@ import org.springframework.stereotype.Component;
  * run with no transaction - the claim's {@code FOR UPDATE} locks would be released the instant
  * the query returned, and two orchestrator instances would compensate the same saga. Here the
  * scheduler holds the sweeper's proxy, so the boundary is real.
+ *
+ * <p><b>M7: it does not sweep while this service is deaf.</b> Each tick first asks
+ * {@link ReplyListenerReadiness} whether the reply listener holds partitions and has held them
+ * long enough to drain its backlog. The gate lives here, on the clock, rather than in
+ * {@link SagaTimeoutSweeper#sweep()}, so a test can still drive the sweeper directly.
  */
 @Component
 @ConditionalOnProperty(prefix = "dpe.saga", name = "scheduled", havingValue = "true",
@@ -28,19 +33,39 @@ public class SagaSweepScheduler {
     private static final Logger log = LoggerFactory.getLogger(SagaSweepScheduler.class);
 
     private final SagaTimeoutSweeper sweeper;
+    private final ReplyListenerReadiness readiness;
 
-    public SagaSweepScheduler(SagaTimeoutSweeper sweeper) {
+    /** Last gate decision, so the log records each change rather than every tick. */
+    private volatile boolean wasHearing = true;
+
+    public SagaSweepScheduler(SagaTimeoutSweeper sweeper, ReplyListenerReadiness readiness) {
         this.sweeper = sweeper;
+        this.readiness = readiness;
     }
 
     @Scheduled(fixedDelayString = "${dpe.saga.sweep-interval:5s}")
     public void poll() {
+        boolean hearing = readiness.canHear();
+        if (hearing != wasHearing) {
+            // WARN on the way down: a sweeper that is holding off is a saga deadline that is not
+            // being enforced, and that is worth seeing in the log of an incident.
+            if (hearing) {
+                log.info("reply listener is assigned and past its grace period; sweeping resumes");
+            } else {
+                log.warn("reply listener holds no partitions (or only just got them); "
+                        + "saga timeouts paused until this instance can hear replies");
+            }
+            wasHearing = hearing;
+        }
+        if (!hearing) {
+            return;
+        }
         try {
             int swept = sweeper.sweep();
             if (swept > 0) {
                 // INFO, not DEBUG. Every row here is a transfer that failed to complete on its
                 // own, so a rising count is a genuine incident signal rather than noise.
-                log.info("saga sweeper compensated {} stalled saga(s)", swept);
+                log.info("saga sweeper acted on {} stalled saga(s)", swept);
             }
         } catch (RuntimeException e) {
             // A fixedDelay method that throws keeps its schedule, but the framework logs it at a

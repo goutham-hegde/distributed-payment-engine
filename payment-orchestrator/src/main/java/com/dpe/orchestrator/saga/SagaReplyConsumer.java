@@ -1,6 +1,7 @@
 package com.dpe.orchestrator.saga;
 
 import com.dpe.events.AccountOpened;
+import com.dpe.events.ChargeVoided;
 import com.dpe.events.EventEnvelope;
 import com.dpe.events.FundsCommitted;
 import com.dpe.events.FundsReleased;
@@ -64,6 +65,18 @@ import tools.jackson.databind.ObjectMapper;
 @Component
 public class SagaReplyConsumer {
 
+    /**
+     * The listener's id in the endpoint registry, so {@link ReplyListenerReadiness} can ask whether
+     * this service can currently hear replies (M7, Fix E).
+     *
+     * <p>{@code idIsGroup = false} on the annotation is NOT optional. By default Spring Kafka uses a
+     * listener's {@code id} as its {@code group.id}, overriding {@code spring.kafka.consumer.group-id}
+     * - so naming the listener would silently move this service to a brand-new consumer group,
+     * which starts from {@code earliest} and re-reads every reply ever sent. The inbox would absorb
+     * it, which is exactly why nothing would fail loudly.
+     */
+    public static final String LISTENER_ID = "saga-replies";
+
     private static final Logger log = LoggerFactory.getLogger(SagaReplyConsumer.class);
 
     private static final TypeReference<EventEnvelope<FundsReserved>> FUNDS_RESERVED =
@@ -82,6 +95,9 @@ public class SagaReplyConsumer {
             new TypeReference<>() {
             };
     private static final TypeReference<EventEnvelope<FundsReleased>> FUNDS_RELEASED =
+            new TypeReference<>() {
+            };
+    private static final TypeReference<EventEnvelope<ChargeVoided>> CHARGE_VOIDED =
             new TypeReference<>() {
             };
     private static final TypeReference<EventEnvelope<FundsTransferred>> FUNDS_TRANSFERRED =
@@ -104,7 +120,8 @@ public class SagaReplyConsumer {
         this.objectMapper = objectMapper;
     }
 
-    @KafkaListener(topics = {Topics.ACCOUNT_EVENTS, Topics.GATEWAY_EVENTS})
+    @KafkaListener(id = LISTENER_ID, idIsGroup = false,
+            topics = {Topics.ACCOUNT_EVENTS, Topics.GATEWAY_EVENTS})
     public void onReply(ConsumerRecord<String, String> record, Acknowledgment ack) {
 
         String eventType = header(record, EventEnvelope.EVENT_TYPE_HEADER);
@@ -152,6 +169,7 @@ public class SagaReplyConsumer {
             case GatewayDeclined.TYPE -> objectMapper.readValue(record.value(), GATEWAY_DECLINED).payload();
             case FundsCommitted.TYPE  -> objectMapper.readValue(record.value(), FUNDS_COMMITTED).payload();
             case FundsReleased.TYPE   -> objectMapper.readValue(record.value(), FUNDS_RELEASED).payload();
+            case ChargeVoided.TYPE    -> objectMapper.readValue(record.value(), CHARGE_VOIDED).payload();
             default -> null;
         };
 

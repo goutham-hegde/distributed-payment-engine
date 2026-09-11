@@ -4,9 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.dpe.events.ChargeGateway;
+import com.dpe.events.ChargeVoided;
 import com.dpe.events.GatewayApproved;
 import com.dpe.events.GatewayDeclined;
 import com.dpe.events.Topics;
+import com.dpe.events.VoidCharge;
 import com.dpe.gateway.saga.GatewayCommandHandler;
 import com.dpe.gateway.service.ChargeService;
 import com.dpe.gateway.service.GatewayTimeoutException;
@@ -108,7 +110,7 @@ class ChargeServiceTest extends AbstractPostgresIT {
         UUID transferId = UUID.randomUUID();
         UUID messageId = UUID.randomUUID();
 
-        assertThatThrownBy(() -> handler.handle(messageId, Topics.GATEWAY_COMMANDS,
+        assertThatThrownBy(() -> handler.handle(messageId, Topics.GATEWAY_COMMANDS, ChargeGateway.TYPE,
                 new ChargeGateway(transferId, UUID.randomUUID(), 30_000L, INR)))
                 .isInstanceOf(GatewayTimeoutException.class);
 
@@ -128,8 +130,8 @@ class ChargeServiceTest extends AbstractPostgresIT {
         UUID messageId = UUID.randomUUID();
         ChargeGateway command = new ChargeGateway(transferId, UUID.randomUUID(), 30_000L, INR);
 
-        assertThat(handler.handle(messageId, Topics.GATEWAY_COMMANDS, command)).isTrue();
-        assertThat(handler.handle(messageId, Topics.GATEWAY_COMMANDS, command))
+        assertThat(handler.handle(messageId, Topics.GATEWAY_COMMANDS, ChargeGateway.TYPE, command)).isTrue();
+        assertThat(handler.handle(messageId, Topics.GATEWAY_COMMANDS, ChargeGateway.TYPE, command))
                 .as("a duplicate is a normal event in an at-least-once system, not an error")
                 .isFalse();
 
@@ -155,7 +157,70 @@ class ChargeServiceTest extends AbstractPostgresIT {
                 .isEqualTo(2);
     }
 
+    // ------------------------------------------------------------------ M7: the void
+
+    @Test
+    @DisplayName("a void reverses an approved charge, and says so")
+    void voidReversesAnApprovedCharge() {
+        UUID transferId = UUID.randomUUID();
+        chargeIt(transferId);
+
+        voidIt(transferId);
+
+        assertThat(chargeStatus(transferId)).isEqualTo("VOIDED");
+        assertThat(outboxField(transferId, ChargeVoided.TYPE, "outcome"))
+                .isEqualTo(ChargeVoided.REVERSED);
+    }
+
+    @Test
+    @DisplayName("a void that arrives BEFORE the charge makes the charge impossible - it commutes")
+    void voidBeforeChargeLeavesATombstone() {
+        UUID transferId = UUID.randomUUID();
+
+        voidIt(transferId);
+        // The late charge: replayed from the dead letter table after the saga compensated. This is
+        // chaos scenario 5 part B, which before M7 charged ten already-refunded customers.
+        chargeIt(transferId);
+
+        assertThat(chargeCount(transferId)).isEqualTo(1);
+        assertThat(chargeStatus(transferId))
+                .as("the tombstone, not an approval - applying the void first and the charge "
+                        + "second must end where the other order ends")
+                .isEqualTo("VOIDED");
+        assertThat(outboxCount(transferId, GatewayApproved.TYPE)).isZero();
+        assertThat(outboxField(transferId, ChargeVoided.TYPE, "outcome"))
+                .isEqualTo(ChargeVoided.PRE_EMPTED);
+        assertThat(outboxField(transferId, GatewayDeclined.TYPE, "reason"))
+                .as("and the late charge is still answered - a participant never goes silent")
+                .isEqualTo("voided");
+    }
+
+    @Test
+    @DisplayName("a void of a declined charge, or a second void, changes nothing and still answers")
+    void voidIsIdempotent() {
+        UUID transferId = UUID.randomUUID();
+        simulation.setFailureRate(1.0);
+        chargeIt(transferId);
+
+        voidIt(transferId);
+        voidIt(transferId);
+
+        assertThat(chargeStatus(transferId)).isEqualTo("DECLINED");
+        assertThat(outboxCount(transferId, ChargeVoided.TYPE)).isEqualTo(2);
+    }
+
     // ------------------------------------------------------------------ helpers
+
+    /** Through the handler, so each command gets the transaction a real delivery gets. */
+    private void chargeIt(UUID transferId) {
+        handler.handle(UUID.randomUUID(), Topics.GATEWAY_COMMANDS, ChargeGateway.TYPE,
+                new ChargeGateway(transferId, UUID.randomUUID(), 30_000L, INR));
+    }
+
+    private void voidIt(UUID transferId) {
+        handler.handle(UUID.randomUUID(), Topics.GATEWAY_COMMANDS, VoidCharge.TYPE,
+                new VoidCharge(transferId, 30_000L, INR, "SAGA_TIMEOUT"));
+    }
 
     private String chargeStatus(UUID transferId) {
         return jdbc.queryForObject(

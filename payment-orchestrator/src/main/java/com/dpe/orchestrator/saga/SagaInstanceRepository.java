@@ -48,12 +48,19 @@ public interface SagaInstanceRepository extends JpaRepository<SagaInstance, UUID
      * because SQL cannot call Java. It must match the partial index
      * {@code idx_saga_instances_in_flight} exactly, or the planner ignores the index and the
      * sweep degrades to a sequential scan over every saga ever run.
+     *
+     * <p>M7: {@code CHARGED} is exempt from the attempt cap. The cap exists so a saga that can
+     * never be compensated is not swept forever - but past the pivot the saga is not compensating,
+     * it is re-sending a commit that must eventually land, and there is nothing to give up in
+     * favour of. Stopping would leave the PSP holding the money and the hold never settled. The
+     * extra predicate is on a column the partial index does not cover, so it is a filter over the
+     * in-flight set, exactly like the attempt cap already was.
      */
     @Query(value = """
             SELECT * FROM saga_instances
             WHERE status NOT IN ('COMPLETED', 'COMPENSATED', 'FAILED')
               AND deadline_at < :now
-              AND sweep_attempts < :maxAttempts
+              AND (sweep_attempts < :maxAttempts OR status = 'CHARGED')
             ORDER BY deadline_at
             LIMIT :batchSize
             FOR UPDATE SKIP LOCKED

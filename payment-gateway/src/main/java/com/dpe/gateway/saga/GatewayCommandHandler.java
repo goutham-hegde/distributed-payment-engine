@@ -1,6 +1,7 @@
 package com.dpe.gateway.saga;
 
 import com.dpe.events.ChargeGateway;
+import com.dpe.events.VoidCharge;
 import com.dpe.gateway.service.ChargeService;
 import com.dpe.messaging.inbox.InboxGate;
 import java.util.UUID;
@@ -29,11 +30,16 @@ public class GatewayCommandHandler {
      * @return {@code true} if this delivery did the work, {@code false} if it was a duplicate
      */
     @Transactional
-    public boolean handle(UUID messageId, String topic, ChargeGateway command) {
-        if (!inbox.claim(messageId, topic, ChargeGateway.TYPE)) {
+    public boolean handle(UUID messageId, String topic, String eventType, Object command) {
+        if (!inbox.claim(messageId, topic, eventType)) {
             return false;
         }
-        charges.charge(command);
+        switch (command) {
+            case ChargeGateway c -> charges.charge(c);
+            case VoidCharge c    -> charges.voidCharge(c);
+            default -> throw new IllegalStateException(
+                    "no handler for command type " + command.getClass().getName());
+        }
         return true;
     }
 

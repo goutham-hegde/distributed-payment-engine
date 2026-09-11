@@ -1,9 +1,12 @@
 package com.dpe.gateway.service;
 
 import com.dpe.events.ChargeGateway;
+import com.dpe.events.ChargeVoided;
 import com.dpe.events.GatewayApproved;
 import com.dpe.events.GatewayDeclined;
 import com.dpe.events.Topics;
+import com.dpe.events.VoidCharge;
+import com.dpe.gateway.domain.ChargeStatus;
 import com.dpe.gateway.domain.GatewayCharge;
 import com.dpe.gateway.repository.GatewayChargeRepository;
 import com.dpe.gateway.sim.GatewaySimulationProperties;
@@ -112,7 +115,60 @@ public class ChargeService {
         }
     }
 
+    /**
+     * M7, the PSP-side compensation: make sure no money is held at the PSP for this transfer,
+     * whether or not it has been charged yet. See {@link VoidCharge} for why both orders must give
+     * the same answer.
+     *
+     * <p>Deliberately NOT subject to the simulation's latency or timeout rate. Those model the
+     * authorization call; a real void is also a network call that can fail, and when it does the
+     * command is redelivered and the tombstone makes the retry safe. Keeping it deterministic here
+     * means a chaos scenario that injects PSP timeouts is testing the charge path it names.
+     *
+     * <p>Always answers, with {@link ChargeVoided} - including when there was nothing to do.
+     */
+    public void voidCharge(VoidCharge command) {
+        // The tombstone first, and via ON CONFLICT DO NOTHING - see insertTombstone for why this
+        // ordering is what lets the void win every race against a concurrent charge.
+        UUID tombstoneId = UUID.randomUUID();
+        int written = charges.insertTombstone(tombstoneId, command.transferId(),
+                command.amountMinor(), command.currency(), command.reason());
+        if (written == 1) {
+            log.info("transfer {} voided before any charge; a late ChargeGateway will be declined",
+                    command.transferId());
+            reply(command.transferId(), tombstoneId, ChargeVoided.PRE_EMPTED);
+            return;
+        }
+
+        GatewayCharge charge = charges.findByTransferIdForUpdate(command.transferId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "transfer " + command.transferId() + " conflicted but has no charge row"));
+        if (charge.getStatus() == ChargeStatus.APPROVED) {
+            charge.voidAuthorization(command.reason());
+            log.warn("transfer {}: approved charge {} REVERSED ({})", command.transferId(),
+                    charge.getId(), command.reason());
+            reply(command.transferId(), charge.getId(), ChargeVoided.REVERSED);
+        } else {
+            reply(command.transferId(), charge.getId(), ChargeVoided.NOTHING_TO_VOID);
+        }
+    }
+
+    private void reply(UUID transferId, UUID chargeId, String outcome) {
+        outbox.append("Transfer", transferId, Topics.GATEWAY_EVENTS, ChargeVoided.TYPE,
+                new ChargeVoided(transferId, chargeId, outcome));
+    }
+
     private void publishOutcome(GatewayCharge charge) {
+        if (charge.getStatus() == ChargeStatus.VOIDED) {
+            // A ChargeGateway that arrived after the saga compensated - replayed from the dead
+            // letter table, typically. The tombstone turns it into a decline instead of a charge,
+            // which is the whole of Fix D; the saga, already compensating, records it as skipped.
+            outbox.append("Transfer", charge.getTransferId(), Topics.GATEWAY_EVENTS,
+                    GatewayDeclined.TYPE,
+                    new GatewayDeclined(charge.getTransferId(), charge.getId(), "voided",
+                            "the saga compensated this transfer; no charge will be made"));
+            return;
+        }
         if (charge.isApproved()) {
             outbox.append("Transfer", charge.getTransferId(), Topics.GATEWAY_EVENTS,
                     GatewayApproved.TYPE,

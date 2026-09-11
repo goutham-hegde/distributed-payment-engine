@@ -1,0 +1,65 @@
+# The same stack on Apache Kafka instead of Redpanda. An OVERRIDE, applied on top of the base file:
+#
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.kafka.yml up -d
+#
+# Why an override rather than `--profile kafka` alone: the profile only STARTS a Kafka container.
+# Every service still has KAFKA_BOOTSTRAP=redpanda:9092 and depends_on a healthy redpanda, so the
+# profile gave you a broker nobody talked to - and both brokers claim host port 19092, so it could
+# not even start next to Redpanda. "Works on Redpanda" is not "works on Kafka", and M7's silent
+# consumer stall is exactly the question that needs the difference: it has only ever been seen
+# against Redpanda, and whether the broker or the client is at fault is the whole open question.
+#
+# Switching is a recreate, not a restart: the consumer groups, committed offsets and topics live in
+# the broker, so a service moved to an empty Kafka starts its groups from `earliest` against empty
+# topics. Nothing in Postgres changes. Quiesce first (no unpublished outbox rows, no in-flight
+# sagas), or the work in flight stays behind in Redpanda's log.
+#
+# `!override` replaces a list/map wholesale instead of merging into it (Compose >= 2.24.4); a plain
+# depends_on here would be ADDED to the base file's, and the services would wait for a redpanda
+# that this file stops from starting.
+
+services:
+  redpanda:
+    # Not started. Its profile is one nothing enables.
+    profiles: ["redpanda-disabled-by-kafka-override"]
+
+  kafka:
+    profiles: !reset []
+    container_name: dpe-kafka
+    environment:
+      # Parity with Redpanda's bootstrap.yaml: an undeclared topic must fail loudly, never be
+      # auto-created with one partition. Apache Kafka's default is `true`.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Kafka fsyncs on the OS's schedule, not per write - the same "acknowledged before durable"
+      # trade Redpanda's write caching made. Left at Kafka's default deliberately: this override is
+      # for comparing brokers as people actually run them, and a single node has no replica to
+      # make acks=all mean anything either way.
+
+  payment-orchestrator:
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+
+  account-service:
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+
+  payment-gateway:
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092

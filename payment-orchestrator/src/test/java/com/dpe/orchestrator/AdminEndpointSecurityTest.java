@@ -61,6 +61,10 @@ class AdminEndpointSecurityTest extends AbstractPostgresIT {
         // else's money movement.
         expect(403, post("/admin/dead-letters/{id}/replay", UUID.randomUUID()), customer);
         expect(403, post("/admin/dead-letters/replay"), customer);
+
+        // M7: reconciliation finishes a compensation, which moves money back to a sender.
+        expect(403, post("/admin/transfers/{id}/reconcile", UUID.randomUUID()), customer);
+        expect(401, post("/admin/transfers/{id}/reconcile", UUID.randomUUID()), null);
     }
 
     @Test
@@ -73,6 +77,7 @@ class AdminEndpointSecurityTest extends AbstractPostgresIT {
         // Reaching the controller and being told the letter does not exist is the proof the role
         // check passed - a 403 here would mean the operator never got in.
         expect(404, post("/admin/dead-letters/{id}/replay", UUID.randomUUID()), operator);
+        expect(404, post("/admin/transfers/{id}/reconcile", UUID.randomUUID()), operator);
     }
 
     @Test

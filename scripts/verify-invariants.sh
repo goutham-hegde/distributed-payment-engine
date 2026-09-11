@@ -6,8 +6,17 @@
 # load run (M8) ends by calling it, and a non-zero exit means money was created, destroyed, or
 # stranded - regardless of what the HTTP responses said.
 #
-#   ./scripts/verify-invariants.sh            check I1, I2, I4, I5 (and I3 if a baseline exists)
+#   ./scripts/verify-invariants.sh            check I1, I2, I4, I5 (and I3 if a baseline exists),
+#                                             then S1-S4, the stranded-money checks
 #   ./scripts/verify-invariants.sh baseline   record the current total as the I3 baseline
+#   ./scripts/verify-invariants.sh --no-stranded
+#                                             I1-I5 only. For the chaos harness, which runs S1-S4
+#                                             itself and fails a scenario only on NEW violations
+#
+# S1-S4 joined this script at M7. The five invariants are statements about one database at a time,
+# and every fault the chaos suite found did its damage where none of them look - they passed
+# through a customer refunded while the PSP kept the charge. A definition of "correct" that a
+# double charge passes is not one. Like I4, they assume the system is at rest.
 #
 # The queries here are deliberately the same statements as
 # account-service/src/test/java/com/dpe/account/support/LedgerInvariants.java, so what the test
@@ -17,6 +26,8 @@ set -uo pipefail
 
 PG_CONTAINER="${PG_CONTAINER:-dpe-postgres}"
 BASELINE_FILE="${BASELINE_FILE:-$(dirname "$0")/.i3-baseline}"
+WITH_STRANDED=1
+[ "${1:-}" = "--no-stranded" ] && WITH_STRANDED=0
 
 failures=0
 
@@ -45,8 +56,20 @@ fi
 
 # --------------------------------------------------------------------- I3 baseline capture
 
+# Customer balances PLUS money sitting in active holds - the one quantity I3 conserves.
+#
+# The baseline and the check MUST both call this. Until M7 they did not: the baseline recorded
+# balances alone and the check added holds back in, so the two agreed only when no hold was ACTIVE
+# at the moment the baseline was taken - true for every run until the chaos suite left twelve holds
+# stranded, after which I3 "failed" by exactly their total (48000) on a system that had conserved
+# every paisa. A conservation check that compares two different sums is not checking conservation.
 total_customer_money() {
-    q accounts_db "SELECT COALESCE(SUM(balance_minor), 0) FROM accounts WHERE account_type = 'CUSTOMER'"
+    local balances=0 held=0
+    balances="$(q accounts_db "SELECT COALESCE(SUM(balance_minor), 0) FROM accounts WHERE account_type = 'CUSTOMER'")"
+    if table_exists accounts_db holds; then
+        held="$(q accounts_db "SELECT COALESCE(SUM(amount_minor), 0) FROM holds WHERE status = 'ACTIVE'")"
+    fi
+    echo $((balances + held))
 }
 
 if [ "${1:-}" = "baseline" ]; then
@@ -92,12 +115,8 @@ fi
 
 if [ -f "$BASELINE_FILE" ]; then
     baseline="$(tr -d '[:space:]' < "$BASELINE_FILE")"
+    # Held money is still money - total_customer_money adds active holds back in, on both sides.
     current="$(total_customer_money)"
-    # Once holds exist (M3), money sitting in a hold is still money and is added back in here.
-    if table_exists accounts_db holds; then
-        held="$(q accounts_db "SELECT COALESCE(SUM(amount_minor), 0) FROM holds WHERE status = 'ACTIVE'")"
-        current=$((current + held))
-    fi
     if [ "$current" = "$baseline" ]; then
         pass "I3  total money conserved (${current})"
     else
@@ -133,6 +152,36 @@ if [ "$i5" = "0" ]; then
     pass "I5  no customer account holds a negative balance"
 else
     fail "I5  ${i5} customer account(s) with a negative balance - an overdraft got through"
+fi
+
+# --------------------------------------------------------------------- S1-S4
+
+stranded_check() {
+    local fn="$1" label="$2" ids n
+    ids="$("$fn")"
+    # grep -c, not wc -l: $(...) strips the trailing newline, and wc -l then counts one short -
+    # which printed "25" against 26 stranded holds on the first run.
+    n="$(printf '%s' "$ids" | grep -c .)"
+    if [ "$n" = "0" ]; then
+        pass "$label"
+    else
+        fail "$label - ${n} violation(s), e.g. $(printf '%s\n' "$ids" | head -2 | paste -sd' ' -)"
+    fi
+}
+
+if [ "$WITH_STRANDED" = "1" ]; then
+    if table_exists gateway_db gateway_charges && table_exists accounts_db holds; then
+        # shellcheck source=lib/stranded.sh
+        source "$(dirname "$0")/lib/stranded.sh"
+        echo
+        echo "Stranded money (after quiescence; S1 and S2 are fixed by scripts/reconcile.sh):"
+        stranded_check stranded_s1 "S1  no money stranded in an ACTIVE hold"
+        stranded_check stranded_s2 "S2  every approved PSP charge belongs to a COMPLETED transfer"
+        stranded_check stranded_s3 "S3  every COMPLETED transfer has an approved PSP charge"
+        stranded_check stranded_s4 "S4  no transfer PENDING under a terminal saga"
+    else
+        skip "S1-S4  the saga tables do not exist yet"
+    fi
 fi
 
 # ---------------------------------------------------------------------

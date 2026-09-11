@@ -30,6 +30,15 @@ public interface HoldRepository extends JpaRepository<Hold, UUID> {
     /** One hold per transfer per account, enforced by {@code holds_one_per_account_per_transfer}. */
     Optional<Hold> findByTransferId(UUID transferId);
 
+    /**
+     * M7: the hold for a transfer, locked. A compensation is addressed by transfer id - a saga that
+     * timed out before hearing {@code FundsReserved} has no hold id to quote - so release and commit
+     * find their hold this way rather than by the id in the command.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select h from Hold h where h.transferId = :transferId")
+    Optional<Hold> findByTransferIdForUpdate(@Param("transferId") UUID transferId);
+
     /** Invariant I3's second term, and the gauge M6 graphs as "money currently in flight". */
     @Query("select coalesce(sum(h.amountMinor), 0) from Hold h where h.status = com.dpe.account.domain.HoldStatus.ACTIVE")
     long sumActiveHolds();

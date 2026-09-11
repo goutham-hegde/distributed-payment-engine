@@ -13,6 +13,7 @@ import com.dpe.events.ReleaseFunds;
 import com.dpe.events.ReserveFunds;
 import com.dpe.events.ReserveRejected;
 import com.dpe.events.Topics;
+import com.dpe.events.VoidCharge;
 import com.dpe.orchestrator.saga.SagaInstance;
 import com.dpe.orchestrator.saga.SagaInstanceRepository;
 import com.dpe.orchestrator.saga.SagaOrchestrator;
@@ -212,6 +213,54 @@ class SagaFlowTest extends AbstractPostgresIT {
         assertThat(outboxCount(transfer.getId(), CommitFunds.TYPE))
                 .as("and above all it must not emit a CommitFunds for a hold that was released")
                 .isZero();
+    }
+
+    // ------------------------------------------------------------------ M7: replies are facts
+
+    @Test
+    @DisplayName("FundsCommitted for a COMPENSATING saga finishes it COMPLETED - the money moved")
+    void commitThatWonTheRaceCompletesTheSaga() {
+        Transfer transfer = newTransfer(30_000L);
+        SagaInstance saga = orchestrator.start(transfer);
+        UUID holdId = UUID.randomUUID();
+        orchestrator.onFundsReserved(reserved(transfer, holdId), UUID.randomUUID());
+        orchestrator.onGatewayDeclined(new GatewayDeclined(transfer.getId(), UUID.randomUUID(),
+                "do_not_honour", "refused"), UUID.randomUUID());
+
+        // account-service answered the release with how the hold actually ended: committed.
+        orchestrator.onFundsCommitted(new FundsCommitted(transfer.getId(), holdId,
+                transfer.getToAccountId(), 30_000L, INR), UUID.randomUUID());
+
+        assertThat(sagas.findById(saga.getId()).orElseThrow().getStatus())
+                .as("before M7 this reply was SKIPPED and the saga sat in COMPENSATING forever "
+                        + "(chaos scenario 2). The recipient has the money; no saga state changes that.")
+                .isEqualTo(SagaStatus.COMPLETED);
+        assertThat(transferStatus(transfer.getId())).isEqualTo("COMPLETED");
+    }
+
+    @Test
+    @DisplayName("FundsReleased for a CHARGED saga compensates it AND voids the PSP charge")
+    void releaseOfAChargedTransferVoidsTheCharge() {
+        Transfer transfer = newTransfer(30_000L);
+        SagaInstance saga = orchestrator.start(transfer);
+        UUID holdId = UUID.randomUUID();
+        orchestrator.onFundsReserved(reserved(transfer, holdId), UUID.randomUUID());
+        orchestrator.onGatewayApproved(
+                new GatewayApproved(transfer.getId(), UUID.randomUUID(), 30_000L, INR),
+                UUID.randomUUID());
+
+        // Not something this orchestrator sends from CHARGED any more - a replayed dead letter,
+        // or a hand-produced command. The sender has their money back regardless.
+        orchestrator.onFundsReleased(new FundsReleased(transfer.getId(), holdId,
+                transfer.getFromAccountId(), 30_000L, INR, ReleaseFunds.SAGA_TIMEOUT),
+                UUID.randomUUID());
+
+        assertThat(sagas.findById(saga.getId()).orElseThrow().getStatus())
+                .isEqualTo(SagaStatus.COMPENSATED);
+        assertThat(transferStatus(transfer.getId())).isEqualTo("FAILED");
+        assertThat(outboxCount(transfer.getId(), VoidCharge.TYPE))
+                .as("the sender was refunded, so the charge must not stand either")
+                .isEqualTo(1);
     }
 
     // ------------------------------------------------------------------ helpers

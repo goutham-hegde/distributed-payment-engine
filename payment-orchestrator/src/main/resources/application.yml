@@ -9,6 +9,10 @@ spring:
     hikari:
       maximum-pool-size: 10
       pool-name: orchestrator-pool
+      # M7: reap a transaction whose client died mid-flight. See account-service's application.yml
+      # for the measured failure and why 30 s is above the relay's bounded idle stretch.
+      data-source-properties:
+        options: "-c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3"
 
   jpa:
     hibernate:
@@ -71,6 +75,10 @@ spring:
         # Below the relay's send-timeout, so the send future always completes on its own rather
         # than being abandoned while the producer is still retrying in the background.
         delivery.timeout.ms: 4000
+        # M7. How long send() itself may block - for topic metadata, or a full buffer - BEFORE it
+        # returns the future that send-timeout bounds. Default 60 s, which would make one send of
+        # a relay batch outlast idle_in_transaction_session_timeout on its own.
+        max.block.ms: 3000
     consumer:
       # One group for the whole service. Every instance shares it, so Kafka gives each instance a
       # disjoint set of partitions: scaling out divides the work instead of duplicating it.
@@ -177,6 +185,8 @@ dpe:
     batch-size: 100
     poll-interval: 500ms
     send-timeout: 5s
+    # M7: a drain stops starting sends after this long and commits. See OutboxProperties.
+    batch-budget: 10s
     # Tests turn this off and call drainBatch() directly, so nothing races them.
     scheduled: true
 
@@ -201,6 +211,12 @@ dpe:
     # Sagas claimed per sweep. Bounded for the same reason the outbox batch is: the claim
     # transaction stays open across the whole batch.
     sweep-batch-size: 100
+    # M7: the sweeper does not time anything out until the reply listener has held its partitions
+    # this long. A timeout is a statement about the other side only while this side can hear it;
+    # chaos scenario 3 caught the sweeper failing sagas whose replies were already waiting, unread,
+    # during the ~23 s a restarted instance spent rejoining its consumer group. See
+    # ReplyListenerReadiness.
+    listen-grace: 10s
     # Tests turn this off and call sweep() directly, so a background thread cannot race them.
     scheduled: true
 

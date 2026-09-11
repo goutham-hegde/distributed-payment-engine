@@ -234,8 +234,114 @@ class ReservationServiceTest extends AbstractPostgresIT {
                 .as("the sender must still be whole - a double settlement would show up here")
                 .isEqualTo(100_000L);
         assertThat(ledger.balanceOf(recipient)).isZero();
+        assertThat(outboxTypeFor(transferId, FundsReleased.TYPE))
+                .as("M7: the losing commit is ANSWERED, with how the hold actually ended. Before, it "
+                        + "logged and returned, and the saga could only learn from its deadline")
+                .isEqualTo(2);
         LedgerInvariants.assertAll(jdbc);
         LedgerInvariants.assertI3TotalIsConserved(jdbc, baseline);
+    }
+
+    // ------------------------------------------------------------------ M7: participants always answer
+
+    @Test
+    @DisplayName("a release that finds the hold COMMITTED answers FundsCommitted - the truth")
+    void releaseOfACommittedHoldReportsTheCommit() {
+        UUID sender = ledger.seedAccount(100_000L);
+        UUID recipient = ledger.seedAccount(0L);
+        UUID transferId = UUID.randomUUID();
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
+        UUID holdId = holdIdFor(transferId);
+        reservations.commit(new CommitFunds(transferId, holdId, recipient));
+
+        reservations.release(new ReleaseFunds(transferId, holdId, ReleaseFunds.SAGA_TIMEOUT));
+
+        assertThat(ledger.balanceOf(recipient)).isEqualTo(30_000L);
+        assertThat(outboxTypeFor(transferId, FundsCommitted.TYPE))
+                .as("chaos scenario 2: six releases hit committed holds and got SILENCE, and six "
+                        + "sagas sat in COMPENSATING forever. The answer is what happened: the "
+                        + "recipient has the money.")
+                .isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                "SELECT payload->'payload'->>'toAccountId' FROM outbox WHERE event_type = ? "
+                        + "AND aggregate_id = ? ORDER BY created_at DESC LIMIT 1",
+                String.class, FundsCommitted.TYPE, transferId))
+                .as("recovered from the ledger's CREDIT leg - the hold does not record it")
+                .isEqualTo(recipient.toString());
+    }
+
+    @Test
+    @DisplayName("a repeated commit settles nothing twice and still answers")
+    void repeatedCommitIsAnswered() {
+        UUID sender = ledger.seedAccount(100_000L);
+        UUID recipient = ledger.seedAccount(0L);
+        UUID transferId = UUID.randomUUID();
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
+        UUID holdId = holdIdFor(transferId);
+
+        // Fix A: after the pivot the saga re-sends CommitFunds until it hears back.
+        reservations.commit(new CommitFunds(transferId, holdId, recipient));
+        reservations.commit(new CommitFunds(transferId, holdId, recipient));
+
+        assertThat(ledger.balanceOf(recipient)).isEqualTo(30_000L);
+        assertThat(outboxTypeFor(transferId, FundsCommitted.TYPE)).isEqualTo(2);
+        LedgerInvariants.assertAll(jdbc);
+    }
+
+    // ------------------------------------------------------------------ M7: the tombstone
+
+    @Test
+    @DisplayName("a release that arrives BEFORE the reserve voids the transfer; the reserve is refused")
+    void releaseBeforeReserveCommutes() {
+        UUID sender = ledger.seedAccount(100_000L);
+        UUID recipient = ledger.seedAccount(0L);
+        UUID transferId = UUID.randomUUID();
+        long baseline = LedgerInvariants.totalCustomerMoney(jdbc);
+
+        // The saga timed out in STARTED: it has no hold id, so it addresses the transfer.
+        reservations.release(new ReleaseFunds(transferId, null, ReleaseFunds.SAGA_TIMEOUT));
+        // ...and the ReserveFunds lands afterwards - from the outbox, the topic, or a replayed dead
+        // letter. Chaos scenarios 1, 2 and 3 each reached exactly this ordering.
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
+
+        assertThat(ledger.balanceOf(sender))
+                .as("the customer was told FAILED, so no money may move for this transfer")
+                .isEqualTo(100_000L);
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM holds WHERE transfer_id = ?", Integer.class, transferId))
+                .isZero();
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM transfer_voids WHERE transfer_id = ?", Integer.class, transferId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForList(
+                "SELECT payload->'payload'->>'reason' FROM outbox WHERE event_type = ? "
+                        + "AND aggregate_id = ?", String.class, ReserveRejected.TYPE, transferId))
+                .as("both commands answered: the release with 'nothing reserved, nothing will be', "
+                        + "the late reserve with the same fact")
+                .containsExactly(ReserveRejected.TRANSFER_VOIDED, ReserveRejected.TRANSFER_VOIDED);
+        LedgerInvariants.assertAll(jdbc);
+        LedgerInvariants.assertI3TotalIsConserved(jdbc, baseline);
+    }
+
+    @Test
+    @DisplayName("a release with no hold id finds the hold by transfer id and returns the money")
+    void releaseAfterReserveByTransferId() {
+        UUID sender = ledger.seedAccount(100_000L);
+        UUID recipient = ledger.seedAccount(0L);
+        UUID transferId = UUID.randomUUID();
+
+        // The other order: the reserve got here first, and its reply was what went missing.
+        reservations.reserve(new ReserveFunds(transferId, sender, recipient, 30_000L, INR, TestLedger.OWNER));
+        reservations.release(new ReleaseFunds(transferId, null, ReleaseFunds.SAGA_TIMEOUT));
+
+        assertThat(ledger.balanceOf(sender))
+                .as("same end state as the other order - that is what commuting means")
+                .isEqualTo(100_000L);
+        assertThat(statusOfHold(holdIdFor(transferId))).isEqualTo("RELEASED");
+        assertThat(jdbc.queryForObject(
+                "SELECT release_reason FROM holds WHERE transfer_id = ?", String.class, transferId))
+                .isEqualTo(ReleaseFunds.SAGA_TIMEOUT);
+        LedgerInvariants.assertAll(jdbc);
     }
 
     // ------------------------------------------------------------------ helpers

@@ -167,6 +167,36 @@ groups:
             advance them is missing: check the other service's outbox age and its dead letters. Do
             NOT read this as an I4 failure - I4 is only meaningful after quiescence.
 
+      # M7. The silent consumer stall the chaos suite found after a broker restart - and, as of
+      # Session 17, the first signature of it anyone has been able to see. The stalled consumer is
+      # NOT idle: it stays in its group, heartbeats, keeps its assignment, logs nothing - and fetches
+      # in a hot loop, ~5,900 empty fetch requests a second, against 2/s for a healthy idle consumer
+      # long-polling on fetch.max.wait. Nothing is consumed while its topic's lag grows.
+      #
+      # So the rule is "fetching furiously and consuming nothing". Neither half alone works: an idle
+      # consumer consumes nothing (at 2/s), and a busy one fetches fast (and consumes). Thresholded at
+      # 50/s, an order of magnitude over idle and two under the stall. Checked against the live stall
+      # in Session 17 before it was committed: it selected exactly the stuck client and no other.
+      #
+      # Root cause NOT established. The broker logged "no session with id N found" for the fetch
+      # sessions that existed before it restarted, and one of the two consumers in the same process
+      # recovered from that while the other did not. A service restart clears it.
+      - alert: KafkaConsumerFetchSpin
+        expr: |
+          sum by (application, client_id) (rate(kafka_consumer_fetch_manager_fetch_total[2m])) > 50
+            and on (application, client_id)
+          sum by (application, client_id) (rate(kafka_consumer_fetch_manager_records_consumed_total[2m])) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.application }} consumer {{ $labels.client_id }} is fetching and consuming nothing"
+          description: >-
+            Fetching at {{ $value | humanize }}/s with zero records consumed for 2 minutes. This is the
+            post-broker-restart stall: the group looks Stable and every saga that depends on this
+            consumer is waiting on a reply it will never read. Confirm with
+            `rpk group describe <group>` (lag not falling), then restart the service.
+
   # ---------------------------------------------------------------------------------------------
   - name: dpe-platform
     interval: 10s

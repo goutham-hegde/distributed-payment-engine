@@ -12,6 +12,8 @@ public interface SagaStepRepository extends JpaRepository<SagaStep, Long> {
 
     long countBySagaIdAndStepName(UUID sagaId, String stepName);
 
+    long countBySagaIdAndStepNameAndOutcome(UUID sagaId, String stepName, StepOutcome outcome);
+
     /**
      * Every step of one saga, in order, with its message joined in from whichever of the two
      * tables holds it.

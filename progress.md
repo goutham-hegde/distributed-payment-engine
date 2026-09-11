@@ -2902,3 +2902,652 @@ $ ./scripts/verify-invariants.sh
   If M9 produces an OpenAPI document, generate them from it.
 - The transfer list still has no status or account filter, and still only gets one together with
   the `(initiated_by, status, created_at DESC, id DESC)` index that serves it.
+
+---
+
+## Session 16 — 2026-09-11
+
+### Goal
+
+Start M7: a chaos harness that runs against the real Compose deployment, the eight scenarios on it,
+and the first runs. The plan's hypothesis for every scenario was the same sentence — "the
+invariants still hold" — and the first thing the suite did was show that sentence is not strong
+enough.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Where scenarios run | Bash against the live Compose stack, not JUnit + Testcontainers | The faults are container-level — SIGKILL, `docker pause`, `docker network disconnect` — and the thing under test is the deployment, including its restart times, healthchecks and DNS aliases. A test that owns the containers it breaks can make them behave better than the real ones do. |
+| Starting condition | Refuse to start unless **quiescent** | Quiescent = no saga in a non-terminal state AND no unpublished row in any of the three outboxes. A scenario that inherits in-flight work from the last one asserts about two faults at once and proves neither. Exit code 2, distinct from a refuted hypothesis. |
+| Fault restore order | Wait for every saga in the batch to be terminal, **then** restore | Carried from M6: the API answers 202 before the gateway is reached, so restoring straight after the last POST tests a system that has already recovered. |
+| I3 baseline | Recorded after the scenario's accounts are opened | Carried from M6.5: funding an account issues new money, and I3 would correctly call a later baseline a violation. |
+| Checks beyond I1–I5 | Four more, S1–S4, run after quiescence | The five invariants are statements about one database at a time. S1 (no `ACTIVE` hold), S2 (every approved PSP charge belongs to a `COMPLETED` transfer), S3 (the converse), S4 (no `PENDING` transfer under a terminal saga). |
+| Cross-database reads | Allowed in the harness, still forbidden in services | The harness is an operator's tool holding a superuser connection for the length of a test, not a component on the payment path. The M6 rule — no service may hold credentials to two databases — is about what a service may be, and is unchanged. |
+| Scenario 3's window | Broker **paused** first, so committed-but-unpublished rows are a certainty rather than a race | The real window is the relay's 500 ms poll interval, far too narrow to hit by timing a kill. Pausing makes the precondition checkable: the scenario asserts the rows were stranded before it kills anything. |
+| Scenario 8's heal | `docker network connect --alias account-service --alias dpe-account` | Reconnecting without the alias restores the container's network but not its service name, so every client addressing it as `account-service` stays partitioned after the "heal" — which reads as a bug in the system under test. |
+
+### Built
+
+**`chaos/lib.sh`** — the shared skeleton: `begin_scenario` (health, quiescence, fault reset, and a
+trap-based cleanup that unpauses, reconnects and restarts whatever a dying scenario left broken),
+`open_account` (which waits until the orchestrator's ownership projection has the account —
+otherwise the first transfer is refused 403 during replication lag), `fire_transfers` (N POSTs, P
+in flight, through `xargs -P`), `wait_terminal`, `wait_quiescent`, and `run_checks` (I1–I5 through
+`scripts/verify-invariants.sh`, then S1–S4).
+
+**Eight scenarios**, `chaos/01` to `chaos/08`, each opening with its hypothesis and each ending in
+`finish_scenario`. Two take a parameter because one fault has two meaningfully different timings:
+`01` takes the outage length (under or over the 30 s saga deadline) and `02` takes whether the
+participant dies before the reserve or after the charge. `06` runs with Redis stopped as well as
+running, since only the Redis-less run proves the unique index is the guarantee. `chaos/run-all.sh`
+runs them sequentially and summarises HELD / REFUTED / NOT RUN; `chaos/README.md` lists them.
+
+Also corrected `SimulationController`'s Javadoc, which still described the endpoint as
+unauthenticated two milestones after it was put behind `OPERATOR`, and fixed the I3 baseline in
+`scripts/verify-invariants.sh` (item 9 below).
+
+### What broke
+
+**1. The fault injector failed silently and the scenario nearly passed.** The first run of scenario
+4 set `failureRate: 1.0` with an unauthenticated POST, got a 401 it did not check, and fired thirty
+transfers through a gateway that approved every one. I1–I5 and S1–S4 all passed — they are true of
+thirty successful transfers. Only the scenario's own assertion ("were they compensated?") failed.
+The cause was a stale comment: `SimulationController`'s Javadoc still said "deliberately
+unauthenticated", and M5 had put `/admin/**` behind `OPERATOR`.
+
+The rule taken from it: **a fault injector that can fail quietly makes every scenario pass.**
+`gateway_set` now requires a 200 and logs the knobs the gateway reports holding *after* the call,
+so the log records what was actually in force. And every scenario asserts the fault's *effect*,
+not only the invariants — invariants cannot tell a fault that was survived from a fault that never
+happened.
+
+**2. Scenario 2 refuted the saga design, as predicted from reading the code before the run.**
+account-service was killed after every reserve had completed and while the gateway (slowed to 3 s)
+was still charging. The PSP approved with the participant dead, so each saga reached `CHARGED` with
+its `CommitFunds` waiting in the topic. Then the deadline passed. One saga's trail:
+
+```
+06:48:13  ReserveFunds   SUCCEEDED  -> RESERVED
+06:48:23  ChargeGateway  SUCCEEDED  -> CHARGED
+06:48:23  CommitFunds    STARTED       CHARGED
+06:48:47  ChargeGateway  TIMED_OUT  -> COMPENSATING     no reply before the deadline
+06:48:47  ReleaseFunds   STARTED       COMPENSATING
+06:48:52  ReleaseFunds   TIMED_OUT     COMPENSATING     (re-emitted by the sweeper)
+   ... three more, every 5 s ...
+06:49:07  ReleaseFunds   TIMED_OUT     COMPENSATING     sweep_attempts = 5, never swept again
+06:49:28  CommitFunds    SKIPPED       COMPENSATING     arrived while the saga was COMPENSATING
+```
+
+account-service came back and consumed its partition in order: `CommitFunds` first — the hold
+settled, bob was paid — then all six `ReleaseFunds`, each finding a `COMMITTED` hold and returning
+**without a reply** (30 log lines of `ReleaseFunds ... ignored: already COMMITTED`). Its
+`FundsCommitted` reached a saga that had already moved to `COMPENSATING` and was skipped. Final
+state: holds `COMMITTED`, bob +42000, PSP charges `APPROVED`, transfers `PENDING`, sagas
+`COMPENSATING` forever.
+
+```
+  FAIL  I4  6 saga(s) stuck in a non-terminal state
+  FAIL  S2  6 transfer(s) CHARGED at the PSP but not COMPLETED
+```
+
+Three distinct defects, and the first is the real one:
+
+- **The sweeper compensates past the pivot.** In saga terms the gateway charge is the *pivot
+  transaction*: the last step that can fail, and the first that cannot be undone by writing an
+  opposite row in our own ledger. Before it the saga may go backward; after it, only forward.
+  `onTimeout` treats `RESERVED` and `CHARGED` alike, so a timeout in `CHARGED` "compensates" by
+  releasing the hold — refunding the customer out of our books while the card network keeps the
+  charge. Here the money happened to go the right way only because per-partition ordering delivered
+  the commit before the release. The saga's own decision was wrong.
+- **A participant answers a command it will not act on with silence.** `release()` on a settled
+  hold logs and returns. The saga cannot tell "not yet processed" from "will never be processed",
+  so the only thing left to learn from is a deadline — which had already passed. The gateway does
+  the opposite, correctly: a repeated charge republishes the *original* outcome.
+- **The sweep budget is counted in sweeps, not time.** Five attempts at a 5 s interval is 20 s, and
+  all five were spent while account-service was still booting. It changed nothing here — the
+  commands were queued in the topic regardless — but a budget that expires inside one container
+  restart is not a budget.
+
+I1, I2, I3 and I5 passed throughout. The ledger was never wrong; the *saga* was.
+
+The six were reconciled by hand after checking all three databases per transfer (hold `COMMITTED`,
+one 7000 credit to the recipient and no refund leg, PSP `APPROVED`): one transaction that aborts
+unless exactly six sagas and six transfers change, and writes a `saga_steps` row on each recording
+the evidence. That is the operator's procedure, and it is what the orchestrator's own `STARTED`
+branch already anticipates when it says "the honest fix is a reconciliation job".
+
+**3. A timeout in `STARTED` strands the customer's money — three scenarios, three routes.** The
+sweeper fails a saga whose reserve has not replied, but it cannot un-send the `ReserveFunds`. When
+that command lands late, account-service reserves, and the `FundsReserved` reply is skipped by a
+terminal saga. The customer is told the transfer failed; their money is in CLEARING; nothing will
+ever move it.
+
+```
+02 before-reserve   transfers: FAILED 6    holds: ACTIVE 6    alice: 958000 (42000 short)
+  PASS  I1-I5
+  FAIL  S1  STRANDED - ACTIVE hold(s) with every saga terminal: 6 new
+```
+
+Reached three ways: the participant dead at the reserve (scenario 2 `before-reserve`), the
+orchestrator's own consumer unable to hear replies after a restart (scenario 3, item 5), and a
+consumer that silently stopped fetching after a broker restart (scenario 1, item 6). I3 passes in
+every case because it adds held money back into the total, which is correct mid-run and exactly why
+it cannot see money held forever. **This is the reason S1 exists.** At the end of the session 26
+holds totalling 110000 were stranded, with I1–I5 green.
+
+**4. A compensated transfer can still be charged by the PSP.** Scenario 5 part B: the PSP stops
+answering, each charge dead-letters, the sweeper compensates all ten. The operator then replays the
+dead letters with the PSP healthy, and it charges all ten.
+
+```
+{"replayed":10}
+gateway charges for the compensated transfers: APPROVED 10
+transfers: FAILED 10
+  PASS  I1-I5
+  FAIL  S2  CHARGED at the PSP but not COMPLETED: 10 new
+```
+
+The same outcome came from restarting the stalled gateway in item 6 (twelve more). Compensation
+here only reaches our own ledger; nothing tells the gateway that the transfer is void, so a late
+charge is indistinguishable from a first one. A compensation has to be able to arrive *before* the
+thing it compensates and still win — the gateway needs to remember a void for a transfer it has not
+charged yet.
+
+**5. The orchestrator's sweeper runs while the orchestrator cannot hear.** Scenario 3 held on its
+own claim — every stranded `ReserveFunds` was published exactly once by the restarted relay, one hold
+each — and failed on what happened next:
+
+```
+08:09:07.7  saga created, deadline 08:09:37
+08:09:10.2  orchestrator container started
+08:09:25.9  application started: HTTP, relay and sweeper all running
+08:09:26.5  ReserveFunds published by the relay
+08:09:26.7  account-service reserves and replies
+08:09:41.3  sweeper: ReserveFunds TIMED_OUT -> FAILED
+08:09:49.6  orchestrator's consumer finally joins the group
+08:09:49.9  the FundsReserved reply is read, and SKIPPED
+```
+
+For 23 seconds the orchestrator could send commands and could not receive a single reply, and its
+sweeper spent that window judging other services by a clock. The join came ~41 s after the SIGKILL,
+consistent with the dead instance's group members being held until their session expired (the
+client's default `session.timeout.ms` is 45 s and is not overridden) — consistent with, not proven.
+A timeout is only meaningful while the thing measuring it can hear the answer.
+
+**6. After a broker restart, one service's consumer sometimes stops fetching, silently.** Scenario 1
+(15 s outage, under the saga deadline) was run four times:
+
+| Run | Result |
+|---|---|
+| 1 | gateway consumer stalled — group `Stable`, all partitions assigned, lag 12, no error, no rebalance, no log line after the reconnect. The sweeper compensated all twelve transfers and the first version of the scenario reported **HELD** |
+| 2 | held — 12/12 `COMPLETED` |
+| 3 | orchestrator consumer stalled — lag 12, all twelve sagas `FAILED` in `STARTED`, twelve holds stranded |
+| 4 | refused to start: not quiescent |
+
+A thread dump of the stalled gateway showed the listener thread alive inside
+`KafkaConsumer.poll` → `NetworkClient.poll`, receiving nothing, while `rpk topic consume` could read
+the waiting records at exactly the committed offsets — so nothing was lost or truncated. A restart
+cleared it each time. Root cause **not established**. Every affected client logged `Resetting the
+last seen epoch ... since the associated topicId changed from null to ...` on reconnect, which points
+at the fetch session's handling of topic ids across a broker restart (kafka-clients 4.2.1, Redpanda
+v25.3.17), but services that recovered logged the same line. The next experiment is to reproduce it
+against Apache Kafka through the `kafka` Compose profile, which is the reason that profile exists.
+
+What makes it dangerous is the combination: no error anywhere, and a timeout sweeper that turns a
+stalled consumer into a column of perfectly tidy compensations. It surfaced only because the first
+run's vacuous pass was examined rather than accepted.
+
+**7. Redpanda is running in developer mode with write caching on.** `rpk cluster config get
+write_caching_default` returns `"true"`: the broker acknowledges a write before it is fsynced, so on
+a single node `acks=all` does not mean the message survives a SIGKILL — and the outbox marks a row
+published on exactly that acknowledgement. No loss was observed in these runs, but scenario 1 is
+testing a weaker broker than the design assumes. Also found: Compose's
+`--set redpanda.auto_create_topics_enabled=false` is a no-op — it is a cluster property placed in
+node config, which Redpanda reports at startup as `Unknown property auto_create_topics_enabled`.
+Auto-creation is off only because that is Redpanda's default.
+
+**8. A dead-lettered record's offset is never committed.** `KafkaErrorHandlingConfig` builds its
+`DefaultErrorHandler` without `setCommitRecovered(true)`, and under `manual_immediate` that means the
+committed offset stays behind a recovered record until a later record on the same partition succeeds.
+Scenario 5 showed it as ten messages of lag with nothing in flight, cleared only when the replay's
+new messages were acknowledged past it. A restart inside that window redelivers every dead-lettered
+command as if new, in addition to whatever the operator replays.
+
+**9. `verify-invariants.sh` compared two different sums for I3.** The check added active holds to
+customer balances; the `baseline` command recorded balances alone. They agreed only when no hold was
+active at baseline time — true of every run until item 3 left holds stranded, after which I3
+"failed" by exactly their total (48000) on a system that had conserved every paisa. Both now call
+one function.
+
+**10. Two more ways the harness nearly lied.** Quiescence was defined as "no saga in flight and every
+outbox drained", and the stalled gateway met that definition with twelve commands unread in its
+topic — a published, unconsumed message is as much work in flight as an outbox row, so consumer lag
+is now the third condition. And S1–S4 were global, so one stranded hold would refute every later
+scenario; they now snapshot the violations present at the start and fail only on new ones, printing
+the inherited count rather than hiding it.
+
+### Verified
+
+Scenario 4, second run (with authenticated injection):
+
+```
+gateway now: {"failureRate":1.0,"latencyMs":50,"timeoutRate":0.0,"duplicateCallbackRate":0.0}
+firing 30 transfers
+all 30 sagas terminal
+  PASS  every POST accepted (30)
+  PASS  sagas COMPENSATED (30)
+  PASS  transfers FAILED with GATEWAY_DECLINED (30)
+  PASS  alice's balance restored exactly (1000000)
+  PASS  bob received nothing (0)
+  PASS  alice's ledger shows 2N entries (debit + credit per transfer) (60)
+  PASS  no new dead letters (a decline is not an error) (1)
+  PASS  I1-I5, S1-S4
+04 gateway declines everything: HYPOTHESIS HELD
+```
+
+Every scenario, against the stack as it stands (no saga fixes yet). Predictions were written down
+before each run.
+
+| Scenario | Result | Against the prediction |
+|---|---|---|
+| 01 broker dies, 15 s | 2 of 4 runs stalled a consumer (item 6); run 2 held, 12/12 `COMPLETED` | Predicted to hold. Refuted by a defect nobody predicted |
+| 02 `after-charge` | **Refuted** — I4, S2 (item 2) | As predicted |
+| 02 `before-reserve` | **Refuted** — S1, 6 holds stranded, I1–I5 green (item 3) | As predicted |
+| 03 orchestrator dies before relay | Outbox claim **held** (8 published once, 8 holds); saga **refuted** — S1 (item 5) | Predicted a race; it happened |
+| 04 gateway declines 100% | **Held** — 30/30 compensated, sender restored exactly | As predicted |
+| 05 A duplicate callbacks | **Held** — inbox took 20 rows for 10 transfers, state guard skipped 10, bob credited once | As predicted, including that the inbox did *not* dedupe |
+| 05 B silent PSP + DLQ replay | **Refuted** — S2, 10 charges for compensated transfers (item 4) | As predicted |
+| 06 key stampede ×100, Redis on | **Held** — 100 × 202, one transfer id, one row, bob paid once | As predicted |
+| 06 key stampede ×100, Redis off | **Held** — identical | As predicted; the unique index alone is the guarantee |
+| 07 hot account, 90 for room of 60 | **Held** — exactly 60 `COMPLETED`, 30 `INSUFFICIENT_FUNDS`, sender exactly 0, recipients exactly 60000, 0 deadlocks | As predicted |
+| 08 partition, 20 s | **Held** — 12/12 `COMPLETED`, no restart needed | The half-open-lock case was **not exercised**: the cut landed on no open transaction |
+| 01 `OUTAGE=45` | Not run | Its predicted mechanism (item 3) was shown three other ways |
+
+Scenario 7, the arithmetic version of "no lost update":
+
+```
+  PASS  every POST accepted (90)
+  PASS  exactly CAPACITY completed (60)
+  PASS  exactly EXTRA refused for insufficient funds (30)
+  PASS  sender drained to exactly zero (0)
+  PASS  recipients received exactly the sender's balance (60000)
+  PASS  deadlocks in the postgres log during the run (0)
+07 hot account (90 transfers, room for 60): HYPOTHESIS HELD
+```
+
+Final state: I1–I5 hold; 26 holds totalling 110000 stranded `ACTIVE`; 22 PSP charges for transfers
+reported `FAILED`. Both are open reconciliation items, and both are invisible to the five
+invariants.
+
+### Committed
+
+Nothing yet — M7 is mid-flight.
+
+### Open / next
+
+In the order they would change the results table:
+
+1. **Forward recovery past the pivot** (item 2). A timeout in `CHARGED` re-emits `CommitFunds` and
+   stays `CHARGED`.
+2. **Participants always answer** (item 2). A commit or release for a settled hold replies with the
+   outcome that actually happened.
+3. **A `STARTED` timeout must be safe whether or not the reserve happened** (item 3). The
+   compensation has to be addressed by transfer id, not hold id, and account-service has to remember
+   it — so a `ReserveFunds` arriving afterwards is refused rather than obeyed.
+4. **Compensation must reach the gateway** (item 4) — a void it remembers for a transfer it has not
+   charged yet, for the same reason.
+5. **The sweeper must not run deaf** (item 5): gate it on the reply consumer holding its partitions,
+   and/or give the consumer static membership (`group.instance.id`) so a restart rejoins without
+   waiting out the dead member's session.
+6. **Isolate the fetch stall** (item 6) on the Apache Kafka profile, and alert on consumer lag that
+   does not fall — the existing rules cannot see it, because the sweeper converts it into
+   compensations.
+7. **Broker durability** (item 7): `write_caching_default: false` via a Redpanda bootstrap file, and
+   move `auto_create_topics_enabled` there too so the setting that claims to disable auto-creation
+   actually does.
+8. **`setCommitRecovered(true)`** (item 8).
+9. **Reconcile** the 26 stranded holds and 22 orphaned charges once 3 and 4 exist to say what the
+   right answer is.
+10. Decide whether S1–S4 join `verify-invariants.sh`, and what that means for "five invariants" on
+    both `/admin/invariants` endpoints and the console.
+
+---
+
+## Session 17 — 2026-09-11
+
+### Goal
+
+Close the five saga defects Session 16's chaos run found, fix the three infrastructure findings
+that came with them, and re-run the whole suite against the result.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Timeout in `CHARGED` | Re-send `CommitFunds`, stay `CHARGED`, never compensate | The gateway charge is the saga's pivot: the one step that cannot be undone by writing an opposite row. Before it, recovery runs backward; after it, only forward. Compensating after it refunds the sender out of our own books while the PSP keeps the charge — scenario 2 caught exactly that. |
+| Attempt cap after the pivot | None; ERROR log on every re-send past `max-sweep-attempts` | A forward step has no alternative to give up in favour of. Capping it leaves the PSP holding the money and the hold unsettled forever; logging makes it the alert. |
+| Retry pacing | Each re-send pushes `deadline_at` out one step-timeout | The old budget was attempts × sweep interval (5 × 5 s), spent entirely while a participant was still restarting. Now 5 × 30 s for a compensation, and one commit per 30 s — not per 5 s — to a participant that is down. A forward transition still never resets the deadline, so the fail-safe property is unchanged. |
+| A command that finds its work already settled | Reply with what actually happened to the hold | Silence left the saga to learn only from a clock; throwing loops forever. A COMMITTED hold answers `FundsCommitted` whichever command asked, a RELEASED one `FundsReleased`. The release reason moved onto the hold row so a repeated question gets the original answer. |
+| Replies that do not match the command sent | Accepted; the saga finishes where the money is | `FundsCommitted` in `COMPENSATING` → `COMPLETED` (the recipient has it); `FundsReleased` in `RESERVED`/`CHARGED` → `COMPENSATED` plus a gateway void. Unreachable from the orchestrator's own commands after the first fix, reachable from a replayed dead letter or a hand-produced command. |
+| Compensation addressing | By transfer id; `ReleaseFunds.holdId` optional | A saga that timed out before hearing `FundsReserved` has no hold id — which is why the old `STARTED` branch sent nothing, and why three scenarios stranded money through that gap. |
+| account-service tombstone | New `transfer_voids` table + transaction-scoped advisory lock per transfer | A release that finds no hold records a void; a later reserve finds it and is refused. The two sides read different tables, so no unique constraint spans them; the lock (taken first, before any row lock) makes the two check-then-write sequences serial. Partition order makes the race rare, not impossible. |
+| Gateway tombstone | A `gateway_charges` row with status `VOIDED`, no new table | The existing UNIQUE on `transfer_id` then *is* the mutual exclusion. The void inserts with `ON CONFLICT DO NOTHING`, which blocks on a concurrent uncommitted charge and then sees it, so the void cannot lose the race; the charge can, and losing means "no charge". Cost: an APPROVED row may now move to VOIDED, once. |
+| Sweeper while the orchestrator cannot hear | Gated on the reply listener holding partitions for a 10 s grace | A timeout is a statement about the other side only while this side can hear it. Static group membership was rejected: a static member sends no LeaveGroup on a clean shutdown either, so every deploy would orphan its partitions for a session timeout, and it does nothing when the broker is what restarted. |
+| Redpanda cluster properties | `infra/redpanda/bootstrap.yaml`, not `--set` | See What broke 2 and 3. |
+| Dead-lettered offsets | `setCommitRecovered(true)` | Under `manual_immediate`, the offset of a record that was dead-lettered was never committed; a restart re-delivered it as new. |
+| Reconciling the 26 stranded holds and 22 orphaned PSP charges from Session 16 | Not done this session | The fixes provide the mechanism — a transfer-addressed release and a void, both idempotent — but choosing to move money for 48 historical transfers is a reconciliation decision, not a code change. Left open with a proposal. |
+
+### Built
+
+**The pivot, in code** — `SagaOrchestrator.onTimeout` now has four distinct branches instead of
+three. `STARTED`: fail, and send a `ReleaseFunds` with no hold id. `RESERVED`: compensate, and send
+a `VoidCharge` to the gateway. `CHARGED`: re-send `CommitFunds`, stay `CHARGED`. `COMPENSATING`:
+re-send the release. `SagaInstance.extendDeadline` paces the re-sends; `claimExpired` exempts
+`CHARGED` from the attempt cap.
+
+**Truthful replies** — `ReservationService.answerWithWhatHappened` replies to a commit or release
+on a settled hold with the event describing how it settled. The recipient of a committed hold is
+recovered from the commit's CREDIT leg, since the hold does not record it. The orchestrator's
+`onFundsCommitted` / `onFundsReleased` accept the replies that can now arrive in unexpected states.
+
+**Tombstones** — account-service `V7__transfer_voids.sql` (`transfer_voids`, plus
+`holds.release_reason`) and `TransferVoidRepository.lockTransfer`; payment-gateway
+`V4__charge_voids.sql` (status `VOIDED`, `voided_at`, `void_reason`, and CHECKs tying them
+together), `ChargeService.voidCharge` and `GatewayChargeRepository.insertTombstone`. New messages
+in `common-events`: `VoidCharge`, `ChargeVoided`, and the rejection code `TRANSFER_VOIDED`.
+
+**The sweeper gate** — `ReplyListenerReadiness` (reads the reply listener's assignment from the
+`KafkaListenerEndpointRegistry`) and `dpe.saga.listen-grace: 10s`; `SagaSweepScheduler` skips a
+tick while it is closed and logs each transition.
+
+**Infrastructure** — `infra/redpanda/bootstrap.yaml` mounted at `/etc/redpanda/.bootstrap.yaml`
+(write caching off, auto-creation off) replacing the `--set` flag; `setCommitRecovered(true)` in
+`KafkaErrorHandlingConfig`; a `KafkaConsumerFetchSpin` alert rule.
+
+**Tests** — 15 new: forward recovery and the uncapped `CHARGED` sweep, the `STARTED` release, the
+gateway void on a `RESERVED` timeout, both unexpected-reply cases, both orders of release and
+reserve, truthful replies for a repeated commit and for a release that finds a committed hold, the
+three gateway void outcomes, and the sweeper gate (a stub container, no broker). One existing test
+was rewritten because it asserted the old behaviour: `SagaTimeoutTest` used to assert that a
+`STARTED` timeout sends *no* release, with a comment conceding the outcome could be wrong; three
+chaos scenarios proved it was.
+
+**Chaos harness** — scenarios 2, 3 and 5 now assert the outcome the design promises (completed after
+the pivot, sender whole before it, nothing timed out while deaf, the replay charged nobody) rather
+than only that no invariant was broken.
+
+### What broke
+
+1. **`@KafkaListener(id = ...)` silently changes the consumer group.** Naming the reply listener so
+   the sweeper gate could look it up would, by Spring Kafka's default, have made the id the
+   `group.id` — overriding `spring.kafka.consumer.group-id` and moving the orchestrator to a brand-new
+   group reading from `earliest`. Every reply ever sent would be re-delivered and every one absorbed
+   by the inbox, so nothing would fail and no test would go red. `idIsGroup = false`; confirmed after
+   deploy that `rpk group list` still shows exactly the three service groups.
+
+2. **Every Redpanda `--set redpanda.<cluster property>` in Compose has been a no-op since M0.**
+   Redpanda writes the value into the node config and then logs `Ignoring value for
+   'write_caching_default' in redpanda.yaml: use rpk cluster config edit` — so the auto-creation flag
+   never did anything (the behaviour was Redpanda's default all along), and adding one for write
+   caching changed nothing: `rpk cluster config get write_caching_default` still said `"true"`,
+   developer mode's default. Cluster properties belong in `.bootstrap.yaml`.
+
+3. **Recreating the Redpanda container does not create a new cluster.** The Compose file declares
+   no volume for it, so a recreate looked like a clean start — and the bootstrap file appeared not to
+   work. The image itself declares an anonymous volume on `/var/lib/redpanda/data`, which Compose
+   carries across a recreate; the giveaway was the controller log opening at `start_offset:60` on a
+   "fresh" broker. Fixed live with `rpk cluster config set write_caching_default false`, then proven
+   on a genuinely new cluster (`up -d --renew-anon-volumes redpanda`, then a service restart so the
+   topics are re-declared): `"false"`, read from the bootstrap file.
+
+4. **The consumer stall recurred, and turned out not to be idle.** Repeat run 2 of scenario 1, with
+   write caching off: account-service's command consumer stopped consuming after the broker restart
+   while staying `Stable`, assigned and heartbeating, with nothing logged. Its client metrics showed
+   `fetch_total` at 2,984,401 and climbing ~5,900/s with zero records consumed, against 2/s for the
+   healthy consumer in the same JVM. The broker had logged `no session with id 2 found` and `... id 3
+   ...` for the two pre-restart fetch sessions; one consumer recovered and one did not. Root cause
+   still not established. Two outcomes:
+   - `KafkaConsumerFetchSpin` (fetch rate > 50/s and zero consumed, for 2 m), checked against the
+     live stall before it was committed — it selected exactly the stuck client, then fired.
+   - After `docker restart dpe-account`, with no manual intervention, all twelve affected transfers
+     settled correctly: 3 `CHARGED` → `COMPLETED` by forward recovery, 9 `FAILED` with their holds
+     `RELEASED (SAGA_TIMEOUT)` because the queued reserve and the transfer-addressed release arrived
+     in that order. The same stall in Session 16 stranded money.
+
+5. **An incremental `./mvnw verify` failed all 89 account-service tests after a one-line change in
+   `common-messaging`** - every context failed with `NoClassDefFoundError: DeadLetterProperties`
+   (note: no package in the name) while introspecting `KafkaErrorHandlingConfig`. Nothing was wrong
+   with the code; `./mvnw clean verify` passed everything. Same family as the earlier stale-test-class
+   trap: after changing a shared module, a failure that names a class the code plainly has is the
+   build, not the change - `clean` before believing it.
+
+### Verified
+
+```
+./mvnw -B -ntp clean verify
+    BUILD SUCCESS - 224 tests, 0 failures (common-messaging 16, account-service 89,
+    payment-orchestrator 110, payment-gateway 9)
+
+docker exec dpe-redpanda rpk cluster config get write_caching_default    "false"
+docker exec dpe-redpanda rpk topic describe -c dpe.account.commands.v1   write.caching false
+
+./chaos/run-all.sh      10 / 10 HELD, exit 0
+```
+
+| Scenario | Session 16 | Session 17 |
+|---|---|---|
+| 01 broker dies, 15 s | 2 of 4 refuted (consumer stall) | 4 of 5 held; 1 stall, settled correctly after a restart |
+| 01 broker dies, 45 s | not run | held — 10 FAILED, 2 COMPENSATED, no stranded hold, no orphaned charge |
+| 02 account-service dies after the charge | refuted — compensated past the pivot | held — 6 COMPLETED, 0 releases sent |
+| 02 account-service dies before the reserve | refuted — 42000 stranded in CLEARING | held — 6 FAILED, holds RELEASED, sender exactly whole |
+| 03 orchestrator dies before relay | refuted — sweeper failed sagas while deaf | held — 8 COMPLETED; sweeper paused once, resumed once |
+| 04 gateway declines everything | held | held |
+| 05 A duplicate callbacks | held | held |
+| 05 B silent PSP, dead letters replayed | refuted — replay charged 10 refunded transfers | held — 10 `VOIDED` tombstones, 0 approvals |
+| 06 key stampede (Redis on / off) | held | held |
+| 07 hot account | held | held — exactly 60 / 30 / 0 |
+| 08 network partition | held | held (the open-transaction case still not exercised) |
+
+After the stall recovery above: `verify-invariants.sh` I1–I5 all pass, account-service lag 0.
+
+### Committed
+
+Nothing yet.
+
+### Open / next
+
+1. **Reconcile Session 16's leftovers** — 26 holds (110000) still `ACTIVE` under `FAILED` sagas and
+   22 `APPROVED` charges on `FAILED` transfers. The idempotent mechanism exists now (a
+   transfer-addressed `ReleaseFunds`, a `VoidCharge`), but no sanctioned way for a person to issue
+   one does; operators deliberately cannot move money. That is a policy decision to make first.
+2. **Consumer stall root cause** — reproduce on the Apache Kafka profile (Compose hard-codes
+   `KAFKA_BOOTSTRAP: redpanda:9092`, which needs an override). Then decide whether an automatic
+   listener restart on `KafkaConsumerFetchSpin` is worth the risk of restarting a healthy consumer.
+3. Scenario 8's open-transaction case.
+4. Whether S1–S4 belong in `scripts/verify-invariants.sh`.
+5. Commit M7.
+
+## Session 18 — 2026-09-11
+
+### Goal
+
+Close everything Session 17 left open: repair the money Session 16's chaos run stranded, decide
+whether S1–S4 belong in the invariant script, reproduce the consumer stall on Apache Kafka, and
+finally exercise scenario 8's open-transaction case.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| How to repair 26 stranded holds and 22 orphaned PSP charges | `POST /admin/transfers/{id}/reconcile` on the orchestrator (OPERATOR), driven per transfer by `scripts/reconcile.sh` | A terminal saga is never swept again, so the fixes could not reach back. SQL was rejected: hand-written ledger rows go around the only code that keeps I1/I2 true. See ADR 0008. |
+| Does that break "an operator moves no money"? | No, and the endpoint is shaped so it cannot | It is refused for a `COMPLETED` saga (reversing that would be a movement) and for a live one (the sweeper owns it), and it chooses no amount, source or destination. It can only finish the compensation a failed transfer already implies. A stolen operator token still cannot pay anyone. |
+| Release and void together, or in order? | In order: release first, void only on an answer proving the sender whole | The orchestrator cannot see holds. If the hold was COMMITTED, voiding the charge would pay the recipient out of our own books. `FundsCommitted` stops it and records `Reconcile FAILED` for a person. |
+| S1–S4 in `verify-invariants.sh`? | Yes, defined once in `scripts/lib/stranded.sh`; `--no-stranded` for the chaos harness | Every defect the chaos suite found passed I1–I5. A definition of "correct" that a double charge passes is not one. The harness keeps its own new-violations-only judgement, so it opts out of the absolute version. |
+| Running on Apache Kafka | `infra/docker-compose.kafka.yml` override, and the harness detects the broker | `--profile kafka` only started a broker no service talked to; every service hard-coded `redpanda:9092` and `depends_on` it. `!override` replaces `depends_on` wholesale instead of merging into it. |
+| Automatic listener restart on `KafkaConsumerFetchSpin` | Not built | The stall did not reproduce on Kafka (below). An alert-driven restart that fires on a healthy consumer is a worse failure than the one it treats. |
+| Orphaned transactions | `idle_in_transaction_session_timeout=30s` and TCP keepalives, as pgjdbc startup options on each pool | Server-side, because the client is gone; set by the service, so they travel with it into every environment. |
+| The relay's transaction | A wall-clock `batch-budget` (10 s) and `max.block.ms: 3000` | See What broke 3. The relay is the only transaction with I/O inside it, so it is the one a session timeout has to be sized against. |
+
+### Built
+
+**Reconciliation** — `SagaOrchestrator.reconcile` and `ReconcileOutcome`; `ReconciliationController`;
+`ReleaseFunds.RECONCILIATION`. The answer is handled in the three reply handlers that can carry it
+(`FundsReleased`, `ReserveRejected(TRANSFER_VOIDED)`, `FundsCommitted`), and only while a request is
+outstanding - counted from `saga_steps`, so no migration. `scripts/reconcile.sh` is a dry run unless
+given `--apply`. ADR 0008.
+
+**`scripts/lib/stranded.sh`** — S1–S4, now read by `verify-invariants.sh`, the chaos harness and
+`reconcile.sh`.
+
+**The Kafka override** — `infra/docker-compose.kafka.yml` (Redpanda disabled, Kafka enabled with
+auto-creation off, all three services pointed at `kafka:9092`). `chaos/lib.sh` detects which broker
+is running and kills, pauses and reads lag from that one (`kafka-consumer-groups.sh`, one JVM start
+for all three groups).
+
+**Scenario 8, rewritten** — the cut is aimed: pause the container, ask `pg_locks` whether one of its
+backends holds a `transactionid` while idle in a transaction, cut only then, otherwise thaw and try
+again 100 ms later, with traffic running until the cut lands (What broke 10). `MODE=crash` kills
+the process while it is cut off. Both modes are in `run-all.sh`.
+
+**Scenario 1** measures the outage the system actually saw (What broke 4).
+
+**One scenario at a time** — `chaos/lib.sh` takes a lock in `begin_scenario` (What broke 9).
+
+**Orphaned-transaction defences** — the pool options in all three services;
+`OutboxProperties.batchBudget` and the budget check in `OutboxRelay.drainBatch`; `max.block.ms` on
+all three producers.
+
+**Tests** — 9 new: seven for reconciliation (the two real leftover shapes, the never-reserved case,
+the committed hold that must not be voided, both refusals, and a reply with no request outstanding),
+the relay budget, and one asserting the session settings actually bind. 233 in total.
+
+### What broke
+
+1. **The orphaned transaction, measured.** Scenario 8's first two versions cut the network at a
+   random moment and landed on no open transaction; a transaction here lasts milliseconds. Aimed,
+   and with the process killed while cut off, the orphan held its locks for as long as anyone
+   watched: 150 s, against a two-hour TCP keepalive. The restarted account-service's only consumer
+   thread blocked on the orphan's *uncommitted inbox row* for the redelivered command - the same
+   "insert that blocks" property that makes idempotency safe, turned into a total stall - and lag
+   climbed until the backend was terminated by hand. The same run left the dead instance's other
+   nine pooled connections idle from its old IP: no locks, but each a `max_connections` slot
+   (100, shared by three pools of 10) for two hours. With the fixes, both modes held and Postgres
+   reaped the orphan itself (29 s after the cut in partition mode).
+
+2. **Postgres prints `tcp_keepalives_idle` as `60`, not `1min`** - unlike the timeout next to it,
+   which prints `30s`. The test asserting the setting bound was written with the wrong expectation
+   and failed first; the setting was right.
+
+3. **The relay could not coexist with a session timeout until its batch had a time budget.** No
+   SQL runs between the relay's claim and its commit, so to Postgres the whole batch is one idle
+   stretch - 100 sends × 5 s against a dead broker is over eight minutes. Any timeout short enough
+   to reap an orphan would have killed a healthy relay mid-batch; under a slow broker, forever. The
+   budget stops a drain from starting new sends after 10 s, and never before the first send, since
+   a budget shorter than one send would otherwise publish nothing, ever - an outage that looks idle.
+   `max.block.ms` (default 60 s) bounds the part of a send that `send-timeout` cannot see. Ceiling
+   10 + 5 + 3 s, under the 30 s timeout. `DeadLetterReplayService` still sends up to 50 × 5 s in one
+   transaction and will be reaped if a replay meets a broker outage; it is operator-invoked and safe
+   to repeat, so left as is.
+
+4. **"A 15 s outage" was a 31 s outage on Kafka.** One run of scenario 1 refuted: four sagas
+   compensated. Their deadline passed at 16:12:10; the first publish after the restart was at
+   16:12:10.852. Apache Kafka took ~14–22 s after `docker start` to accept writes, which Redpanda
+   does in a couple, and `OUTAGE` only measures kill-to-start. The system was right - they were
+   compensated and every check passed - and the scenario's assertion was wrong. It now measures
+   kill to the first publish of a command written after the kill, and asks for "all COMPLETED"
+   only below 25 s. Its first version took the first publish after the kill instant and read 0 s on
+   four runs out of six: sends in flight at the kill were acknowledged as it landed.
+
+5. **`curl -o /tmp/...` fails in Git Bash under `MSYS_NO_PATHCONV=1`** with `(23) Failure writing
+   output` on every request - a Windows `curl` given a POSIX path. `reconcile.sh`'s first live run
+   printed 48 of them over 48 successful requests. Body and status are now captured with `-w`.
+
+6. **Counting lines of `$(...)` with `wc -l` is one short.** The substitution strips the trailing
+   newline; the first `verify-invariants.sh` with S1–S4 reported 25 stranded holds against 26.
+
+7. **A known inaccuracy, not fixed.** A hold released before migration V7 has no stored release
+   reason, so its truthful reply echoes the command's. The 22 reconciled charges' steps say "hold
+   released (RECONCILIATION)" about holds released in Session 16 for other reasons. The money is
+   right; the label is not.
+
+8. **The consumer stall happened again, on Redpanda, inside the suite.** Scenario 01's broker kill
+   at the start of `run-all.sh`; this time the gateway's dead-letter listener
+   (`consumer-payment-gateway-2`) - a third kind of consumer to stall, after the gateway's command
+   listener and account-service's. 5,120 fetches/s, nothing consumed, 10 records of lag on
+   `dpe.gateway.commands.v1.dlt`, and `KafkaConsumerFetchSpin` firing on exactly that client. It
+   surfaced two scenarios later as 05's "each silent charge dead-lettered: got 0" - the check counts
+   rows the stalled consumer writes - and every scenario after it refused to start on the lag. A
+   restart of the one service cleared it. Redpanda is now 4 stalls in 10 broker restarts; Apache
+   Kafka 0 in 13.
+
+9. **Two harnesses ran at once, and nothing said so.** Stopping `run-all.sh` stopped its wrapper
+   and not its loop, which went on to run 07 and 08 on top of a re-run of 05 and 06. The results
+   were plausible and wrong: 05 miscounted duplicate callbacks and dead letters; 06 reported I3
+   6,000 short, because the other harness funded accounts after 06 took its baseline (the ledger
+   showed 08's 1,500-paise traffic inside 06's window); 08 failed to aim. Run alone, all of them
+   held. `chaos/lib.sh` now takes a lock (`mkdir`, atomic, with the holder's pid so a lock left by
+   a killed run is recognised as stale) and a second scenario exits 2 naming the first.
+
+10. **The aimed cut was aimed at a fixed batch.** Scenario 8 caught an open transaction on try 1 in
+    three runs, then missed 300 times in a row: 40 transfers drain in seconds, and each try - two
+    docker CLI calls and a psql - takes most of a second. Traffic now runs until the cut lands.
+    Caught on try 8 and try 23 since.
+
+### Verified
+
+```
+./mvnw -B -ntp clean verify              BUILD SUCCESS - 233 tests, 0 failures, 0 errors
+                                         (common-messaging 16, account-service 91,
+                                          payment-orchestrator 117, payment-gateway 9; was 224)
+
+./scripts/reconcile.sh                   dry run: S1 26, S2 22, S3 0, S4 0 - 48 would be reconciled
+./scripts/reconcile.sh --apply           HTTP 202 x48; after: S1 0, S2 0, S3 0, S4 0; exit 0
+  saga_steps  Reconcile STARTED 48, SUCCEEDED 48;  VoidCharge REVERSED 22, PRE_EMPTED 26
+  holds       RELEASED (RECONCILIATION) 26, 110000
+./scripts/verify-invariants.sh           I1-I5 PASS, S1-S4 PASS, exit 0
+./scripts/reconcile.sh                   (second run) Nothing to reconcile.
+```
+
+Scenario 8, the open-transaction case:
+
+| Run | Result |
+|---|---|
+| `MODE=crash`, before the fix (experiment) | orphan idle in transaction at +15, +45, +90, +150 s; consumer blocked on its inbox row; lag 85 → 156; cleared only by `pg_terminate_backend` |
+| `MODE=crash`, after | HELD — orphan reaped by Postgres, 10 COMPLETED / 30 FAILED (a 40 s outage, past the deadline), I1–I5 and S1–S4 pass |
+| `MODE=partition`, after | HELD — reaped 29 s after the cut, 37 COMPLETED / 3 COMPENSATED, all checks pass |
+
+Scenario 1 on Apache Kafka 4.3.1 (`infra/docker-compose.kafka.yml`), 13 broker kills:
+
+| Batch | Result |
+|---|---|
+| `OUTAGE=15` × 5 | 4 held; 1 refuted by the scenario's own timing assumption (What broke 4), not a stall |
+| `OUTAGE=8` × 7 | 7 held, 12/12 COMPLETED each |
+| `OUTAGE=45` × 1 | held — 12 FAILED, S1–S4 clean |
+| Consumer fetch rate, every run | 1.7–3.8/s (the stall's signature is thousands per second) |
+
+Zero silent stalls, against 3 in 9 broker restarts on Redpanda.
+
+The whole suite on Redpanda, after every change above:
+
+| Scenario | Result |
+|---|---|
+| 01, 02 `after-charge`, 02 `before-reserve`, 03, 04 | held (in `run-all.sh`) |
+| 05 | refuted in `run-all.sh` by a silent consumer stall that began at 01's broker kill (What broke 8); held run alone after a restart of payment-gateway |
+| 06 Redis on / off, 07 | held (run alone - What broke 9) |
+| 08 `partition` | held — cut on try 8, orphan reaped 27 s after the cut, 92 COMPLETED |
+| 08 `crash` | held — cut on try 23, orphan reaped 41 s after the cut, 140 COMPLETED / 44 FAILED |
+
+The stalled dead-letter consumer's ten records were replayed once it recovered: approved charges
+882 before, 882 after — every one found its transfer's `VOIDED` tombstone. I1–I5 and S1–S4 pass.
+
+### Committed
+
+Nothing yet.
+
+### Open / next
+
+1. The consumer stall: only ever reproduced on Redpanda. A comparison, not a root cause.
+2. `DeadLetterReplayService` holds a transaction across up to 50 sends; bound it like the relay if
+   replays ever become routine.
+3. Commit M7.

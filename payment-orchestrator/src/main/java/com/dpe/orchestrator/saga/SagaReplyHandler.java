@@ -1,5 +1,6 @@
 package com.dpe.orchestrator.saga;
 
+import com.dpe.events.ChargeVoided;
 import com.dpe.events.FundsCommitted;
 import com.dpe.events.FundsReleased;
 import com.dpe.events.FundsReserved;
@@ -52,6 +53,7 @@ public class SagaReplyHandler {
             case GatewayDeclined r -> orchestrator.onGatewayDeclined(r, messageId);
             case FundsCommitted r  -> orchestrator.onFundsCommitted(r, messageId);
             case FundsReleased r   -> orchestrator.onFundsReleased(r, messageId);
+            case ChargeVoided r    -> orchestrator.onChargeVoided(r, messageId);
             default -> throw new IllegalStateException(
                     "no handler for reply type " + reply.getClass().getName());
         }

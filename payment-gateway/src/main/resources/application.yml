@@ -9,6 +9,10 @@ spring:
     hikari:
       maximum-pool-size: 10
       pool-name: gateway-pool
+      # M7: reap a transaction whose client died mid-flight. See account-service's application.yml
+      # for the measured failure and why 30 s is above the relay's bounded idle stretch.
+      data-source-properties:
+        options: "-c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3"
 
   jpa:
     hibernate:
@@ -41,6 +45,10 @@ spring:
         linger.ms: 5
         request.timeout.ms: 3000
         delivery.timeout.ms: 4000
+        # M7. How long send() itself may block - for topic metadata, or a full buffer - BEFORE it
+        # returns the future that send-timeout bounds. Default 60 s, which would make one send of
+        # a relay batch outlast idle_in_transaction_session_timeout on its own.
+        max.block.ms: 3000
 
     consumer:
       group-id: payment-gateway
@@ -96,6 +104,8 @@ dpe:
     batch-size: 100
     poll-interval: 500ms
     send-timeout: 5s
+    # M7: a drain stops starting sends after this long and commits. See OutboxProperties.
+    batch-budget: 10s
     scheduled: true
 
   # M4 part 2: retry and dead letter policy. See DeadLetterProperties for what each knob trades.

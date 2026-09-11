@@ -2,11 +2,15 @@ package com.dpe.account;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.dpe.messaging.outbox.OutboxProperties;
 import com.dpe.messaging.outbox.OutboxRelay;
+import com.dpe.messaging.outbox.OutboxRepository;
+import com.dpe.messaging.tracing.OutboxTracing;
 import com.dpe.account.support.AbstractKafkaIT;
 import com.dpe.account.support.Concurrently;
 import com.dpe.events.EventEnvelope;
 import com.dpe.events.Topics;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -15,6 +19,8 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The specification for {@code OutboxRelay.drainBatch}.
@@ -149,6 +155,59 @@ class OutboxRelayTest extends AbstractKafkaIT {
         assertThat(publishedNow())
                 .as("exactly one Kafka record per outbox row")
                 .hasSize(messages);
+    }
+
+    @Test
+    @DisplayName("M7: a drain past its time budget commits what it sent and leaves the rest queued")
+    void batchBudgetBoundsTheTransaction() {
+        for (int i = 0; i < 3; i++) {
+            seed(UUID.randomUUID());
+        }
+        // A budget shorter than any send: exactly one message per drain, because the first is
+        // always attempted - otherwise this relay would never publish anything.
+        OutboxRelay budgeted = new OutboxRelay(outboxRepository, kafka,
+                new OutboxProperties(100, null, null, Duration.ofNanos(1)), tracing);
+
+        assertThat(drainIn(budgeted)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM outbox WHERE published_at IS NULL",
+                Long.class))
+                .as("the unsent rows are still unpublished - stopping early loses nothing")
+                .isEqualTo(2);
+        assertThat(drainIn(budgeted)).isEqualTo(1);
+        assertThat(drainIn(budgeted)).isEqualTo(1);
+        assertThat(publishedNow()).hasSize(3);
+    }
+
+    @Test
+    @DisplayName("M7: every pooled connection carries idle_in_transaction_session_timeout")
+    void orphanedTransactionsAreReaped() {
+        assertThat(jdbc.queryForObject("SHOW idle_in_transaction_session_timeout", String.class))
+                .as("set as a startup option on the pool in application.yml. A mis-nested key "
+                        + "binds to nothing and fails silently - and an orphaned transaction then "
+                        + "holds its locks for the two hours TCP keepalive takes (chaos 08)")
+                .isEqualTo("30s");
+        assertThat(jdbc.queryForObject("SHOW tcp_keepalives_idle", String.class))
+                .as("and a dead client's IDLE connections are dropped in ~90 s rather than "
+                        + "holding a max_connections slot each for two hours")
+                .isEqualTo("60");
+    }
+
+    @Autowired
+    OutboxRepository outboxRepository;
+
+    @Autowired
+    KafkaTemplate<String, String> kafka;
+
+    @Autowired
+    OutboxTracing tracing;
+
+    @Autowired
+    TransactionTemplate tx;
+
+    /** A hand-built relay has no transactional proxy, so the drain is given a transaction here. */
+    private int drainIn(OutboxRelay r) {
+        Integer n = tx.execute(s -> r.drainBatch());
+        return n == null ? 0 : n;
     }
 
     private UUID seed(UUID transferId) {
