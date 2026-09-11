@@ -3782,7 +3782,7 @@ docker inspect dpe-jaeger                  OOMKilled=true (exit 137); restarted,
 
 ### Committed
 
-Not yet; M8 is in progress.
+`5c43f2b` — "M8 (part 1): the load harness, a collapse that conserved every paisa, and admission control" (together with part 2).
 
 ### Open / next
 
@@ -3884,7 +3884,7 @@ orchestrator recreated with the normal configuration          healthy; verify-in
 
 ### Committed
 
-Not yet.
+`5c43f2b` — "M8 (part 1): the load harness, a collapse that conserved every paisa, and admission control".
 
 ### Open / next
 
