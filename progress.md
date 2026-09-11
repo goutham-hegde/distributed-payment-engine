@@ -3649,3 +3649,248 @@ a second npm run dev                      "Error: Port 8085 is already in use" -
 1. The two earlier port workarounds (M3 part 2, Session 11) are history now: both stacks run at once.
 2. Carried over: the consumer stall (only reproduced on Redpanda) and `DeadLetterReplayService`'s
    unbounded transaction.
+
+## Session 20 — 2026-09-11
+
+### Goal
+
+Start M8: a load harness that judges a run by the invariants rather than by HTTP status codes, and a
+first experiment to find the throughput at which the saga stops keeping up — and what the system does
+past it. The expected ceiling was worked out from the code and written down before the first run.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| What one iteration is | Pay, then poll `GET /transfers/{id}` until the transfer settles, then think | `POST /transfers` answers 202 once three rows are committed, before any money moves. A test that reads only the POST measures the one component that cannot fall behind. |
+| Where the settle time comes from | `saga_instances`, accept → terminal, per 30 s window; k6's polled figure as the customer's view | Polling quantises to the poll interval and sees only transfers a VU was still watching. The table sees every saga, exactly. |
+| Load models | `knee` is open (ramping arrival rate); `users` is closed (1,000 VUs with think time) | An open model keeps arriving when the system slows down, so it measures latency honestly past saturation; a closed model backs off and under-reports it (coordinated omission). "1,000 concurrent" is a statement about sessions, so the closed profile prints its Little's-law rate beside the user count. |
+| Where k6 runs | In a container on the Compose network, image pinned (`grafana/k6:2.2.0`), capped at 2 GB | Through the host it would measure Docker Desktop's userspace port forwarder. |
+| Runner structure | `loadtest/run.sh` sources `chaos/lib.sh` | A load run is a chaos scenario with no fault: the same lock (a load run and a chaos run can never read each other's traffic), the same quiescence gate, accounts opened *before* the I3 baseline, and the same verdict — I1–I5 plus new S1–S4 violations. |
+| Correctness vs latency | Reported separately. Exit 1 = an invariant refuted, 3 = correct but SLO missed | A capacity finding and a correctness bug are different kinds of news. |
+| Idempotency under load | 2% of accepted POSTs re-sent with the same key; threshold `replay_consistent rate==1` | A retry answered with a different transfer is a double payment. |
+| Stack configuration during the run | As shipped (100% trace sampling, DEBUG for `com.dpe`) | One variable at a time; the ceilings found are structural. |
+
+### Expected ceiling, from the code
+
+- **payment-gateway, ~18 charges/s.** One listener thread, and the simulated PSP call
+  (`Thread.sleep(50)`) runs inside the `@Transactional` handler, holding the thread and a connection.
+- **Orchestrator relay, ~37 transfers/s.** One send at a time, each blocking on its ack
+  (`linger.ms` 5 plus a round trip), then a 500 ms sleep even after a full batch; three commands
+  per transfer.
+- **The API edge, far higher,** and blind to both.
+
+So: knee near 18/s, edge latency flat throughout, the queue forming as consumer lag on the gateway's
+group, and — past the knee — the 30 s step-timeout compensating sagas that were only waiting.
+
+### Built
+
+- `loadtest/transfers.js` — profiles `smoke`, `knee`, `users`; custom metrics `transfer_settle_ms`,
+  `transfer_outcome{outcome}`, `transfer_completed`, `replay_consistent`; per-VU token renewal inside
+  the 15-minute TTL; `name` tags on URLs so a transfer id never becomes a time series.
+- `loadtest/run.sh` — seeds 200 funded accounts and waits for the orchestrator's ownership
+  projection, records the baseline, runs k6, waits up to 900 s for the pipeline to drain, then
+  reports outcomes, per-window settle percentiles, accepted-vs-settled throughput, Prometheus peaks
+  (outbox backlog and age, consumer lag, pool waits, GC) and container CPU from a 5 s sampler.
+- `loadtest/README.md`. Results go to `loadtest/results/<run>/` (ignored).
+
+### The knee run
+
+Open model, 5 → 10 → 15 → 20 → 30 → 40 arrivals/s, 60 s per step.
+
+```
+window    started    /s   done timedout     p50     p95     p99     max   (s, accept -> terminal)
+17:28:50      300  10.0    300        0    2.40    2.90    3.10    3.26
+17:29:50      435  14.5    435        0    3.29    4.28    4.45    4.62
+17:30:20      446  14.9    446        0    3.74    4.29    4.47    4.64   last flat window
+17:30:50      534  17.8    534        0    4.34    6.76   14.19   15.03   the knee
+17:31:20      453  15.1    453        0   15.56   20.63   22.00   22.35
+17:31:50      592  19.7    555       46   20.16   33.66   35.34   35.66   timeouts begin
+17:32:20      681  22.7    409      409   37.14   69.35   73.16   76.15
+17:32:50      697  23.2      0      697   81.63   89.27   91.64   92.54   nothing completes
+17:34:20       44   1.5      0       44   35.37   35.64   35.66   35.67   1.5/s, still all timed out
+```
+
+5,382 transfers accepted (and 2,822 arrivals k6 could not start, all 1,000 VUs being busy): 3,943
+COMPLETED, 1,401 COMPENSATED and 38 FAILED — every non-completion a saga timeout. Zero HTTP errors
+in 248,628 requests; all 112 idempotent retries answered with the original transfer. **I1–I5 and
+S1–S4 all held.** Capacity on this machine is about 15 transfers/s, with the knee between 15 and 18.
+
+**Why throughput collapsed instead of plateauing** (Prometheus, 20 s steps):
+
+```
+                   31:20 31:40 32:00 32:20 32:40 33:00 33:20 33:40 34:00 34:20
+GET poll/s           144   237   452   569   843  1131  1424  1531  1616  1857
+settled/s             17     8    14    16    14    17    21     5     1     5
+orch pool waiting      0     0     0     0     0     0    59   187   187   145
+orch outbox rows      22    51    31    36    90    47   331   697   883   861
+```
+
+The gateway saturated first, as expected. Customers then waited longer, and each waiting customer
+polls: status requests rose from 144/s to 1,857/s and made up 97% of all traffic. Those requests
+took the orchestrator's ten database connections — 187 threads queued for one — and the outbox relay
+and the reply consumer draw from the same ten. The orchestrator could neither send commands nor
+read replies, so nothing completed, and every saga past 30 s was compensated, adding more messages
+to the starved pipeline. Arrivals at a tenth of capacity still timed out. That is a metastable
+failure: the system's own recovery work, and its clients' reaction to its slowness, kept it down
+after the load that caused it had gone.
+
+The pool was exhausted two minutes after the knee, so it was a consequence, not the trigger — and
+enlarging it would only have let the status requests take more connections. The missing pieces are
+a **bulkhead** (the pipeline must not queue behind read traffic) and **admission control** (the API
+accepted 20–26/s against a pipeline doing 15/s with nothing bounding the difference; a 202 is a
+promise, and the edge had no way to know it could not keep it).
+
+### What broke
+
+1. **Seeding opened 200 accounts and recorded 109.** Each parallel worker wrote the owner and then
+   the id as two separate writes to a shared pipe; writes under `PIPE_BUF` are atomic, pairs of
+   writes are not, and interleaved lines were discarded. Fixed by building each line and writing it
+   once.
+2. **The Windows Python on this machine cannot open a POSIX path** (`/g/project/...`). The seed file
+   came out empty and k6 failed parsing it. Fixed: the JSON is built with awk; Python only reads
+   stdin.
+3. **Stop-the-world pauses of several seconds on a ~60 MB live heap** — 4.8 s (account-service),
+   7.9 s (gateway), 1.3 and 2.6 s (orchestrator). All but one are full collections recorded as
+   `CodeCache GC Threshold`: the JIT's code cache growing as new code paths got hot under load, not
+   heap pressure (about 55 MB used of 247). Swap is ruled out (none in the container's cgroup). Why a
+   full collection of that heap takes seconds is not yet established. The gateway's 7.9 s pause fell
+   exactly on the knee, and with one consumer thread a pause is a stalled partition.
+4. **The orchestrator reached 505 of its 512 MiB container limit.** The heap is capped at 256 MB;
+   the rest is native (up to 200 request threads, metaspace, code cache, buffers). It was one step
+   from an OOM kill, and nothing alerts on container memory.
+5. **Jaeger was OOM-killed during the run.** Its store is bounded by `MEMORY_MAX_TRACES`, which
+   counts traces, not bytes; 248k requests at 100% sampling overran 384 MB well before 20,000
+   traces. The Compose comment calling it a hard ceiling was wrong. Every payment was unaffected —
+   the exporters logged failures and carried on, which is the property the tracing design requires.
+6. **The knee run reported `SLO: MET` over a collapse,** because the knee profile deliberately sets
+   no latency thresholds and k6 therefore exited 0. It now reports "not judged".
+7. **Unexplained: the first five requests of the smoke run took ~600 ms**; every later one took
+   17–51 ms. Five virtual users firing at the same instant after a long idle. Not Redis, not pool
+   acquisition (1.8 ms max), not reproducible sequentially.
+
+### Verified
+
+```
+./loadtest/run.sh                (smoke)   42 transfers, all COMPLETED; settle p95 3.77 s;
+                                           I1-I5, S1-S4 PASS; exit 3 (accept p99 607 ms - What broke 7)
+PROFILE=knee ./loadtest/run.sh             5,382 accepted: 3,943 COMPLETED, 1,401 COMPENSATED, 38 FAILED;
+                                           0 / 248,628 HTTP errors; replay_consistent 112/112;
+                                           drained 16 s after k6 stopped; I1-I5, S1-S4 PASS; exit 0
+docker inspect dpe-jaeger                  OOMKilled=true (exit 137); restarted, healthy
+```
+
+### Committed
+
+Not yet; M8 is in progress.
+
+### Open / next
+
+1. Admission control on `POST /transfers`, bounded by work in flight (Little's law: capacity ×
+   step-timeout is the ceiling, and the bound belongs well below it).
+2. A bulkhead in the orchestrator: the relay, reply consumer and sweeper must not share a pool with
+   request threads.
+3. Gateway throughput: the PSP call out of the transaction; listener concurrency equal to the
+   partition count.
+4. Relay pipelining: send a batch, then await the acks together; keep draining while batches are full.
+5. The `CodeCache GC Threshold` pauses — cause first, fix second.
+6. A real memory bound for Jaeger, or lower sampling under load.
+7. The `users` profile (1,000 concurrent) is not yet run.
+
+## Session 20, part 2 — 2026-09-12
+
+### Goal
+
+Fix the two defects the first knee run exposed: an API that accepted work with no idea whether the
+pipeline could finish it, and API reads that could take every database connection the pipeline
+needs. Then prove, by switching one off, which fix does what.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| What admission control bounds | Sagas in flight, counted from `saga_instances` | Little's law: at fixed throughput, bounding the number in the system bounds the wait, which is what the 30 s saga deadline cares about. A requests-per-second limit knows nothing about whether the pipeline keeps up. Counted from the database, the bound is global across instances. |
+| The limit | 150 | ~15/s measured capacity × a 10 s wait target (a third of the deadline, so no healthy saga is swept). A measurement of this deployment, to be re-derived when throughput changes. |
+| Where it is checked | Inside `createTransfer`, after the idempotency claim | Only new work reaches it. A retry of an accepted payment is replayed at any load; refusing it would tell a client "not accepted" about a payment that was. The refusal rolls back the claim, so the key is not consumed. |
+| How it counts | Recounted at most once a second, lazily, in the admitting request's own transaction; between counts, last count + admissions since | No query per request, no extra connection, no dependence on the service's single scheduler thread. Errs toward refusing early, never late. A soft bound, and documented as one. |
+| Status code | 503 with `Retry-After`, code `AT_CAPACITY`, body telling the client to retry with the same `Idempotency-Key` | The refusal is about server state, not client behaviour (429). A fresh key after a lost 202 is the way to pay twice. |
+| Bulkhead | A fair semaphore on `/api/*` and `/admin/*`: 6 request permits against a pool of 10 | Each request uses at most one connection at a time, so 6 permits hold at most 6 and 4 are always free for the scheduler thread, the reply listener, the dead-letter listener and the health check. Boot refuses to start if permits ≥ pool size. |
+| Why not two connection pools | Rejected | A routing DataSource over two Hikari pools means defining DataSource beans, which in Boot 4 switches off the auto-configuration that wires connection details — including `@ServiceConnection` in every Testcontainers test. The semaphore gives the same isolation with one pool. |
+| Filter position | Just after Spring Security | Unauthenticated requests are answered 401 without spending a permit. |
+| Admission in the test suite | Effectively off by default; enabled at 3 in its own test with `@TestPropertySource` | The estimate is a singleton and the test base truncates the saga table under it; a real limit would make test order matter. |
+| Load client | 503 treated as an expected status; the customer waits `Retry-After` plus jitter and retries with the same key, giving up after 5 | Shedding filed as an HTTP failure makes a system protecting itself indistinguishable from one failing. |
+
+### Built
+
+- `admission/` — `AdmissionControl`, `AdmissionProperties`, `AdmissionRefusedException`; one call in
+  `TransferService.createTransfer`; a 503 handler in `ApiExceptionHandler`.
+- `web/RequestBulkhead`, `BulkheadProperties`, `BulkheadConfig` (registration and the startup guard).
+- Metrics `dpe.admission.refused`, `dpe.admission.limit`, `dpe.bulkhead.rejected`,
+  `dpe.bulkhead.in_use`, `dpe.bulkhead.permits`. Deliberately no gauge for the in-flight estimate:
+  it is recounted lazily, so on an idle system it would sit at its last value indefinitely.
+  `dpe.saga.inflight` is the refreshed number.
+- A "Load shedding" row on the Grafana dashboard.
+- `AdmissionControlTest` (refusal writes nothing; a replay is never refused; a refused key is reusable;
+  the HTTP 503 with `Retry-After`) and `RequestBulkheadTest` (refusal at capacity, permit returned
+  on exception, the startup guard).
+- The load client and runner updated for 503s and the new metrics.
+
+### Results: three runs of the same knee profile (5 → 40 arrivals/s)
+
+| | Neither | Bulkhead only | Both |
+|---|---|---|---|
+| Accepted | 5,382 | 6,211 | 5,741 |
+| Completed | 3,943 (73%) | 4,554 (73%) | **5,741 (100%)** |
+| Compensated or failed after acceptance | 1,439 | 1,657 | **0** |
+| Worst per-window settle p99 | 91.6 s | 59.9 s | **13.3 s** |
+| Settled/s at 40/s offered | ~3 | ~2 | **15.5–17.8** |
+| Orchestrator pool, threads waiting | 187 | 0 | 0 |
+| Orchestrator reply-listener lag | 294 | 8 | 0 |
+| Orchestrator outbox, peak rows | 883 | 864 | 43 |
+| Refused up front | — | — | 14,495 responses; 1,984 of 7,725 payments abandoned after 5 attempts |
+| I1–I5, S1–S4 | pass | pass | pass |
+
+- **Admission control prevents the collapse.** In flight flattened at the limit, the wait stayed at
+  the 10–13 s design target, and throughput held at twice the offered load the pipeline can carry.
+  The excess was told "not accepted, retry later" instead of "accepted" followed by a timeout.
+- **The bulkhead removes the starvation, and on its own that is not enough.** No thread ever
+  queued for a connection and the reply listener kept up, but with nothing bounding accepted work
+  the queue still outgrew the deadline. Bounding concurrency does not bound work.
+- **The next bottleneck is visible.** With its connection no longer contended, the orchestrator's
+  outbox still reached 864 rows: the relay's one-send-at-a-time ceiling.
+- The bulkhead never had to refuse a request in any run; its refusal path is covered by tests, not
+  yet observed live.
+
+### What broke
+
+1. **`mvn clean` could not delete `target/surefire-reports`** — a shell's working directory was
+   inside it, and Windows will not delete a directory in use. Stopping that background build then
+   left its Maven JVM running; it had to be found and killed before a clean re-run.
+2. **An edited provisioned Grafana dashboard was not reloaded** despite a 10 s update interval and
+   the new file being visible in the container; nothing was logged. A Grafana restart loaded it.
+   The cause (most likely change detection on a Docker Desktop bind mount) is not established.
+3. **k6 reported a negative request duration** in the third run: the VM's clock stepped backwards.
+
+### Verified
+
+```
+./mvnw -pl payment-orchestrator -am test -Dtest='AdmissionControlTest,RequestBulkheadTest'   7 of 7 pass
+./mvnw -B -ntp -pl payment-orchestrator -am clean verify     common-messaging 16, orchestrator 124, 0 failures
+docker compose up -d --build payment-orchestrator            healthy; "request bulkhead: 6 permits against a pool of 10"
+PROFILE=knee ./loadtest/run.sh  (both)                        5,741 of 5,741 COMPLETED; I1-I5, S1-S4 pass
+PROFILE=knee ./loadtest/run.sh  (DPE_ADMISSION_ENABLED=false) 1,657 COMPENSATED; pool waits 0; I1-I5, S1-S4 pass
+orchestrator recreated with the normal configuration          healthy; verify-invariants.sh passes
+```
+
+### Committed
+
+Not yet.
+
+### Open / next
+
+1. Relay pipelining — the measured next bottleneck.
+2. Gateway throughput (PSP call out of the transaction, listener concurrency 3), then re-derive
+   `max-in-flight` from the new capacity.
+3. The `CodeCache GC Threshold` pauses (2.7 s on account-service again).
+4. A real memory bound for Jaeger.
+5. The `users` profile (1,000 concurrent).

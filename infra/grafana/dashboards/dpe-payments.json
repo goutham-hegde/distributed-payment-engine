@@ -1243,13 +1243,297 @@
     },
     {
       "type": "row",
+      "title": "Load shedding - admission control and the bulkhead (M8)",
+      "id": 27,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission - sagas in flight vs the limit",
+      "description": "Little's L against the bound AdmissionControl enforces. In flight rising to the dashed line and flattening there is admission control WORKING: the excess is being refused (503 AT_CAPACITY) instead of queued. In flight ABOVE the line by more than a few means several instances are admitting against one stale count - it is a soft bound.\n\nThe limit is a measurement of this deployment's capacity (15/s x a 10 s wait target), not a constant.\n\nMetrics: dpe.saga.inflight, dpe.admission.limit",
+      "id": 28,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(dpe_saga_inflight{application=\"payment-orchestrator\"})",
+          "legendFormat": "in flight",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "max(dpe_admission_limit{application=\"payment-orchestrator\"})",
+          "legendFormat": "limit",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "limit"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Refused /s - at capacity vs busy",
+      "description": "Two different 503s. AT_CAPACITY is admission control declining NEW payments because the pipeline is full - a statement about the saga backlog. BUSY is the bulkhead declining ANY request because every request permit is held - a statement about database connections. Neither means a payment was lost: a refusal commits nothing, and the client retries with the same Idempotency-Key.\n\nZero is not automatically good news: at a rate the pipeline cannot drain, zero refusals means the edge is still promising work it cannot do.\n\nMetrics: dpe.admission.refused, dpe.bulkhead.rejected",
+      "id": 29,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(dpe_admission_refused_total{application=\"payment-orchestrator\"}[1m]))",
+          "legendFormat": "at capacity (admission)",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "sum(rate(dpe_bulkhead_rejected_total{application=\"payment-orchestrator\"}[1m]))",
+          "legendFormat": "busy (bulkhead)",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Bulkhead - request permits in use",
+      "description": "Concurrent API requests against the permits they may hold. The pool has more connections than there are permits, and the difference is reserved for the relay, the reply listener and the sweeper - so this line at the ceiling means API traffic is saturated WITHOUT the saga pipeline being starved, which is the point. Compare the pool panel below: pending there should now stay at zero.\n\nMetrics: dpe.bulkhead.in_use, dpe.bulkhead.permits",
+      "id": 30,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dpe-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "max(dpe_bulkhead_in_use{application=\"payment-orchestrator\"})",
+          "legendFormat": "in use",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dpe-prometheus"
+          },
+          "expr": "max(dpe_bulkhead_permits{application=\"payment-orchestrator\"})",
+          "legendFormat": "permits",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "permits"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
       "title": "Resources - USE",
       "id": 23,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 47
       },
       "collapsed": false,
       "panels": []
@@ -1267,7 +1551,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "targets": [
         {
@@ -1329,7 +1613,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 40
+        "y": 48
       },
       "targets": [
         {
@@ -1402,7 +1686,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 40
+        "y": 48
       },
       "targets": [
         {

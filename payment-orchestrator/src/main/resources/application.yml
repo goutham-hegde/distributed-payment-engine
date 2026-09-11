@@ -243,6 +243,44 @@ dpe:
     # Tests turn this off and call sweep() directly, so nothing races them.
     scheduled: true
 
+  # M8: how much new work POST /transfers may accept while earlier work is in flight. See
+  # AdmissionControl for why the bound is sagas-in-flight and why it is checked after the
+  # idempotency claim rather than before it.
+  admission:
+    enabled: true
+    # Little's law: in-flight = throughput x time-in-system. The first load test measured ~15
+    # settled transfers/s on this machine (knee between 15 and 18). The saga deadline is 30 s, and a
+    # payment admitted into a queue that takes longer than that is compensated having never failed.
+    # Aim for a third of the deadline - 10 s of worst-case wait - and the bound is 15/s x 10 s = 150.
+    # At the knee the system held ~65 in flight, so 150 lets a burst through and stops a flood.
+    # THIS IS A MEASUREMENT OF THIS DEPLOYMENT, not a constant: re-derive it whenever the
+    # pipeline's throughput changes, in either direction.
+    max-in-flight: 150
+    # How stale the count may be. Recounted by the next admission after it expires, inside that
+    # request's own transaction - one indexed COUNT a second, whatever the request rate.
+    count-interval: 1s
+    # Roughly one healthy saga's settle time: long enough that capacity has usually freed up, short
+    # enough that a customer is not kept waiting for nothing. Clients should add jitter - a Retry-
+    # After alone synchronises every refused client into one retry wave.
+    retry-after: 2s
+
+  # M8: a bulkhead between API requests and the saga pipeline, which share the pool above.
+  # See RequestBulkhead for the load-test collapse this exists for.
+  bulkhead:
+    # 6 of the pool's 10, leaving 4 that request traffic can never take. What needs them, at most
+    # one connection each and at the same time:
+    #   1  the scheduler thread - relay, sweeper, idempotency sweep, metrics refresh all share it
+    #      (Boot's default TaskScheduler has ONE thread; nothing here configures more)
+    #   1  the saga reply listener (concurrency 1)
+    #   1  the dead-letter listener
+    #   1  the actuator's DB health check, on the management port, which this filter does not see
+    # Raising this without raising hikari.maximum-pool-size is refused at startup (BulkheadConfig).
+    request-permits: 6
+    # A permit turns over every few milliseconds, so a second of waiting means the service really
+    # is saturated. Better to answer 503 than to hold the caller's connection for longer.
+    max-wait: 1s
+    retry-after: 1s
+
   # M4 part 2: retry and dead letter policy. See DeadLetterProperties for what each knob trades.
   dlq:
     # Four deliveries total, not four retries. Enough to ride out a pod restart or a brief

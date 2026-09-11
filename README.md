@@ -85,7 +85,12 @@ Every service also owns its own `outbox` and `inbox` tables.
   impossible rather than merely detected
 - **Retry with exponential backoff + jitter**, and a **Dead Letter Queue** with replay
 - **Chaos suite** of 8 injected-failure scenarios, each asserting the invariants
-- **Load tested** to 1,000 concurrent transfers with conservation verified
+- **Admission control** on the payment API, bounded by sagas in flight (Little's law) rather than
+  requests per second, and a **bulkhead** that reserves database connections for the saga pipeline
+  — both added after a load test drove the system into a metastable collapse, with money conserved
+  throughout
+- **Load testing** with k6 (open and closed models), judged by the invariants after the run rather
+  than by HTTP status codes — see [`loadtest/`](loadtest/README.md)
 
 ### A note on "exactly-once"
 
@@ -111,8 +116,8 @@ Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · Docker
 | M5 | JWT security | ✅ **done** |
 | M6 | Observability — metrics, dashboards, tracing, read endpoints | ✅ **done** |
 | M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ✅ **done** |
-| M7 | Chaos suite — 8 scenarios | ⬜ |
-| M8 | k6 load test to 1,000 concurrent | ⬜ |
+| M7 | Chaos suite — 8 scenarios | ✅ **done** |
+| M8 | k6 load test to 1,000 concurrent | 🚧 in progress |
 | M9 | Docs + README polish | ⬜ |
 | M10 | Kubernetes + Helm | ⬜ |
 

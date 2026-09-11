@@ -37,3 +37,6 @@ scripts/.i3-baseline
 
 # Held by a running chaos scenario, so a second one refuses to start. See chaos/lib.sh.
 chaos/.lock/
+
+# One directory per load run: the k6 summary, its HTML report, container stats and the console log.
+loadtest/results/

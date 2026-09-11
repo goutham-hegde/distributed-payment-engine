@@ -1,5 +1,6 @@
 package com.dpe.orchestrator.transfer;
 
+import com.dpe.orchestrator.admission.AdmissionControl;
 import com.dpe.orchestrator.authz.AccountOwnershipGuard;
 import com.dpe.orchestrator.saga.SagaInstance;
 import com.dpe.orchestrator.saga.SagaInstanceRepository;
@@ -55,15 +56,17 @@ public class TransferService {
     private final SagaStepRepository steps;
     private final SagaOrchestrator orchestrator;
     private final AccountOwnershipGuard ownership;
+    private final AdmissionControl admission;
 
     public TransferService(TransferRepository transfers, SagaInstanceRepository sagas,
                            SagaStepRepository steps, SagaOrchestrator orchestrator,
-                           AccountOwnershipGuard ownership) {
+                           AccountOwnershipGuard ownership, AdmissionControl admission) {
         this.transfers = transfers;
         this.sagas = sagas;
         this.steps = steps;
         this.orchestrator = orchestrator;
         this.ownership = ownership;
+        this.admission = admission;
     }
 
     /**
@@ -98,6 +101,13 @@ public class TransferService {
         if (request.amountMinor() <= 0) {
             throw new InvalidTransferException("Amount must be positive");
         }
+
+        // M8. After validation, so a malformed request is told what is wrong with it rather than
+        // to come back later; and here rather than in the controller, because only NEW work
+        // reaches this line - the idempotency gate has already answered every retry of an accepted
+        // payment. Throws inside this transaction, so the claim rolls back and the key stays
+        // unused. See AdmissionControl.
+        admission.admit();
 
         Transfer transfer = new Transfer(UUID.randomUUID(), request.fromAccountId(),
                 request.toAccountId(), request.amountMinor(),

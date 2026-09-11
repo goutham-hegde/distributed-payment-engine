@@ -1,12 +1,15 @@
 package com.dpe.orchestrator.web;
 
+import com.dpe.orchestrator.admission.AdmissionRefusedException;
 import com.dpe.orchestrator.authz.AccountAccessDeniedException;
 import com.dpe.orchestrator.idempotency.IdempotencyConflictException;
 import com.dpe.orchestrator.transfer.InvalidTransferException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingRequestHeaderException;
@@ -82,6 +85,36 @@ public class ApiExceptionHandler {
     ResponseEntity<Map<String, Object>> onInvalidCursor(InvalidCursorException e) {
         return body(HttpStatus.BAD_REQUEST, "INVALID_CURSOR",
                 "The cursor is not one this API issued");
+    }
+
+    /**
+     * M8: the pipeline is full, and this payment was NOT accepted.
+     *
+     * <p>503 rather than 429. 429 says the CLIENT sent too much - a per-caller rate limit - and
+     * this client may have sent one request all day. The refusal is about the server's state, so
+     * it is the server's status code. {@code Retry-After} tells the client when to try again, and
+     * the message tells it how: with the SAME Idempotency-Key, which a refusal did not consume. A
+     * client that retries with a fresh key after a lost 202 is the one way to pay twice, so the
+     * body says so rather than trusting every client to know.
+     *
+     * <p>Only ever reached for new work - see {@code AdmissionControl}. A retry of an accepted
+     * payment is replayed at any load, so this answer is always true when it is given.
+     */
+    @ExceptionHandler(AdmissionRefusedException.class)
+    ResponseEntity<Map<String, Object>> onAdmissionRefused(AdmissionRefusedException e) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, Long.toString(retryAfterSeconds(e.retryAfter())))
+                .body(Map.of(
+                        "timestamp", Instant.now().toString(),
+                        "status", HttpStatus.SERVICE_UNAVAILABLE.value(),
+                        "code", "AT_CAPACITY",
+                        "message", "The payment was not accepted: the system is at capacity. Retry "
+                                + "after the Retry-After interval with the same Idempotency-Key."));
+    }
+
+    /** Retry-After is whole seconds (RFC 9110); round up so "wait 1500 ms" is never "wait 1 s". */
+    static long retryAfterSeconds(Duration retryAfter) {
+        return Math.max(1, (retryAfter.toMillis() + 999) / 1000);
     }
 
     private static ResponseEntity<Map<String, Object>> body(HttpStatus status, String code,
