@@ -3182,7 +3182,7 @@ invariants.
 
 ### Committed
 
-Nothing yet — M7 is mid-flight.
+Committed with Sessions 17 and 18 as `df330a4` — "M7: the chaos suite - five saga defects it found, their fixes, and the lock that outlives its owner".
 
 ### Open / next
 
@@ -3353,7 +3353,7 @@ After the stall recovery above: `verify-invariants.sh` I1–I5 all pass, account
 
 ### Committed
 
-Nothing yet.
+`df330a4`, with Sessions 16 and 18 (see Session 18).
 
 ### Open / next
 
@@ -3543,11 +3543,11 @@ The stalled dead-letter consumer's ten records were replayed once it recovered: 
 
 ### Committed
 
-Nothing yet.
+`df330a4` — "M7: the chaos suite - five saga defects it found, their fixes, and the lock that outlives its owner". Sessions 16–18 in one commit: the harness, the five fixes and this session's work are one milestone, and several files carry changes from all three.
 
 ### Open / next
 
 1. The consumer stall: only ever reproduced on Redpanda. A comparison, not a root cause.
 2. `DeadLetterReplayService` holds a transaction across up to 50 sends; bound it like the relay if
    replays ever become routine.
-3. Commit M7.
+3. ~~Commit M7~~ — done, `df330a4`.
