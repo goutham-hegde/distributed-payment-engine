@@ -187,6 +187,9 @@ dpe:
     send-timeout: 5s
     # M7: a drain stops starting sends after this long and commits. See OutboxProperties.
     batch-budget: 10s
+    # M8: batches one tick may drain back to back while each comes back full. Bounded because the
+    # relay shares the single scheduler thread with the saga sweeper and the metrics refresh.
+    max-batches-per-poll: 5
     # Tests turn this off and call drainBatch() directly, so nothing races them.
     scheduled: true
 

@@ -106,6 +106,8 @@ dpe:
     send-timeout: 5s
     # M7: a drain stops starting sends after this long and commits. See OutboxProperties.
     batch-budget: 10s
+    # M8: batches one tick may drain back to back while each comes back full. See OutboxProperties.
+    max-batches-per-poll: 5
     scheduled: true
 
   # M4 part 2: retry and dead letter policy. See DeadLetterProperties for what each knob trades.

@@ -33,10 +33,21 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *                     ceiling on the relay's idle stretch is batchBudget + sendTimeout +
  *                     the producer's max.block.ms, and the session timeout in application.yml
  *                     is set above that sum.
+ * @param maxBatchesPerPoll M8. How many batches one scheduler tick may drain back to back, while
+ *                     each comes back full and fully acknowledged. Pipelined, a batch of 100 takes
+ *                     milliseconds, and then the relay would sleep pollInterval with a backlog
+ *                     waiting - so it drains again. Bounded because the relay has no thread of its
+ *                     own: in the orchestrator it shares Boot's single scheduler thread with the
+ *                     saga sweeper and the metrics refresh, and an unbounded loop under sustained
+ *                     load would stop sagas timing out and freeze every gauge at its last value.
+ *                     (A dedicated thread is not free either: it is a connection, taken from the
+ *                     reserve the request bulkhead keeps.) Any batch that is not both full and
+ *                     fully acked ends the tick, so a failing broker costs one batch per tick, as
+ *                     before.
  */
 @ConfigurationProperties(prefix = "dpe.outbox")
 public record OutboxProperties(int batchSize, Duration pollInterval, Duration sendTimeout,
-                               Duration batchBudget) {
+                               Duration batchBudget, int maxBatchesPerPoll) {
 
     public OutboxProperties {
         if (batchSize <= 0) {
@@ -50,6 +61,9 @@ public record OutboxProperties(int batchSize, Duration pollInterval, Duration se
         }
         if (batchBudget == null) {
             batchBudget = Duration.ofSeconds(10);
+        }
+        if (maxBatchesPerPoll <= 0) {
+            maxBatchesPerPoll = 5;
         }
     }
 }

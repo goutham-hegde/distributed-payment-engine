@@ -6,6 +6,7 @@ import io.micrometer.tracing.propagation.Propagator;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 import org.apache.kafka.common.header.Headers;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
@@ -107,12 +108,22 @@ public class OutboxTracing {
     }
 
     /**
-     * Opens a PRODUCER span for one publish attempt, parented to the stored context.
+     * Starts a PRODUCER span for one publish attempt, parented to the stored context.
      *
-     * <p>The returned handle is {@link AutoCloseable} and MUST be closed, in a try-with-resources,
-     * or the span leaks: the scope it opens is a thread local, and a relay thread that fails to
-     * close one will parent the next message - and every message after it - under a span that
-     * ended long ago.
+     * <p>The span is started but NOT made current. M8: the relay pipelines, so a batch has up to
+     * {@code batchSize} publish spans open at once on one thread, each ending when its own ack
+     * arrives, in whatever order the broker answers. A thread-local scope cannot express that:
+     * scopes nest, so they must close in reverse order of opening, and acks do not arrive in
+     * reverse order. Until M8 this method opened a scope and {@link PublishSpan#close()} closed it,
+     * which was correct only while the relay sent one message and waited for it before starting
+     * the next. Now the span's lifetime (send to ack) and the scope's (the {@code send()} call
+     * alone) are separate, and {@link PublishSpan#inScope} is the only place a scope is opened -
+     * inside a try-with-resources, so it cannot leak onto the next message.
+     *
+     * <p>The handle must still be closed, and closing it is what records the ack latency. A handle
+     * that is never closed loses its span - which is a far better failure than the one this
+     * replaced, where an unclosed handle left the THREAD pointing at a finished span and parented
+     * every later message under it.
      *
      * @param traceParent the row's {@code trace_parent}; {@code null} starts a fresh root span,
      *                    which is the right outcome for a message whose producer had no trace
@@ -140,25 +151,22 @@ public class OutboxTracing {
                 .tag("dpe.event.type", eventType)
                 .start();
 
-        return new PublishSpan(span, tracer.withSpan(span));
+        return new PublishSpan(span);
     }
 
     /**
-     * One publish attempt's span, plus the thread-local scope that makes it current.
+     * One publish attempt's span: open from the send to the broker's answer.
      *
-     * <p>Two objects rather than one because they answer different questions: the scope is about
-     * THIS thread, the span is about the operation. They are closed together here, in that order -
-     * scope first, then span - because ending a span while it is still the thread's current one
-     * leaves the thread pointing at something that has already finished.
+     * <p>Deliberately holds no scope. The span is about the operation and may outlive any number
+     * of other sends on the same thread; a scope is about THIS thread at THIS moment, and is opened
+     * only for the duration of {@link #inScope}.
      */
     public final class PublishSpan implements AutoCloseable {
 
         private final Span span;
-        private final Tracer.SpanInScope scope;
 
-        private PublishSpan(Span span, Tracer.SpanInScope scope) {
+        private PublishSpan(Span span) {
             this.span = span;
-            this.scope = scope;
         }
 
         /**
@@ -189,9 +197,27 @@ public class OutboxTracing {
             span.error(t);
         }
 
+        /**
+         * Runs {@code call} with this span current on the calling thread, and only for that long.
+         *
+         * <p>Wrap the {@code send()} in it - not the wait for the ack. Anything that reads the
+         * current span during the send (log correlation, any instrumentation inside the producer)
+         * then attributes it to this message. The ack is awaited later, possibly after many other
+         * sends, and making the span current across that wait is exactly the nesting problem this
+         * class was changed to avoid.
+         */
+        public <T> T inScope(Supplier<T> call) {
+            try (Tracer.SpanInScope ignored = tracer.withSpan(span)) {
+                return call.get();
+            }
+        }
+
+        /**
+         * Ends the span. Call it when the broker has answered - success or failure - or when the
+         * relay gives up waiting, so the span's duration is the time this message was in flight.
+         */
         @Override
         public void close() {
-            scope.close();
             span.end();
         }
     }

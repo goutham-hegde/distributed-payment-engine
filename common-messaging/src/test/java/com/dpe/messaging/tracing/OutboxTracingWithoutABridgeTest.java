@@ -49,6 +49,7 @@ class OutboxTracingWithoutABridgeTest {
             try (OutboxTracing.PublishSpan publish =
                          tracing.beginPublish(null, null, "dpe.account.events.v1", "FundsTransferred")) {
                 publish.injectInto(headers);
+                assertThat(publish.inScope(() -> "sent")).isEqualTo("sent");
                 publish.error(new IllegalStateException("recorded nowhere, and that is fine"));
             }
         }).doesNotThrowAnyException();

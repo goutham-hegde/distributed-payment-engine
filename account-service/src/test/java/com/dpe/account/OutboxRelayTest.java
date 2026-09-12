@@ -166,7 +166,7 @@ class OutboxRelayTest extends AbstractKafkaIT {
         // A budget shorter than any send: exactly one message per drain, because the first is
         // always attempted - otherwise this relay would never publish anything.
         OutboxRelay budgeted = new OutboxRelay(outboxRepository, kafka,
-                new OutboxProperties(100, null, null, Duration.ofNanos(1)), tracing);
+                new OutboxProperties(100, null, null, Duration.ofNanos(1), 0), tracing);
 
         assertThat(drainIn(budgeted)).isEqualTo(1);
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM outbox WHERE published_at IS NULL",

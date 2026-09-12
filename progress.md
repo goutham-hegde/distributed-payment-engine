@@ -3897,3 +3897,94 @@ orchestrator recreated with the normal configuration          healthy; verify-in
 3. The `CodeCache GC Threshold` pauses (2.7 s on account-service again).
 4. A real memory bound for Jaeger.
 5. The `users` profile (1,000 concurrent).
+
+## Session 21 — 2026-09-12
+
+### Goal
+
+Pipeline the outbox relay: define precisely what a pipelined `drainBatch` must preserve, write that
+down as tests before the rewrite, change the tracing API that a pipelined relay could not use, then
+rewrite the relay against the tests.
+
+A correction to the previous session's summary first. The relay is the next bottleneck *under
+overload* (the bulkhead-only run's outbox reached 864 rows), but the knee (~15/s) is set by the
+gateway, predicted at ~18 charges/s against the relay's ~37 transfers/s; with both fixes on, the
+orchestrator's outbox peaked at 43 rows. Pipelining the relay will not move a knee run on its own.
+The gateway has to be lifted first for a load run to show the relay change.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Ordering under pipelining | At most one unacknowledged message per aggregate; pipeline across aggregates only | The idempotent producer preserves order across its *own* retries. The relay's retry is a new record sent by a later poll; if A1 fails and A2 is already in flight and succeeds, A1's retry lands after A2. The serial loop avoided this by never sending A2 before A1's outcome was known. |
+| Waiting for acks | One deadline for the whole wait, not `sendTimeout` per future | Against a wedged broker, per-future waits sum to N × `sendTimeout` with the claim transaction open, while `idle_in_transaction_session_timeout` is 30 s. |
+| Batch budget | Checked before every `send()`, not only between waits | `send()` itself can block for `max.block.ms` (3 s) on metadata or a full buffer before returning a future. |
+| Where a row is marked | On the relay thread, after `get()` | The future completes on the producer's network thread; the entity belongs to the relay thread's persistence context and transaction. |
+| Tracing | A publish span no longer holds a thread-local scope; the scope covers only the `send()` call | With many spans open on one thread and acks arriving in any order, nested scopes cannot be closed in the order they were opened. |
+| How the tests observe pipelining | A scripted `MockProducer` recording in-flight sends per key; real Postgres | Counts ("5 in flight", "never two unacked for one key") rather than timing, where possible. |
+| Shape of the pipelined relay | Waves: each wave sends the next message of every unblocked aggregate, then awaits them all | Satisfies the ordering rule by construction. The simpler alternative (send each aggregate's first message, leave the rest for the next poll) costs a whole poll per extra message of one transfer. |
+| Draining again when a batch is full | Up to `max-batches-per-poll` (5) per tick, and only while each batch is full and fully acknowledged | A pipelined batch takes milliseconds, so sleeping the poll interval with a backlog wastes the speed-up. Bounded because the orchestrator's relay shares one scheduler thread with the saga sweeper and the metrics refresh; a dedicated thread would be a connection taken from the bulkhead's reserve. A short batch means drained, failing or out of budget, and only the first is a reason to continue. |
+
+### Built
+
+- `OutboxTracing.PublishSpan`: no scope held; `inScope(Supplier)` makes the span current for one
+  call; `close()` ends the span. The serial relay wraps its `send()` in `inScope`, so its behaviour is
+  unchanged.
+- `OutboxRelayPipeliningTest` (account-service, 6 tests). Two specify the new behaviour and fail
+  against the serial relay (`sendsTheWholeBatchBeforeWaitingForAnyAck`,
+  `oneDeadlineForTheWholeWaitNotOnePerMessage`). Four pass against it and guard what the rewrite
+  must keep: no two unacked sends for one aggregate, a failure holds back only its own aggregate,
+  only acknowledged rows are marked, and the budget is checked before every send.
+- The pipelined `OutboxRelay.drainBatch`: per-aggregate queues in claim order, waves, one ack
+  deadline per wave (past it the wait is zero, so an ack that already arrived still counts), the
+  budget checked before every send, rows marked on the relay thread, a synchronous `send()` failure
+  blocking only its aggregate, and an interrupt resolving the current wave without waiting. The
+  worst-case open-transaction stretch is unchanged: 10 s budget + 3 s `max.block.ms` + 5 s wait.
+- `OutboxRelayScheduler.poll()` drains again while batches come back full and fully acknowledged, up
+  to `dpe.outbox.max-batches-per-poll` (new, default 5, set in all three services).
+  `OutboxRelaySchedulerTest` (4 tests, no container) pins the three cases.
+- A wait timeout's `last_error` now reads "no broker acknowledgement within PT5S" rather than
+  "TimeoutException: null".
+
+### What broke
+
+1. **`KafkaTemplate` closes the producer after every non-transactional send.** A real producer
+   factory returns a close-safe wrapper; `MockProducerFactory` returns the bare `MockProducer`, which
+   then refuses the next send ("MockProducer is already closed"). The test double ignores `close()`.
+2. **`MockProducer` without a partitioner takes partition 0 of its `Cluster`**, and the default
+   cluster is empty: `IndexOutOfBoundsException` on the first send.
+3. **The first version of the deadline test would have failed a correct relay.** The first send in
+   the JVM carried ~850 ms of warm-up (2.05 s measured for 3 × 400 ms). A warm-up drain and a wider
+   margin fixed it; the serial relay then measured 2.68 s against a predicted 2.5 s, leaving ~180 ms
+   of overhead, so a pipelined relay should finish in about 0.7 s against the 1.5 s bound.
+
+### Verified
+
+```
+./mvnw -B -ntp -q -pl account-service -am clean test-compile     exit 0
+OutboxTracingWithoutABridgeTest     3/3 pass
+OutboxRelayTest                     8/8 pass
+OutboxTracePropagationTest          5/5 pass
+OutboxRelayPipeliningTest           4 pass, 2 fail as intended against the serial relay
+                                    (1 in flight where 5 expected; 2.68 s against a 1.5 s bound)
+
+After the rewrite:
+OutboxRelayPipeliningTest 6/6, OutboxRelayTest 8/8, OutboxTracePropagationTest 5/5,
+OutboxTracingWithoutABridgeTest 3/3, OutboxRelaySchedulerTest 4/4
+./mvnw -B -ntp clean verify         BUILD SUCCESS in 14:24 - common-messaging 20, account-service 97,
+                                    payment-orchestrator 124, payment-gateway 9: 250 tests, 0 failures
+```
+
+Not yet measured under load: the stack was down, and a knee run cannot show the relay change until
+the gateway stops being the bottleneck.
+
+### Committed
+
+Nothing yet.
+
+### Open / next
+
+1. Gateway throughput: listener concurrency 3, then the PSP call's place in the transaction; then a
+   knee run, which re-derives `max-in-flight` and is the first live measurement of the pipelined
+   relay.
+2. The `CodeCache GC Threshold` pauses, a memory bound for Jaeger, the `users` profile.

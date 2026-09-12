@@ -32,15 +32,32 @@ public class OutboxRelayScheduler {
     private static final Logger log = LoggerFactory.getLogger(OutboxRelayScheduler.class);
 
     private final OutboxRelay relay;
+    private final OutboxProperties properties;
 
-    public OutboxRelayScheduler(OutboxRelay relay) {
+    public OutboxRelayScheduler(OutboxRelay relay, OutboxProperties properties) {
         this.relay = relay;
+        this.properties = properties;
     }
 
+    /**
+     * Drains until a batch comes back short, up to {@code maxBatchesPerPoll} batches - see
+     * {@link OutboxProperties#maxBatchesPerPoll} for why the bound exists. Each drainBatch() call
+     * goes through the proxy and so is its own transaction: one batch per transaction, never one
+     * around the loop, or every batch's row locks would be held until the last committed.
+     */
     @Scheduled(fixedDelayString = "${dpe.outbox.poll-interval:500ms}")
     public void poll() {
         try {
-            int published = relay.drainBatch();
+            int published = 0;
+            for (int batch = 0; batch < properties.maxBatchesPerPoll(); batch++) {
+                int acked = relay.drainBatch();
+                published += acked;
+                // Short means the outbox is drained, or something failed or ran out of budget.
+                // Only the first is a reason to go again, and the other two are reasons not to.
+                if (acked < properties.batchSize()) {
+                    break;
+                }
+            }
             if (published > 0) {
                 log.debug("outbox relay published {} message(s)", published);
             }
