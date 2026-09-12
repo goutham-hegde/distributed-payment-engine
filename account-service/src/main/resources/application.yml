@@ -158,6 +158,13 @@ spring:
 
 # M2 relay tuning. See OutboxProperties for what each knob actually trades away.
 dpe:
+  account:
+    # M8. Consumers of dpe.account.commands.v1 in this instance - one per partition (3), in the one
+    # group. Each holds a pool connection for its transaction: 3 of maximum-pool-size 10, beside the
+    # scheduler thread (relay), the dead-letter listener, the health check and the account API.
+    # Only worth more than 1 because CLEARING is sharded - see V8 and AccountCommandConsumer.
+    command-concurrency: 3
+
   outbox:
     batch-size: 100
     poll-interval: 500ms

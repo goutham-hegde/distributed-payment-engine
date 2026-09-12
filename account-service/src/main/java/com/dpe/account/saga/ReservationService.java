@@ -45,11 +45,20 @@ import org.springframework.transaction.annotation.Transactional;
  * lose the command or apply it twice.
  *
  * <p><b>Locks are taken in a globally deterministic order.</b> Every method touches two accounts,
- * and one of them - CLEARING - is touched by <i>every concurrent saga in the system</i>. Locking
- * "the sender, then clearing" is a per-transfer order, not a global one, and two sagas can still
- * form a cycle. The two ids are sorted and the lower one is locked first, exactly as
+ * and one of them is a CLEARING shard that other sagas touch at the same moment. Locking "the
+ * sender, then clearing" is a per-transfer order, not a global one, and two sagas can still form a
+ * cycle. The two ids are sorted and the lower one is locked first, exactly as
  * {@code TransferService} does, so deadlock is structurally impossible rather than merely
- * detected and retried.
+ * detected and retried. ({@code UUID.compareTo} is SIGNED, so for about half of all random ids the
+ * sender sorts before the shard. That is fine - one total order is all the argument needs - but
+ * "the shard is always locked first" is not true, and nothing may rely on it.)
+ *
+ * <p><b>CLEARING is sharded (M8, V8).</b> With one clearing row, every reserve and commit in the
+ * system took the same row lock and held it to commit, so account-service ran one money movement at
+ * a time however many consumer threads it had. A reserve now picks one of several shards
+ * ({@link ClearingAccounts}) and RECORDS it on the hold; commit and release read it back. They
+ * never recompute it: the commit/release mutual exclusion below depends on both writing the SAME
+ * clearing leg, and a recomputed shard is only the same one while the shard list never changes.
  *
  * <p><b>The money rules live in constraints.</b> The overdraft check is
  * {@code accounts_customer_balance_non_negative}; one-hold-per-transfer is
@@ -101,15 +110,17 @@ public class ReservationService {
     private final LedgerEntryRepository ledgerEntries;
     private final HoldRepository holds;
     private final TransferVoidRepository voids;
+    private final ClearingAccounts clearingAccounts;
     private final OutboxWriter outbox;
 
     public ReservationService(AccountRepository accounts, LedgerEntryRepository ledgerEntries,
                               HoldRepository holds, TransferVoidRepository voids,
-                              OutboxWriter outbox) {
+                              ClearingAccounts clearingAccounts, OutboxWriter outbox) {
         this.accounts = accounts;
         this.ledgerEntries = ledgerEntries;
         this.holds = holds;
         this.voids = voids;
+        this.clearingAccounts = clearingAccounts;
         this.outbox = outbox;
     }
 
@@ -154,9 +165,24 @@ public class ReservationService {
             return;
         }
 
-        // Sorted by id, never by the role the account plays in this transfer. CLEARING is in every
-        // saga, so a role-based order would put it on both sides of a cycle.
-        UUID clearingId = AccountType.CLEARING_ACCOUNT_ID;
+        // M8: which CLEARING shard this transfer parks its money in. Chosen here, once, and written
+        // onto the hold below; commit and release read it from the hold and never ask again. No
+        // shard in this currency is the same refusal the currency check further down gives - it is
+        // just discovered before any row is locked, since there is nothing to lock.
+        Optional<UUID> shard = clearingAccounts.forTransfer(command.transferId(), command.currency());
+        if (shard.isEmpty()) {
+            reject(command, ReserveRejected.CURRENCY_MISMATCH,
+                    "no clearing account in " + command.currency());
+            return;
+        }
+        UUID clearingId = shard.get();
+
+        // Sorted by id, never by the role the account plays in this transfer. Every saga touches a
+        // CLEARING shard, so a role-based order would put one on both sides of a cycle. With the
+        // shards this matters MORE than it did with one clearing row, not less: two reserves can now
+        // genuinely run at once (three consumer threads), and they deadlock the moment one locks
+        // sender-then-shard while another locks shard-then-sender. One global order (UUID.compareTo,
+        // the same comparator TransferService uses) makes that cycle impossible to form.
         UUID first = lower(command.fromAccountId(), clearingId);
         UUID second = first.equals(command.fromAccountId()) ? clearingId : command.fromAccountId();
 
@@ -239,7 +265,7 @@ public class ReservationService {
         clearing.applyDelta(amount);
 
         UUID holdId = UUID.randomUUID();
-        holds.save(new Hold(holdId, command.transferId(), sender.getId(), amount,
+        holds.save(new Hold(holdId, command.transferId(), sender.getId(), clearing.getId(), amount,
                 command.currency()));
 
         outbox.append("Transfer", command.transferId(), Topics.ACCOUNT_EVENTS,
@@ -281,7 +307,8 @@ public class ReservationService {
             return;
         }
 
-        UUID clearingId = AccountType.CLEARING_ACCOUNT_ID;
+        // The shard the reserve parked the money in - read from the hold, never recomputed (V8).
+        UUID clearingId = hold.getClearingAccountId();
         Accounts locked = lockPair(clearingId, command.toAccountId());
         if (locked == null) {
             log.error("CommitFunds cannot settle transfer {}: recipient {} does not exist",
@@ -363,7 +390,8 @@ public class ReservationService {
             return;
         }
 
-        UUID clearingId = AccountType.CLEARING_ACCOUNT_ID;
+        // The shard the reserve parked the money in - read from the hold, never recomputed (V8).
+        UUID clearingId = hold.getClearingAccountId();
         Accounts locked = lockPair(clearingId, hold.getAccountId());
         if (locked == null) {
             log.error("ReleaseFunds cannot compensate transfer {}: account {} does not exist",
@@ -422,13 +450,13 @@ public class ReservationService {
 
     /**
      * Who a committed hold paid. The hold does not record it - the commit's CREDIT leg does, and
-     * it is the only CREDIT for the transfer that did not go to CLEARING.
+     * it is the only CREDIT for the transfer that did not go to the hold's CLEARING shard.
      */
     private UUID recipientOf(Hold hold) {
         return ledgerEntries.findByTransferIdOrderByIdAsc(hold.getTransferId()).stream()
                 .filter(e -> e.getEntryType() == EntryType.CREDIT)
                 .map(LedgerEntry::getAccountId)
-                .filter(id -> !id.equals(AccountType.CLEARING_ACCOUNT_ID))
+                .filter(id -> !id.equals(hold.getClearingAccountId()))
                 .findFirst()
                 .orElse(null);
     }

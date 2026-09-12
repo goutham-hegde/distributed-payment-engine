@@ -19,11 +19,42 @@ public final class LedgerInvariants {
     private LedgerInvariants() {
     }
 
-    /** I1, I2 and I5 - the three that hold at every instant, with no baseline required. */
+    /**
+     * I1, I2 and I5 - the three that hold at every instant, with no baseline required - plus the
+     * clearing identity, which also holds at every instant.
+     */
     public static void assertAll(JdbcTemplate jdbc) {
         assertI1GlobalSumIsZero(jdbc);
         assertI2BalancesMatchEntries(jdbc);
         assertI5NoNegativeCustomerBalance(jdbc);
+        assertClearingShardsMatchTheirHolds(jdbc);
+    }
+
+    /**
+     * M8: every CLEARING shard holds exactly the money of the ACTIVE holds that name it.
+     *
+     * <p>Stronger than "total clearing = total active holds", which is what V3 described for one
+     * clearing account: a hold settled against a DIFFERENT shard than the one it was parked in
+     * leaves the total right and two shards wrong in opposite directions. I1 and I2 cannot see that
+     * - the legs balance and every balance matches its own entries - so this is the only check
+     * that would.
+     */
+    public static void assertClearingShardsMatchTheirHolds(JdbcTemplate jdbc) {
+        List<Map<String, Object>> drifted = jdbc.queryForList("""
+                SELECT a.id,
+                       a.balance_minor                                   AS parked,
+                       COALESCE(SUM(h.amount_minor)
+                                FILTER (WHERE h.status = 'ACTIVE'), 0)   AS held
+                  FROM accounts a
+                  LEFT JOIN holds h ON h.clearing_account_id = a.id
+                 WHERE a.account_type = 'CLEARING'
+                 GROUP BY a.id, a.balance_minor
+                HAVING a.balance_minor <> COALESCE(SUM(h.amount_minor)
+                                                   FILTER (WHERE h.status = 'ACTIVE'), 0)
+                """);
+        assertThat(drifted)
+                .as("each CLEARING shard's balance must equal the ACTIVE holds parked in it")
+                .isEmpty();
     }
 
     /**

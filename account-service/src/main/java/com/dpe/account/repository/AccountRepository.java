@@ -1,7 +1,9 @@
 package com.dpe.account.repository;
 
 import com.dpe.account.domain.Account;
+import com.dpe.account.domain.AccountType;
 import jakarta.persistence.LockModeType;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -29,6 +31,16 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select a from Account a where a.id = :id")
     Optional<Account> findByIdForUpdate(@Param("id") UUID id);
+
+    /**
+     * M8: the CLEARING shards, in a stable order. Read by {@code ClearingAccounts}, which picks one
+     * per transfer. The order only has to agree between instances, and it does - they all read it
+     * from the same table.
+     */
+    @Query("select a.id from Account a where a.accountType = :type and a.currency = :currency "
+            + "order by a.id")
+    List<UUID> findIdsByTypeAndCurrency(@Param("type") AccountType type,
+                                        @Param("currency") String currency);
 
     /**
      * <b>M6 part 3, invariant I5.</b> Customer accounts holding a negative balance - an overdraft

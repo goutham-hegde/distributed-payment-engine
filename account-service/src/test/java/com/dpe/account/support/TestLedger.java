@@ -71,6 +71,23 @@ public class TestLedger {
         return balance == null ? 0L : balance;
     }
 
+    /**
+     * M8: money in flight, across every CLEARING shard. Replaces reading "the" clearing account,
+     * which since V8 is only one of eight - a reserve may have parked its money in any of them.
+     */
+    public long clearingBalance() {
+        Long balance = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(balance_minor), 0) FROM accounts WHERE account_type = 'CLEARING'",
+                Long.class);
+        return balance == null ? 0L : balance;
+    }
+
+    /** M8: the CLEARING shard a transfer's hold recorded at reserve. */
+    public UUID clearingShardOf(UUID transferId) {
+        return jdbc.queryForObject(
+                "SELECT clearing_account_id FROM holds WHERE transfer_id = ?", UUID.class, transferId);
+    }
+
     public int entryCountFor(UUID transferId) {
         Integer count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM ledger_entries WHERE transfer_id = ?", Integer.class, transferId);

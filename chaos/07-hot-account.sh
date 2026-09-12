@@ -11,9 +11,15 @@
 #   the sender ends at exactly 0        (never negative - and I5's CHECK constraint would refuse
 #                                        the write if the application ever tried)
 #
-# Every reserve locks the sender AND the shared CLEARING row in sorted-id order; that ordering is
-# what lets this run without a single deadlock rather than with deadlocks detected and retried.
-# The scenario counts deadlocks in the Postgres log window to prove the "without".
+# Every reserve locks the sender AND a CLEARING shard in sorted-id order; that ordering is what lets
+# this run without a single deadlock rather than with deadlocks detected and retried. The scenario
+# counts deadlocks in the Postgres log window to prove the "without".
+#
+# Since M8 this is genuinely concurrent at the database. Until then account-service had ONE consumer
+# thread, so the 90 reserves arrived in parallel over HTTP and were then applied one at a time -
+# the lock order was only ever exercised by the Java concurrency tests. With three consumer threads
+# (one per partition) and CLEARING sharded, three reserves out of this one account really do
+# contend for its row, which is what the scenario always claimed to test.
 
 source "$(dirname "$0")/lib.sh"
 

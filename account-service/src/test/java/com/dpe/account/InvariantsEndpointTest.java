@@ -102,8 +102,9 @@ class InvariantsEndpointTest extends AbstractPostgresIT {
         // while a saga runs. Without adding the hold back, the 'constant' would dip and recover
         // on every transfer and the invariant would be unusable under load.
         jdbc.update("""
-                INSERT INTO holds (id, transfer_id, account_id, amount_minor, currency, status)
-                VALUES (?, ?, ?, 30000, 'INR', 'ACTIVE')
+                INSERT INTO holds (id, transfer_id, account_id, clearing_account_id, amount_minor,
+                                   currency, status)
+                VALUES (?, ?, ?, '00000000-0000-0000-0000-000000000002', 30000, 'INR', 'ACTIVE')
                 """, UUID.randomUUID(), UUID.randomUUID(), account);
         jdbc.update("UPDATE accounts SET balance_minor = balance_minor - 30000 WHERE id = ?",
                 account);

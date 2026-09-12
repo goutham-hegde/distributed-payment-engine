@@ -44,6 +44,16 @@ public class Hold {
     private UUID accountId;
 
     /**
+     * M8: the CLEARING shard the money is parked in, chosen at reserve and never recomputed.
+     * Commit and release debit this account. If they recomputed it from the transfer id instead,
+     * adding a shard would settle older holds against a different account than they were parked in
+     * - and the commit/release mutual exclusion, which relies on both writing the same
+     * {@code (transfer_id, clearing, DEBIT)} leg, would stop covering them. See V8.
+     */
+    @Column(name = "clearing_account_id", nullable = false, updatable = false)
+    private UUID clearingAccountId;
+
+    /**
      * A positive magnitude, unlike {@link LedgerEntry#getAmountMinor()} which is signed. A hold
      * has no direction to encode, and invariant I3 sums this column directly - a signed value
      * would make that sum meaningless.
@@ -78,13 +88,15 @@ public class Hold {
         // for JPA
     }
 
-    public Hold(UUID id, UUID transferId, UUID accountId, long amountMinor, String currency) {
+    public Hold(UUID id, UUID transferId, UUID accountId, UUID clearingAccountId, long amountMinor,
+                String currency) {
         if (amountMinor <= 0) {
             throw new IllegalArgumentException("hold amount must be positive: " + amountMinor);
         }
         this.id = id;
         this.transferId = transferId;
         this.accountId = accountId;
+        this.clearingAccountId = clearingAccountId;
         this.amountMinor = amountMinor;
         this.currency = currency;
         this.status = HoldStatus.ACTIVE;
@@ -133,6 +145,10 @@ public class Hold {
 
     public UUID getAccountId() {
         return accountId;
+    }
+
+    public UUID getClearingAccountId() {
+        return clearingAccountId;
     }
 
     public long getAmountMinor() {

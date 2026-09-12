@@ -2,7 +2,6 @@ package com.dpe.account;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.dpe.account.domain.AccountType;
 import com.dpe.account.saga.ReservationService;
 import com.dpe.account.support.AbstractPostgresIT;
 import com.dpe.account.support.LedgerInvariants;
@@ -104,7 +103,7 @@ class ReserveOwnershipTest extends AbstractPostgresIT {
                 "alice"));
 
         assertThat(ledger.balanceOf(sender)).isEqualTo(70_000L);
-        assertThat(ledger.balanceOf(AccountType.CLEARING_ACCOUNT_ID))
+        assertThat(ledger.clearingBalance())
                 .as("money in flight lives in CLEARING, never nowhere")
                 .isEqualTo(30_000L);
         assertThat(holdCount(transferId)).isEqualTo(1);

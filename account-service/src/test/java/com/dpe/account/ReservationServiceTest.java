@@ -2,7 +2,6 @@ package com.dpe.account;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.dpe.account.domain.AccountType;
 import com.dpe.account.saga.ReservationService;
 import com.dpe.account.support.AbstractPostgresIT;
 import com.dpe.account.support.LedgerInvariants;
@@ -56,7 +55,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         assertThat(ledger.balanceOf(sender))
                 .as("the money has genuinely left the sender - a hold is not a promise")
                 .isEqualTo(70_000L);
-        assertThat(ledger.balanceOf(AccountType.CLEARING_ACCOUNT_ID))
+        assertThat(ledger.clearingBalance())
                 .as("and it is sitting in CLEARING, which is where money in flight lives")
                 .isEqualTo(30_000L);
         assertThat(ledger.balanceOf(recipient))
@@ -157,7 +156,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
 
         assertThat(ledger.balanceOf(sender)).isEqualTo(70_000L);
         assertThat(ledger.balanceOf(recipient)).isEqualTo(30_000L);
-        assertThat(ledger.balanceOf(AccountType.CLEARING_ACCOUNT_ID))
+        assertThat(ledger.clearingBalance())
                 .as("CLEARING is back to zero: nothing is in flight any more")
                 .isZero();
         assertThat(statusOfHold(holdId)).isEqualTo("COMMITTED");
@@ -191,7 +190,7 @@ class ReservationServiceTest extends AbstractPostgresIT {
         assertThat(ledger.balanceOf(recipient))
                 .as("the recipient never received anything")
                 .isZero();
-        assertThat(ledger.balanceOf(AccountType.CLEARING_ACCOUNT_ID)).isZero();
+        assertThat(ledger.clearingBalance()).isZero();
         assertThat(statusOfHold(holdId)).isEqualTo("RELEASED");
 
         assertThat(ledger.entryCountFor(transferId))

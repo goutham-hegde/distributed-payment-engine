@@ -24,9 +24,27 @@ import tools.jackson.databind.ObjectMapper;
  * {@code AccountEventConsumer} - acknowledge only after the handler's transaction has committed,
  * do not acknowledge on failure, and keep the transaction in the handler so that
  * {@code ack.acknowledge()} cannot run inside it.
+ *
+ * <h2>Concurrency (M8)</h2>
+ *
+ * <p>{@code dpe.account.command-concurrency} consumers, one per partition of
+ * {@link Topics#ACCOUNT_COMMANDS}, all in the one group. Unlike the gateway and the orchestrator,
+ * the threads here DO meet on shared rows - two transfers out of one account, or into one - and
+ * what keeps that correct is the lock discipline in {@code ReservationService}, not partitioning:
+ * the per-transfer advisory lock first, then exactly two account rows in one global id order. Until
+ * M8 that discipline was only ever exercised by tests, because one consumer thread serialized every
+ * command anyway.
+ *
+ * <p>More threads only help because CLEARING is sharded (V8): with one clearing row, every reserve
+ * and every commit locked it and held it to commit, and extra threads queued on that one lock.
+ *
+ * <p>The listener is named for the concurrency test; {@code idIsGroup = false} keeps it in the
+ * {@code account-service} group - without it the id becomes the group id.
  */
 @Component
 public class AccountCommandConsumer {
+
+    public static final String LISTENER_ID = "account-commands";
 
     private static final Logger log = LoggerFactory.getLogger(AccountCommandConsumer.class);
 
@@ -48,7 +66,9 @@ public class AccountCommandConsumer {
         this.objectMapper = objectMapper;
     }
 
-    @KafkaListener(topics = Topics.ACCOUNT_COMMANDS)
+    // No default in the placeholder: a mis-nested key should fail the boot, not fall back to one.
+    @KafkaListener(id = LISTENER_ID, idIsGroup = false, topics = Topics.ACCOUNT_COMMANDS,
+            concurrency = "${dpe.account.command-concurrency}")
     public void onCommand(ConsumerRecord<String, String> record, Acknowledgment ack) {
 
         String eventType = header(record, EventEnvelope.EVENT_TYPE_HEADER);

@@ -4107,3 +4107,142 @@ that stayed at 150".
 3. Unloaded latency is set by the relay poll interval (~1.7 s of ~1.9 s), not throughput.
 4. A memory bound for Jaeger (OOM-killed in five of the last six knee runs); the orchestrator's 1.8 s
    allocation-failure pause; the `users` profile.
+
+## Session 22, part 2 — 2026-09-12
+
+### Goal
+
+account-service had become the knee (~35/s), and its limit was a hot row: every reserve and commit
+locked the one CLEARING account and held it to commit. Measure that contention, remove it, and prove
+the new concurrency cannot deadlock.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Measure first | account-service consumers ×3 with one CLEARING row, a lock sampler on `pg_locks` / `pg_stat_activity` | A hot row is a hypothesis until sessions are seen queued on it. The sampler counts tuple locks on account rows and matches them to the CLEARING row's ctid. |
+| The fix | Shard CLEARING: eight accounts (`V8__sharded_clearing.sql`) | Keeps every invariant literally true: each shard is an ordinary account (I2), legs still balance (I1), shards are outside I3's sum as before. A derived CLEARING balance would have changed what I2 means; a "CLEARING last" lock order would have been a global rule change that still serializes on the commit's WAL flush. |
+| Which shard | `hash(transfer_id) mod N`, chosen at RESERVE and recorded on the hold (`holds.clearing_account_id`) | Commit and release read the shard from the hold and never recompute it. Recomputing is correct only while the shard list never changes: add a shard and older holds would settle against a different account than they were parked in, and the commit/release mutual exclusion (both write the same `(transfer_id, clearing, DEBIT)` leg) would stop covering them. |
+| Enforcing that a hold is parked in a CLEARING account | Composite foreign key `(clearing_account_id, clearing_account_type) → accounts (id, account_type)`, the type column pinned to `'CLEARING'` by a CHECK | A plain foreign key would accept a customer account, whose balance would then carry someone else's money in flight. |
+| Existing holds | Backfilled to the original CLEARING (now shard 0), then `NOT NULL`, with no DEFAULT | A default would quietly supply the original for any future insert that forgot the column: the recompute-instead-of-record bug in another form. |
+| Shard count | 8, as data (rows), not configuration | With three consumer threads, two concurrent transfers share a shard 1 time in 8. Adding shards later is safe because holds record theirs. |
+| A currency with no shard | Refused as `CURRENCY_MISMATCH`, before any lock | The same answer the reserve gave when the single CLEARING account had a different currency. |
+| account-service consumers | 3, one per partition (`dpe.account.command-concurrency`) | Only worth it once CLEARING stopped serializing every transaction. |
+| Test isolation | Test contexts get a bootstrap and datasource address (and, in the orchestrator, a Redis address) that reach nothing (`127.0.0.1:9`), and the Kafka test bases turn topic creation back on | See What broke 1. `auto-startup=false` does not stop a restarted context's listeners. |
+
+### Built
+
+- `V8__sharded_clearing.sql`; `Hold.clearingAccountId`; `ClearingAccounts` (the shard for a
+  transfer, from the CLEARING rows in its currency); `ReservationService` reserves into the chosen
+  shard and settles against the hold's; `AccountCommandConsumer` concurrency 3.
+- `ClearingShardTest`: reserves spread over the shards with each shard's balance equal to its own
+  ACTIVE holds; a commit and a release of a pre-V8 hold settle against the original account, not the
+  one the transfer id maps to now; the database refuses a hold parked in a non-CLEARING account;
+  45 transfers round a ring of three accounts (every account both paying and being paid) reserved
+  and committed in parallel with exact balances and no deadlock. `AccountCommandConcurrencyTest`
+  pins 3 consumers in group `account-service`.
+- `LedgerInvariants.assertAll` now also checks the per-shard identity (shard balance = ACTIVE holds
+  naming it). It is stronger than the single-account total: a hold settled against the wrong shard
+  leaves the total right and two shards wrong in opposite directions, and I1 and I2 cannot see it.
+- Test configuration in all three modules; account-service's Postgres test base now switches its
+  listeners off, as the other two services' do.
+
+### Results: the knee profile (5 → 40 arrivals/s), continuing from part 1
+
+| | replies ×3 (part 1) | + account ×3, one CLEARING | + CLEARING ×8 |
+|---|---|---|---|
+| results dir | 20260912T134310Z | 20260912T144105Z | 20260912T150159Z |
+| Completed | 7,417 of 7,417 | 7,852 of 7,852 | 7,944 of 7,944 |
+| Settle p99 in the ~30/s windows | — | 4.0–4.7 s | **2.8–3.1 s** |
+| Worst window p99 | 9.1 s | 6.1 s | 9.4 s (a 6.7 s GC pause, below) |
+| Refused (503) | 4,626 | 1,769 | 1,055 |
+| Sessions waiting on an account-row lock (mean, busy samples) | — | 1.24 of 2.03 active | 0.33 of 1.78 |
+| …of which on CLEARING | — | ≥ 0.81 | 0.08 |
+| account-service consumer busy | 0.90–0.99 (one thread) | — | 0.2–0.4 per thread |
+| I1–I5, S1–S4 | pass | pass | pass |
+
+- Three threads helped even with one CLEARING row, because part of each command (deserialising, the
+  inbox insert, the ~4 ms offset commit) happens outside the lock. But roughly one thread ran while
+  the others queued, mostly on CLEARING.
+- With the shards the curve stays flat (p99 ≈ 3 s) up to 31 starts/s. The two top windows were set
+  by a **6.7 s full GC on the gateway** (SerialGC, one core at 101% during the pause) and a 1.9 s one
+  on the orchestrator, not by locks. The gateway's consumers, at 0.72–0.87 busy, are the next stage
+  to saturate.
+- The orchestrator container reached **491 of 512 MiB** during the run.
+
+### What broke
+
+1. **Running the test suite with the Compose stack up put test consumers into the live consumer
+   groups.** One full verify in part 1 joined the live `account-service` group 18 times and the live
+   `payment-orchestrator` group 24 times. A test consumer in a live group takes partitions, processes
+   live commands against the *test* database, and commits their offsets, so the running service
+   never sees them. No traffic was flowing at the time and the next load run's quiescence check
+   passed, so nothing is believed lost. There were two causes:
+   - account-service's Postgres test base never set `spring.kafka.listener.auto-startup=false`, and
+     every default address in `application.yml` is `localhost`, where Compose publishes the broker,
+     Postgres and Redis.
+   - The orchestrator's test base *did* set it, and its consumers still started. Spring Framework
+     7.0.9 pauses cached test contexts and restarts them on reuse (`spring.test.context.cache.pause`,
+     default `ON_CONTEXT_SWITCH`), and spring-kafka 4.1.1's registry starts **every** container on a
+     `start()` after refresh (`startIfNecessary`: `(contextRefreshed && alwaysStartAfterRefresh) ||
+     isAutoStartup()`, with `alwaysStartAfterRefresh` defaulting to `true`). `auto-startup=false`
+     only governs a context's first start. Both were confirmed from the bytecode.
+
+   The fix is that tests have no route to anything: `127.0.0.1:9` for the bootstrap and the
+   datasource in every module's test properties, and for Redis in the orchestrator's (the only
+   service that uses it), overridden by `@ServiceConnection` wherever a container exists. After it, with the stack up, the full verify made zero contacts with the live
+   broker, and the restarted listeners can be seen in the logs failing to reach port 9 instead.
+   The same verify also ran faster (4:42 against 6:05). Plausibly because non-Kafka contexts no
+   longer create topics or join groups at startup, but that has not been isolated.
+2. **The first parallel test could not have caught a deadlock.** Its senders and recipients were
+   disjoint, so a per-role lock order (sender, then clearing, then recipient) happened to be global
+   and the test would have passed it. Rewritten as a ring (A pays B, B pays C, C pays A). With the
+   order mutated to per-role, Postgres reported 9 deadlocks and the test failed; with the global order
+   it passes. Before that, the same test had asserted 16 transfers per recipient where its own
+   distribution gave 18/15/15.
+3. **Settling against a recomputed shard was caught, but not by the check expected to catch it.**
+   With commit mutated to recompute the shard, the test failed on
+   `accounts_customer_balance_non_negative`. Despite its name, that constraint is
+   `balance_minor >= 0 OR account_type = 'SYSTEM'`, so it covers CLEARING too: the wrong shard was
+   empty and could not go negative. Under load the wrong shard would usually hold other transfers'
+   money and the debit would succeed. The per-shard identity is the check that catches that case.
+4. **Jaeger was OOM-killed again**, and the gateway's 6.7 s pause shows that GC under load, not lock
+   contention, now sets the tail.
+
+### Verified
+
+```
+knee run, account ×3 + one CLEARING, lock sampler    7,852/7,852 COMPLETED; I1-I5, S1-S4 pass;
+                                                     1.24 of 2.03 active sessions waiting on a row lock
+./mvnw -pl account-service -am clean verify (stack up)   before the test fix: 18 live-group joins in part 1;
+                                                     after: 0 contacts with localhost:29092
+ClearingShardTest 5/5, AccountCommandConcurrencyTest 1/1, ReservationServiceTest 10/10,
+ReserveOwnershipTest 4/4, InvariantsEndpointTest 7/7
+  mutation: commit recomputes the shard          FAILS (accounts_customer_balance_non_negative)
+  mutation: per-role lock order                   FAILS - 9 x "deadlock detected"
+docker compose up -d --build account-service     "Successfully applied 1 migration ... now at version v8";
+                                                 8 CLEARING accounts, 48,429 holds backfilled; invariants pass
+knee run, CLEARING ×8, lock sampler              7,944/7,944 COMPLETED; I1-I5, S1-S4 pass;
+                                                 0.33 of 1.78 active sessions waiting, 0.08 on CLEARING
+./chaos/07-hot-account.sh                        HYPOTHESIS HELD - exactly 60 completed, 30 refused,
+                                                 sender at 0, 0 deadlocks in the Postgres log
+./mvnw -B -ntp clean verify (stack up)           BUILD SUCCESS in 04:42 - common-messaging 20,
+                                                 account-service 103, payment-orchestrator 126,
+                                                 payment-gateway 10: 259 tests, 0 failures;
+                                                 0 contacts with the live broker
+```
+
+### Committed
+
+See the commits that follow `094896f`.
+
+### Open / next
+
+1. GC under load now sets the tail: a 6.7 s SerialGC full collection on the gateway, 1.9 s on the
+   orchestrator, and the orchestrator at 491 of 512 MiB. Heap sizing and the collector choice are
+   next.
+2. The gateway's consumers (0.72–0.87 busy at ~36/s) are the next stage to saturate.
+3. `max-in-flight` has not been re-derived since CLEARING was sharded; do it with a knee run, not
+   arithmetic.
+4. Per-record offset commits; the relay poll interval as the unloaded-latency floor; a memory bound
+   for Jaeger; the `users` profile.
