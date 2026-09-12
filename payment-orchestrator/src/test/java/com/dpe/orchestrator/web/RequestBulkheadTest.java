@@ -75,13 +75,25 @@ class RequestBulkheadTest {
     @Test
     @DisplayName("a bulkhead as large as the pool is refused at startup - it would reserve nothing")
     void bulkheadMustLeaveAReserve() {
-        assertThatThrownBy(() -> BulkheadConfig.requireReserve(10, 10))
+        assertThatThrownBy(() -> BulkheadConfig.requireReserve(10, 10, 1))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("must be below the connection pool size");
-        assertThatThrownBy(() -> BulkheadConfig.requireReserve(12, 10))
+                .hasMessageContaining("exceeds the connection pool size");
+        assertThatThrownBy(() -> BulkheadConfig.requireReserve(12, 10, 1))
                 .isInstanceOf(IllegalStateException.class);
 
-        BulkheadConfig.requireReserve(6, 10);
+        BulkheadConfig.requireReserve(6, 10, 1);
+    }
+
+    @Test
+    @DisplayName("the reserve must cover every reply listener thread, not merely be non-empty")
+    void reserveCoversEveryListenerThread() {
+        // The M8 change this guards: three reply threads against the old pool of 10. 6 < 10 still
+        // held, and the reserve would have been two connections short of what the pipeline needs.
+        assertThatThrownBy(() -> BulkheadConfig.requireReserve(6, 10, 3))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("3 reply listener threads");
+
+        BulkheadConfig.requireReserve(6, 12, 3);
     }
 
     private RequestBulkhead bulkhead(int permits, Duration maxWait) {

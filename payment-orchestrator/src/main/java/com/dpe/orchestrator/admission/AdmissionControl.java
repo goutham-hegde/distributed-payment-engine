@@ -89,7 +89,7 @@ public class AdmissionControl {
                 .register(registry);
         // The limit only - NOT the estimate. The estimate is recounted lazily, by the next
         // admission, so on an idle system it would sit at whatever it last was forever: a gauge
-        // pinned at 150 on a system with nothing in flight. dpe.saga.inflight is the refreshed,
+        // pinned at the limit on a system with nothing in flight. dpe.saga.inflight is the refreshed,
         // honest in-flight number; plot it against this line.
         Gauge.builder("dpe.admission.limit", properties, p -> p.maxInFlight())
                 .description("Sagas that may be in flight before new transfers are refused")

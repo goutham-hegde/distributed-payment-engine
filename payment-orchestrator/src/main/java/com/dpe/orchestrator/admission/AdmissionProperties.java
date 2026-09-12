@@ -8,8 +8,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *
  * <p>Every value here is a statement about MEASURED capacity, not a tuning knob to be nudged until
  * a graph looks better. See application.yml for the derivation of the default, and re-derive it
- * whenever the pipeline's throughput changes - a faster gateway makes this limit too cautious, a
- * slower one makes it a lie.
+ * with a knee run whenever the pipeline's throughput changes. Not by arithmetic alone: after the
+ * knee moved from ~15/s to ~35/s, "capacity x 10 s" said 300, and the run at 300 doubled the tail
+ * for 1.7% more completions - capacity falls as the queue deepens, and Little's law gives the mean.
  *
  * @param enabled       master switch. Boxed, because a primitive binds to false when the key is
  *                      absent and admission control would ship silently off (the M4 trap)
@@ -26,6 +27,7 @@ public record AdmissionProperties(Boolean enabled, Integer maxInFlight, Duration
             enabled = true;
         }
         if (maxInFlight == null || maxInFlight <= 0) {
+            // Kept equal to application.yml's measured value; see there for the derivation.
             maxInFlight = 150;
         }
         if (countInterval == null || countInterval.isNegative()) {

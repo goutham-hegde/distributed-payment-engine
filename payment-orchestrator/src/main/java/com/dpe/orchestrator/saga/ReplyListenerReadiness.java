@@ -22,7 +22,11 @@ import org.springframework.stereotype.Component;
  *
  * <ol>
  *   <li>The reply listener has partitions assigned. Before the group join completes it has none,
- *       and whatever it is "waiting for" may already have arrived.</li>
+ *       and whatever it is "waiting for" may already have arrived. Since M8 the listener runs
+ *       several consumers ({@code dpe.saga.reply-concurrency}); the container reports the union of
+ *       their assignments, so this still means "this instance holds reply partitions", exactly as
+ *       it did with one. The range assignor's eager rebalance revokes everything before it
+ *       reassigns, so a rebalance between the threads empties the union and restarts the grace.</li>
  *   <li>It has had them for at least {@code dpe.saga.listen-grace}. Being assigned is not the same
  *       as having read the backlog; the grace is time to drain what queued up while it was deaf.
  *       It is measured from the first sweep that SAW the assignment, so its resolution is one sweep

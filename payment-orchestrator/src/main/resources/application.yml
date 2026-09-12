@@ -7,7 +7,9 @@ spring:
     username: ${DB_USER:payments}
     password: ${DB_PASSWORD:payments}
     hikari:
-      maximum-pool-size: 10
+      # M8: 12, not 10 - the reply listener's three threads each hold one. The budget is spelled out
+      # under dpe.bulkhead below, and BulkheadConfig refuses to boot if it does not add up.
+      maximum-pool-size: 12
       pool-name: orchestrator-pool
       # M7: reap a transaction whose client died mid-flight. See account-service's application.yml
       # for the measured failure and why 30 s is above the relay's bounded idle stretch.
@@ -220,6 +222,12 @@ dpe:
     # during the ~23 s a restarted instance spent rejoining its consumer group. See
     # ReplyListenerReadiness.
     listen-grace: 10s
+    # M8. Consumers of the two reply topics in this instance, all in the one group. At 1 the
+    # listener was the knee (93-99% busy at ~24 transfers/s). Ceiling 3: each topic has three
+    # partitions, and the default range assignor divides each topic separately, so a fourth consumer
+    # would be assigned nothing. Each thread is a pool connection; see dpe.bulkhead.
+    # SagaReplyConsumer has why this is safe.
+    reply-concurrency: 3
     # Tests turn this off and call sweep() directly, so a background thread cannot race them.
     scheduled: true
 
@@ -251,13 +259,31 @@ dpe:
   # idempotency claim rather than before it.
   admission:
     enabled: true
-    # Little's law: in-flight = throughput x time-in-system. The first load test measured ~15
-    # settled transfers/s on this machine (knee between 15 and 18). The saga deadline is 30 s, and a
+    # Little's law: in-flight = throughput x time-in-system. The saga deadline is 30 s, and a
     # payment admitted into a queue that takes longer than that is compensated having never failed.
-    # Aim for a third of the deadline - 10 s of worst-case wait - and the bound is 15/s x 10 s = 150.
-    # At the knee the system held ~65 in flight, so 150 lets a burst through and stops a flood.
-    # THIS IS A MEASUREMENT OF THIS DEPLOYMENT, not a constant: re-derive it whenever the
-    # pipeline's throughput changes, in either direction.
+    # Aim for a third of the deadline - 10 s of worst-case wait - so the bound is capacity x 10 s.
+    #
+    # First derived (2026-09-11) as 15/s x 10 s = 150. Re-derived 2026-09-12 after the knee moved
+    # from ~15/s to ~35/s, and it is STILL 150 - by measurement, after the arithmetic said 300:
+    #
+    #   limit 150   7,417 completed, 4,626 refusals, worst window p99  9.1 s
+    #   limit 300   7,542 completed, 2,025 refusals, worst window p99 19.9 s
+    #
+    # +1.7% completions for twice the tail, two-thirds of the deadline. Two things the
+    # "capacity x 10 s" arithmetic gets wrong:
+    #   1. Little's law gives the MEAN wait. The 10 s target is a tail target; aim the mean lower.
+    #   2. Capacity is not a constant of the pipeline - it falls as the queue deepens. Every
+    #      customer polls until settled, so GETs scale with in-flight (46/s -> ~500/s at 286), all
+    #      three databases share one Postgres, and account-service's per-command time doubled
+    #      (11 -> 18-23 ms). The throughput to divide by is the one measured AT the queue depth the
+    #      limit allows (~22/s at 286), not the peak (36/s at ~110).
+    #
+    # The bound is an UPPER limit on queue, not a throughput knob: once the bottleneck is
+    # saturated, raising it buys wait and almost nothing else. The floor is capacity x the unloaded
+    # settle time (~2 s), ~60 here - below that it starves the bottleneck.
+    #
+    # THIS IS A MEASUREMENT OF THIS DEPLOYMENT, not a constant: re-derive it with a knee run
+    # whenever the pipeline's throughput changes, in either direction.
     max-in-flight: 150
     # How stale the count may be. Recounted by the next admission after it expires, inside that
     # request's own transaction - one indexed COUNT a second, whatever the request rate.
@@ -270,14 +296,14 @@ dpe:
   # M8: a bulkhead between API requests and the saga pipeline, which share the pool above.
   # See RequestBulkhead for the load-test collapse this exists for.
   bulkhead:
-    # 6 of the pool's 10, leaving 4 that request traffic can never take. What needs them, at most
+    # 6 of the pool's 12, leaving 6 that request traffic can never take. What needs them, at most
     # one connection each and at the same time:
     #   1  the scheduler thread - relay, sweeper, idempotency sweep, metrics refresh all share it
     #      (Boot's default TaskScheduler has ONE thread; nothing here configures more)
-    #   1  the saga reply listener (concurrency 1)
+    #   3  the saga reply listener (dpe.saga.reply-concurrency)
     #   1  the dead-letter listener
     #   1  the actuator's DB health check, on the management port, which this filter does not see
-    # Raising this without raising hikari.maximum-pool-size is refused at startup (BulkheadConfig).
+    # Permits + that sum above hikari.maximum-pool-size is refused at startup (BulkheadConfig).
     request-permits: 6
     # A permit turns over every few milliseconds, so a second of waiting means the service really
     # is saturated. Better to answer 503 than to hold the caller's connection for longer.

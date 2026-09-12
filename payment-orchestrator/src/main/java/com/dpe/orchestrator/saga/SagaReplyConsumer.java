@@ -61,6 +61,26 @@ import tools.jackson.databind.ObjectMapper;
  * everything that shares the table.</b> A key that is unique per message but not per consumer is
  * fine right up to the day someone adds a second consumer, and then it fails by being too
  * effective rather than by erroring.
+ *
+ * <h2>One listener, several threads (M8)</h2>
+ *
+ * <p>One listener is not one thread. {@code dpe.saga.reply-concurrency} consumers in the SAME group
+ * split the six reply partitions between them, and one group still means every message passes one
+ * inbox gate once - the rule above is about groups, and this changes nothing about it. With one
+ * thread this listener was the knee of the system: 93-99% busy at ~24 settled transfers/s, three
+ * replies per transfer at ~15 ms each.
+ *
+ * <p>Why more threads are safe, and it is not because of partitioning. A saga's replies arrive on
+ * two topics; each is keyed by transfer id and both have three partitions, so with the default
+ * range assignor partition N of both lands on the same consumer - a transfer's replies usually
+ * share a thread. Nothing relies on that. Every saga transition loads the saga {@code FOR UPDATE},
+ * which it already had to, because the timeout sweeper and the reconcile endpoint race the replies
+ * from other threads. The two projections this listener also feeds are single-row upserts guarded by
+ * a constraint, with no aggregate across rows for two threads to interleave.
+ *
+ * <p>Each thread holds a connection for its handler's transaction, so the value is a claim on the
+ * pool: {@code BulkheadConfig} refuses to boot if request permits plus background connections
+ * exceed it.
  */
 @Component
 public class SagaReplyConsumer {
@@ -120,8 +140,10 @@ public class SagaReplyConsumer {
         this.objectMapper = objectMapper;
     }
 
+    // No default in the placeholder: a mis-nested key should fail the boot, not fall back to one.
     @KafkaListener(id = LISTENER_ID, idIsGroup = false,
-            topics = {Topics.ACCOUNT_EVENTS, Topics.GATEWAY_EVENTS})
+            topics = {Topics.ACCOUNT_EVENTS, Topics.GATEWAY_EVENTS},
+            concurrency = "${dpe.saga.reply-concurrency}")
     public void onReply(ConsumerRecord<String, String> record, Acknowledgment ack) {
 
         String eventType = header(record, EventEnvelope.EVENT_TYPE_HEADER);

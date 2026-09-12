@@ -3980,7 +3980,7 @@ the gateway stops being the bottleneck.
 
 ### Committed
 
-Nothing yet.
+`d129fc7` — "M8 (part 2): pipeline the outbox relay without reordering an aggregate".
 
 ### Open / next
 
@@ -3988,3 +3988,122 @@ Nothing yet.
    knee run, which re-derives `max-in-flight` and is the first live measurement of the pipelined
    relay.
 2. The `CodeCache GC Threshold` pauses, a memory bound for Jaeger, the `users` profile.
+
+## Session 22 — 2026-09-12
+
+### Goal
+
+Lift the gateway, which set the knee, so a load run can finally show the pipelined relay; then
+follow the bottleneck wherever it moved and re-derive the admission limit from the new capacity.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Gateway consumers | 3, one per partition of `dpe.gateway.commands.v1` (`dpe.gateway.command-concurrency`) | Each charge holds its thread through the PSP call, so 50 ms of latency capped the whole system at 20/s. Per-transfer order comes from the key, not the thread count; the concurrent-charge race was already settled by `UNIQUE(transfer_id)`. A fourth consumer would be assigned nothing. |
+| How the concurrency is declared | On the `@KafkaListener`, from a property with no default | Scoped to one listener (the dead-letter listener stays at one). A mis-nested yml key fails the boot instead of quietly running one thread. |
+| Moving the PSP call out of the transaction | Not done | Three threads hold 3 of 10 gateway connections through the sleep, and the gateway pool never had a waiting thread. The case for moving it is correctness under a slow PSP, not throughput, and it needs a pending-charge state and recovery path of its own. |
+| Orchestrator reply consumers | 3, all in the one group (`dpe.saga.reply-concurrency`) | The single reply thread was 93–99% busy once the gateway was lifted. Every saga transition already loads the saga `FOR UPDATE` (the sweeper and reconcile race the replies), and the two projections are single-row upserts under a constraint, so more threads change no outcome. |
+| Orchestrator pool | 10 → 12 | Two more reply threads are two more connections. The request bulkhead's reserve must still cover everything background can hold at once. |
+| Bulkhead startup guard | `permits + (3 + reply threads) ≤ pool`, replacing `permits < pool` | The old check would have gone on passing with the reserve two connections short. A thread that touches the database is a connection, so the boot now does the arithmetic. |
+| `max-in-flight` | Re-derived with two runs; **stays 150** | "Capacity × 10 s" said 300. At 300 the worst window p99 was 19.9 s (two-thirds of the deadline) for 1.7% more completions. Little's law gives the mean, and capacity falls as the queue deepens (below). |
+| Account-service consumers | Not changed | Every reserve and commit locks the CLEARING row and holds it to commit, so extra threads there would queue on one row lock. That is a ledger design question, not a configuration one. |
+
+### Built
+
+- `GatewayCommandConsumer`: named listener (`idIsGroup = false`), `concurrency` from
+  `dpe.gateway.command-concurrency: 3`. `GatewayCommandConcurrencyTest` asserts 3 consumers, at most
+  the partition count, in group `payment-gateway`.
+- `SagaReplyConsumer`: `concurrency` from `dpe.saga.reply-concurrency: 3`; javadoc records why it is
+  safe. `ReplyListenerConcurrencyTest` (real broker): three consumers in `payment-orchestrator`,
+  each holding one partition of each reply topic, all six covered, and the sweeper's readiness gate
+  opening on the union.
+- `BulkheadConfig.requireReserve(permits, pool, replyConcurrency)`; `RequestBulkheadTest` pins
+  "6 permits, pool 10, 3 reply threads" as a boot failure.
+- The `max-in-flight` derivation in `application.yml` rewritten around the three measurements.
+
+### Results: the same knee profile (5 → 40 arrivals/s), three configurations
+
+| | S20 baseline | + gateway ×3 | + replies ×3 | + limit 300 |
+|---|---|---|---|---|
+| Completed | 5,741 of 5,741 | 6,365 of 6,365 | 7,417 of 7,417 | 7,542 of 7,542 |
+| Best 30 s window started/s | 17.8 | 24.2 | 36.6 | 39.8 |
+| Worst window p99 | 13.3 s | 12.4 s | 9.1 s | **19.9 s** |
+| Refused (503) | 14,495 | 11,197 | 4,626 | 2,025 |
+| Peak sagas in flight | ~150 | 149 | 148 | 286 |
+| Busiest stage at the top | gateway (predicted, not measured) | orchestrator replies, 93–99% | account-service, 90–99% | account-service, 99% |
+| I1–I5, S1–S4 | pass | pass | pass | pass |
+
+Where the time goes, decomposed per hop from the outboxes' `created_at`/`published_at` and the
+consuming transaction's start:
+
+- **The relay is not a bottleneck at any load.** Its wait is flat at p50 ~0.28 s, p95 ~0.54 s,
+  from 4/s to 40/s: uniform over the 500 ms poll interval. Six relay hops account for ~1.7 s of the
+  ~1.9 s unloaded settle time. The poll interval, not throughput, sets unloaded latency.
+- **Gateway ×3:** each gateway thread ~45% busy at the top; its hop stayed ~0.3 s. The queue moved
+  to the orchestrator's single reply thread: 0.7–2.3 s per reply hop, three hops per saga.
+- **Replies ×3:** orchestrator hops back to ~0.1 s, each reply thread ~40% busy. The queue moved to
+  account-service's single consumer (1.6–2.2 s per hop in the worst windows).
+- **Offset commits** (`ack-mode: manual_immediate`) average ~4 ms, a quarter of the orchestrator's
+  ~15 ms per reply.
+
+### What broke
+
+1. **The first re-derivation of `max-in-flight` was wrong, and only a run could show it.**
+   30/s × 10 s = 300 doubled the tail. Customers poll until their payment settles, so GETs grow with
+   the number in flight: 46/s at low load, ~500/s at 286. All three databases share one Postgres,
+   and account-service's per-command time went from 11 ms to 18–23 ms while its own thread had no
+   contention. Throughput at 286 in flight was ~22/s against 36/s at ~110. Capacity is a function of
+   the queue the limit allows, which is the S20 collapse's feedback loop in a milder form. (The link
+   through Postgres is consistent with the timing, not isolated.)
+2. **A stage at 95% utilisation turns every pause into a long queue.** Backlog drains at (1 − ρ) of
+   capacity, so a pause costs about ρ/(1 − ρ) times its own length: ~20× at 95%. The erratic windows
+   in the second run line up with a 0.57 s GC pause on account-service and a 1.8 s one on the
+   orchestrator.
+3. **The `CodeCache GC Threshold` pauses are not code-cache exhaustion.** The code heaps held ~41 of
+   116 MiB. The trigger is a growth threshold, and under SerialGC it runs as a full stop-the-world
+   collection (0.57 s once on account-service). The orchestrator's 1.8 s pause was an ordinary
+   allocation failure, which points at heap pressure under load instead.
+4. **Jaeger was OOM-killed in all three runs** (exit 137), and in two of the three S20 runs. Payments were
+   unaffected. It needs a real memory bound before the `users` profile.
+5. **An uncontrolled variable:** a Kind cluster from another project was running throughout
+   (mean 1.3–1.75 cores, peaks above 4 of 16). It was not running during the S20 runs.
+
+### Verified
+
+```
+./mvnw -pl payment-gateway -am test -Dtest='GatewayCommandConcurrencyTest,ChargeServiceTest'   10/10 pass
+  same, with idIsGroup = false removed      FAILS: expected "payment-gateway" but was "gateway-commands"
+docker compose up -d --build                   3 gateway consumers, one partition each, group payment-gateway
+PROFILE=knee ./loadtest/run.sh  (gateway x3)                  6,365/6,365 COMPLETED; I1-I5, S1-S4 pass
+./mvnw -pl payment-orchestrator -am test -Dtest='ReplyListenerConcurrencyTest,RequestBulkheadTest,
+    ReplyListenerReadinessTest,AccountEventConsumerTest'      1 + 4 + 4 + 3 pass
+orchestrator rebuilt                "6 permits against a pool of 12 - 6 reserved ... which needs 6";
+                                    saga-replies-0/1/2 each hold one partition of each reply topic
+PROFILE=knee ./loadtest/run.sh  (+ replies x3)                7,417/7,417 COMPLETED; I1-I5, S1-S4 pass
+PROFILE=knee ./loadtest/run.sh  (+ max-in-flight 300)         7,542/7,542 COMPLETED; I1-I5, S1-S4 pass;
+                                                              worst p99 19.9 s -> reverted to 150
+orchestrator rebuilt at 150         dpe_admission_limit 150.0, dpe_bulkhead_permits 6.0
+./scripts/verify-invariants.sh                                I1-I5, S1-S4 pass
+./mvnw -B -ntp clean verify         BUILD SUCCESS in 06:05 - common-messaging 20, account-service 97,
+                                    payment-orchestrator 126, payment-gateway 10: 253 tests, 0 failures
+```
+
+### Committed
+
+`93d7d87` — "gateway: one command consumer per partition, which moved the knee from ~17/s to ~24/s".
+The reply-listener concurrency, the bulkhead arithmetic and the admission re-derivation are in the
+commit that follows it.
+
+### Open / next
+
+1. **account-service is the knee (~35/s), and its limit is a hot row.** Every reserve and commit
+   locks CLEARING and holds it to commit, so consumer concurrency alone will queue on that lock.
+   First measure it (concurrency 3, then `pg_locks` under load); the candidate designs are sharded
+   clearing accounts, a derived rather than maintained CLEARING balance, or taking the CLEARING lock
+   last in a new global order.
+2. Per-record offset commits (`manual_immediate`, ~4 ms of ~15 ms per reply): `manual` would batch
+   them, with the inbox absorbing the wider redelivery window.
+3. Unloaded latency is set by the relay poll interval (~1.7 s of ~1.9 s), not throughput.
+4. A memory bound for Jaeger (OOM-killed in five of the last six knee runs); the orchestrator's 1.8 s
+   allocation-failure pause; the `users` profile.

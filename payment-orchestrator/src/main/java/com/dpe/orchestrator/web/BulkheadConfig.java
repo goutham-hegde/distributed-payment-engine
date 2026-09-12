@@ -6,6 +6,7 @@ import java.sql.SQLException;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.security.autoconfigure.web.servlet.SecurityFilterProperties;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -35,10 +36,10 @@ public class BulkheadConfig {
      * is being protected with.
      */
     @Bean
-    FilterRegistrationBean<RequestBulkhead> requestBulkhead(BulkheadProperties properties,
-                                                            MeterRegistry registry,
-                                                            DataSource dataSource) {
-        requireReserve(properties.requestPermits(), poolSize(dataSource));
+    FilterRegistrationBean<RequestBulkhead> requestBulkhead(
+            BulkheadProperties properties, MeterRegistry registry, DataSource dataSource,
+            @Value("${dpe.saga.reply-concurrency}") int replyConcurrency) {
+        requireReserve(properties.requestPermits(), poolSize(dataSource), replyConcurrency);
 
         FilterRegistrationBean<RequestBulkhead> registration =
                 new FilterRegistrationBean<>(new RequestBulkhead(properties, registry));
@@ -49,23 +50,44 @@ public class BulkheadConfig {
     }
 
     /**
-     * A bulkhead as large as the pool reserves nothing and protects nothing - and would look, in
-     * config and on the dashboard, exactly like one that did. So it is a boot failure, not a
-     * warning: someone raising the permits to "fix" 503s under load must raise the pool with them,
-     * on purpose.
+     * Connections background work can hold at the same moment, apart from the reply listener's:
+     * Boot's single scheduler thread (relay, sweeper, idempotency sweep and metrics refresh take
+     * turns on it), the dead-letter listener, and the actuator's DB health check on the management
+     * port, which the filter never sees.
      */
-    static void requireReserve(int permits, int poolSize) {
+    static final int FIXED_BACKGROUND_CONNECTIONS = 3;
+
+    /**
+     * The reserve has to cover everything that can hold a connection at the same time as a full
+     * set of permits - it is arithmetic, and the boot is where to do it.
+     *
+     * <p>Until M8 this checked only {@code permits < pool}, which is the right check for "reserves
+     * something" and the wrong one for "reserves enough". Giving the reply listener three threads
+     * needs two more connections, and {@code 6 < 10} would have gone on passing while the reserve
+     * silently shrank below what the pipeline needs - the collapse this filter exists to prevent,
+     * reintroduced by a change to a different class. A thread that touches the database is a
+     * connection.
+     *
+     * <p>A boot failure, not a warning: someone raising the permits to "fix" 503s under load, or
+     * adding listener threads, must raise the pool with them, on purpose.
+     */
+    static void requireReserve(int permits, int poolSize, int replyConcurrency) {
         if (poolSize <= 0) {
             return;
         }
-        if (permits >= poolSize) {
-            throw new IllegalStateException("dpe.bulkhead.request-permits (" + permits + ") must be "
-                    + "below the connection pool size (" + poolSize + "): the difference is what API "
-                    + "traffic can never take from the outbox relay, the reply listener and the "
-                    + "sweeper. With none left over, a surge of reads starves the saga pipeline.");
+        int background = FIXED_BACKGROUND_CONNECTIONS + replyConcurrency;
+        if (permits + background > poolSize) {
+            throw new IllegalStateException("dpe.bulkhead.request-permits (" + permits + ") plus "
+                    + background + " background connections (" + replyConcurrency + " reply "
+                    + "listener threads, the scheduler thread, the dead-letter listener and the "
+                    + "health check) exceeds the connection pool size (" + poolSize + "). The "
+                    + "difference is what API traffic can never take from the saga pipeline; "
+                    + "without it, a surge of reads starves the pipeline. Raise "
+                    + "spring.datasource.hikari.maximum-pool-size, or lower the permits.");
         }
         log.info("request bulkhead: {} permits against a pool of {} - {} connections reserved for "
-                + "background work", permits, poolSize, poolSize - permits);
+                + "background work, which needs {}", permits, poolSize, poolSize - permits,
+                background);
     }
 
     private static int poolSize(DataSource dataSource) {
