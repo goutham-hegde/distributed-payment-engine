@@ -4092,8 +4092,8 @@ orchestrator rebuilt at 150         dpe_admission_limit 150.0, dpe_bulkhead_perm
 ### Committed
 
 `93d7d87` — "gateway: one command consumer per partition, which moved the knee from ~17/s to ~24/s".
-The reply-listener concurrency, the bulkhead arithmetic and the admission re-derivation are in the
-commit that follows it.
+`094896f` — "orchestrator: three reply consumers, a bulkhead check that does the arithmetic, and a limit
+that stayed at 150".
 
 ### Open / next
 
