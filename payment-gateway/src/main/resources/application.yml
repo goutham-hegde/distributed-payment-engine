@@ -100,6 +100,13 @@ spring:
 
 # M3 relay tuning. See OutboxProperties for what each knob trades away.
 dpe:
+  gateway:
+    # M8. Consumers of dpe.gateway.commands.v1 in this instance. One per partition is the ceiling
+    # (Topics.GATEWAY_COMMANDS_PARTITIONS, 3): a fourth is assigned nothing. Each holds a pool
+    # connection through its PSP call, so this is also 3 of maximum-pool-size. See
+    # GatewayCommandConsumer.
+    command-concurrency: 3
+
   outbox:
     batch-size: 100
     poll-interval: 500ms

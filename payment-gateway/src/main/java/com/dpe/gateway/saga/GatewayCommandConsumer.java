@@ -21,9 +21,35 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p>Acknowledges after the handler commits, never before, and does not acknowledge on failure -
  * so a simulated PSP timeout leaves the offset uncommitted and the command is redelivered.
+ *
+ * <h2>Concurrency (M8)</h2>
+ *
+ * <p>One consumer per partition of {@link Topics#GATEWAY_COMMANDS}, set by
+ * {@code dpe.gateway.command-concurrency}. With one thread the gateway was the knee of the whole
+ * system: each charge holds its thread for the PSP call, so 50 ms of PSP latency is a ceiling of
+ * 20 charges/s however fast everything else gets.
+ *
+ * <p>Why more threads do not reorder anything: every command about a transfer is keyed by its
+ * transfer id, so it lands on one partition, and one partition is only ever read by one thread.
+ * Per-transfer order is a property of the key, not of there being one thread (a dead letter
+ * replay reuses the original key, so it too lands on the same partition). Two commands for one
+ * transfer in flight at once needs a partition to change owner mid-delivery - a consumer evicted
+ * past {@code max.poll.interval.ms} while its handler is still running - and that was possible
+ * with one thread per instance and two instances just the same. It is settled by the
+ * {@code UNIQUE(transfer_id)} on {@code gateway_charges}, never by the thread count.
+ *
+ * <p>The ceiling is the partition count: a fourth thread would be assigned nothing. And every
+ * thread holds a connection for the whole of its transaction, PSP call included, so the value is
+ * also a claim on the pool - 3 of 10.
+ *
+ * <p>The listener is named so a test can find its container, and {@code idIsGroup = false} is
+ * NOT optional: without it Spring Kafka uses the id as the {@code group.id}, moving this service
+ * to a new group reading from {@code earliest}.
  */
 @Component
 public class GatewayCommandConsumer {
+
+    public static final String LISTENER_ID = "gateway-commands";
 
     private static final Logger log = LoggerFactory.getLogger(GatewayCommandConsumer.class);
 
@@ -42,7 +68,10 @@ public class GatewayCommandConsumer {
         this.objectMapper = objectMapper;
     }
 
-    @KafkaListener(topics = Topics.GATEWAY_COMMANDS)
+    // No default in the placeholder: a mis-nested key in application.yml should fail the boot,
+    // not quietly fall back to a number nobody chose.
+    @KafkaListener(id = LISTENER_ID, idIsGroup = false, topics = Topics.GATEWAY_COMMANDS,
+            concurrency = "${dpe.gateway.command-concurrency}")
     public void onCommand(ConsumerRecord<String, String> record, Acknowledgment ack) {
 
         String eventType = header(record, EventEnvelope.EVENT_TYPE_HEADER);
