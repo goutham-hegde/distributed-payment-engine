@@ -4234,7 +4234,8 @@ knee run, CLEARING ×8, lock sampler              7,944/7,944 COMPLETED; I1-I5, 
 
 ### Committed
 
-See the commits that follow `094896f`.
+`44e55a4` — "test: give no test a route to the running Compose stack".
+`e471be1` — "account-service: shard CLEARING, and record each hold's shard so it can never be recomputed".
 
 ### Open / next
 
