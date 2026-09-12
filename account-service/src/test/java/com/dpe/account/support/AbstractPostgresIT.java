@@ -32,7 +32,13 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
         // outbox while a test is asserting on it makes failures depend on scheduling, and the
         // tests that do exercise the relay call drainBatch() directly so their assertions are
         // deterministic. AbstractKafkaIT is where a broker actually exists.
-        "dpe.outbox.scheduled=false"
+        "dpe.outbox.scheduled=false",
+        // M8: no broker here, so no listener either - as the other two services have had since
+        // M3. Until now these contexts started their consumers against localhost:29092, which with
+        // the Compose stack up is the LIVE broker, and joined the live account-service group. The
+        // no-route bootstrap in application.properties is what makes that impossible; this keeps a
+        // context from retrying a connection to it for its whole life. AbstractKafkaIT turns it on.
+        "spring.kafka.listener.auto-startup=false"
 })
 public abstract class AbstractPostgresIT {
 

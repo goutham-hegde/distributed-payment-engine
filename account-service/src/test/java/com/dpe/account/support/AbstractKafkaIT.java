@@ -23,6 +23,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.BeforeEach;
+import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.testcontainers.redpanda.RedpandaContainer;
 
@@ -42,7 +43,17 @@ import org.testcontainers.redpanda.RedpandaContainer;
  * mapped port. The factory that does it ships in {@code spring-boot-kafka}, which arrives with
  * {@code spring-boot-starter-kafka} - in Boot 4 the connection-detail factories live in the
  * per-technology modules rather than all together in {@code spring-boot-testcontainers}.
+ *
+ * <p>Re-declares {@code @SpringBootTest} to turn the listeners and topic creation back on, which
+ * the parent and {@code application.properties} switch off (M8). It repeats the parent's
+ * properties IN FULL: {@code @SpringBootTest} properties do not merge down a class hierarchy, and
+ * a subclass listing only what it changes would silently bring the relay's timer back.
  */
+@SpringBootTest(properties = {
+        "dpe.outbox.scheduled=false",
+        "spring.kafka.listener.auto-startup=true",
+        "spring.kafka.admin.auto-create=true"
+})
 public abstract class AbstractKafkaIT extends AbstractPostgresIT {
 
     @ServiceConnection

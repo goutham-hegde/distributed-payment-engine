@@ -20,7 +20,11 @@ import org.testcontainers.redpanda.RedpandaContainer;
  * disables it, because most tests here have no broker to talk to.
  */
 @SpringBootTest(properties = {
-        "spring.kafka.listener.auto-startup=true"
+        "spring.kafka.listener.auto-startup=true",
+        // M8: application.properties turns topic creation off, because in every other context the
+        // bootstrap address leads nowhere. Here it leads to the container, and the listeners need
+        // their topics - broker auto-creation is off by design (see KafkaTopicsConfig).
+        "spring.kafka.admin.auto-create=true"
 })
 public abstract class AbstractKafkaIT extends AbstractPostgresIT {
 
