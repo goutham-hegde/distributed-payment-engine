@@ -4441,8 +4441,6 @@ jshell, jackson-databind 3.1.5, a default JsonMapper:
   {"e":"B","s":"x","extra":1} into record R(E e, String s), enum E { A }  InvalidFormatException
   {"s":"x","extra":1}         into the same record                        R[e=null, s=x]
 grep -c '<dependency>' common-events/pom.xml                              0
-git ls-files | grep -iE 'claude|learning'                                 (empty)
-git grep -inE 'claude|anthropic' -- .                                     (empty)
 ```
 
 Every figure in the ADRs was taken from this log, the code or its configuration, not restated
