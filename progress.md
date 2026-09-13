@@ -17,7 +17,7 @@ and what broke along the way. Newest entries at the bottom.
 | M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ✅ **done** |
 | M7 | Chaos suite — 8 injected-failure scenarios | ✅ **done** |
 | M8 | Load test — k6 to 1,000 concurrent transfers | ✅ **done** |
-| M9 | Documentation, ADRs, README polish | 🔄 **in progress** — ADRs done |
+| M9 | Documentation, ADRs, README polish | ✅ **done** |
 | M10 | Kubernetes manifests + Helm chart | ⬜ |
 
 ---
@@ -4571,7 +4571,7 @@ orchestrator rebuilt, one live transfer               202, replay and GET: creat
 
 ### Committed
 
-This entry's commit.
+`b82702d` — "orchestrator: the 202 carries createdAt, which took two fixes; README and the clean-clone test".
 
 ### Open / next
 
@@ -4650,7 +4650,8 @@ verify-invariants.sh                         All invariants hold
 
 ### Committed
 
-This entry's commit.
+`8d13084` — "tracing: off the shutdown path - a bounded export, no exporter retries, 30 s grace".
+The commit after it marks **M9 done**: the ADRs, the README and the clean-clone test were its planned scope.
 
 ### Open / next
 

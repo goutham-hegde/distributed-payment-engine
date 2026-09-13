@@ -10,7 +10,7 @@ and a chaos suite and load test that judge the system by what is in its ledger r
 HTTP status codes it returned.
 
 > [!NOTE]
-> **Status: M0–M8 complete; M9 (this documentation) in progress; M10 (Kubernetes) not started.**
+> **Status: M0–M9 complete. M10 (Kubernetes + Helm) is an optional extra and not started.**
 > Every result below comes from a run recorded in [`progress.md`](progress.md), with the command
 > that produced it.
 
@@ -372,5 +372,5 @@ Docker Compose
 | M6.5 | Demo console | ✅ done |
 | M7 | Chaos suite — 8 scenarios | ✅ done |
 | M8 | Load test — 1,000 concurrent users | ✅ done |
-| M9 | Documentation, ADRs, README | 🔄 in progress |
+| M9 | Documentation, ADRs, README | ✅ done |
 | M10 | Kubernetes + Helm | ⬜ not started |
