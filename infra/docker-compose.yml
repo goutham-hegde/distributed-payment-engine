@@ -294,6 +294,11 @@ services:
       args:
         MODULE: payment-orchestrator
     container_name: dpe-orchestrator
+    # M9. Kubernetes' default terminationGracePeriodSeconds, instead of Docker's 10 s. A stop with
+    # the trace backend gone measured up to ~6.6 s even after the exporter was bounded (see
+    # TraceExportConfig), and one whole-stack stop still SIGKILLed this service for a reason not
+    # established. 30 s keeps SIGKILL for a process that is actually stuck.
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -328,6 +333,7 @@ services:
       args:
         MODULE: account-service
     container_name: dpe-account
+    stop_grace_period: 30s   # M9 - see payment-orchestrator
     depends_on:
       postgres:
         condition: service_healthy
@@ -354,6 +360,7 @@ services:
       args:
         MODULE: payment-gateway
     container_name: dpe-gateway
+    stop_grace_period: 30s   # M9 - see payment-orchestrator
     depends_on:
       postgres:
         condition: service_healthy

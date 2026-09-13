@@ -4581,3 +4581,80 @@ This entry's commit.
    extra SELECT per entity per transfer (the merge loads the row first); not measured here.
 3. Deferred, not blocking: gateway partitions, batched offset commits, the relay poll interval, the
    PSP call's place in the transaction.
+
+## Session 24, part 3 — 2026-09-13
+
+### Goal
+
+Get tracing off the shutdown path. Part 2 found that with Jaeger down every service took ~12 s to
+stop, past Docker's 10 s grace, so a whole-stack stop SIGKILLed all three.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| The call timeout | `management.opentelemetry.tracing.export.otlp.timeout: 3s`, `connect-timeout: 1s`, in all three services | The key read from the Boot 4.1.1 jar's configuration metadata (the Boot 3 `management.otlp.tracing.*` keys are deprecated at ERROR level and do not bind). The timeout spans the whole HTTP call. 3 s against a collector on the same network that answers in milliseconds. |
+| Exporter retries | Off: `OtlpHttpSpanExporterBuilderCustomizer` setting the retry policy to null, one `TraceExportConfig` per service | The timeout alone only halved the wait: the second thread dump showed the export asleep in OpenTelemetry's `RetryInterceptor`, whose default policy retries five times with backoff from 1 s. A retried batch survives a collector blip; that is worth nothing next to deciding whether the process exits cleanly. `null` checked in the bytecode: `HttpExporterBuilder.setRetryPolicy` stores it without a check. |
+| Where the customizer lives | In each service, not `common-messaging` | That library holds outbox and inbox mechanics and has no OpenTelemetry dependency (ADR 0004). Three copies of a one-line bean, each pointing at the same measurement. |
+| Grace period | `stop_grace_period: 30s` on the three services | Kubernetes' default `terminationGracePeriodSeconds`. The measured worst case is now ~6.6 s, and one whole-stack stop still SIGKILLed the orchestrator for a reason not established; a 2 s margin is not a margin. |
+
+### Built
+
+- `timeout` and `connect-timeout` under `management.opentelemetry.tracing.export.otlp` in all three
+  `application.yml` files.
+- `TraceExportConfig` in each service: no exporter retries.
+- `infra/docker-compose.yml`: `stop_grace_period: 30s` for the three services.
+
+### What broke
+
+1. **Bounding the timeout was not enough, and the first measurement said so.** 3 s took
+   account-service from ~12 s to 6.1–6.3 s and the gateway to 7.5–9.9 s, which is not "timeout plus a
+   normal stop". Thread dumps at +1.5 s and +5.3 s showed why: the span worker first inside an export
+   that was already in flight when the stop began, then inside the shutdown flush, a second export,
+   and both asleep in `RetryInterceptor`'s backoff between attempts.
+2. **With retries off, the export blocks in a native DNS lookup** of `jaeger`, whose container no
+   longer exists (`Inet6AddressImpl.lookupAllHostAddr`). The call timeout bounds it, but a stop can
+   meet two exports, which is why the orchestrator still measured 5.5–6.6 s against
+   account-service's 2.1–3.6 s.
+3. **One whole-stack stop after the fix still ended with the orchestrator exit 137**, about 5–7 s
+   after its SIGTERM, which does not match Docker's 10 s grace. Its signal events had already aged
+   out of Docker's event history by the time they were looked for (health checks fill it). Three
+   further whole-stack stops, recorded with `docker events`, were clean. Unexplained; the 30 s grace
+   period is the margin for it.
+4. **A thread dump taken 5 s into a stop found nothing to dump.** The JVM had exited by then and
+   `docker stop` was still returning (it includes the container's teardown). A stop's wall time
+   overstates the process's exit by a few hundred milliseconds.
+
+### Verified
+
+```
+stop with Jaeger DOWN (docker stop -t 60)   before     3 s timeout      + no retries
+  account-service                           12.1/11.9  6.3/6.1          3.0/2.1/3.6 s
+  payment-orchestrator                      -          6.6              6.6/5.5 s
+  payment-gateway                           -          9.9/7.5          (clean in every stack stop)
+stop with Jaeger UP                         account 1.6-1.9 s, orchestrator 2.1 s, gateway 1.8 s
+
+docker compose stop (whole stack), docker events recorded:
+  run 1 (idle)             6.7 s; SIGTERM -> die: account 1.5 s, gateway 2.6 s, orchestrator 2.7 s; all exit 143
+  run 2 (5 transfers)      6.7 s; 2.9 / 2.5 / 2.4 s; all exit 143
+  run 3 (5 transfers)      6.5 s; 2.7 / 1.9 / 1.7 s; all exit 143
+  (Jaeger is signalled with the console, 1.7 s before the services)
+
+a transfer with the new exporter settings    one trace, 22 spans, all three services (twice)
+docker compose config --quiet                OK; stop_grace_period 30s on the three services
+docker inspect .Config.StopTimeout           30 on the three recreated containers
+./mvnw -B -ntp clean verify                  BUILD SUCCESS - common-messaging 20, account-service 103,
+                                             payment-orchestrator 127, payment-gateway 10
+verify-invariants.sh                         All invariants hold
+```
+
+### Committed
+
+This entry's commit.
+
+### Open / next
+
+1. The single unexplained exit 137. If it recurs, record `docker events` from before the stop.
+2. `SagaOrchestrator.start` merges entities with assigned ids through `save()` (part 2).
+3. Deferred, not blocking: gateway partitions, batched offset commits, the relay poll interval, the
+   PSP call's place in the transaction.
