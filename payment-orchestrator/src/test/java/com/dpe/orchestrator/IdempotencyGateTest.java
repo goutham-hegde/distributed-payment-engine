@@ -10,6 +10,7 @@ import com.dpe.orchestrator.support.AbstractPostgresIT;
 import com.dpe.orchestrator.support.Concurrently;
 import com.dpe.orchestrator.transfer.InvalidTransferException;
 import com.dpe.orchestrator.web.dto.CreateTransferRequest;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -17,6 +18,8 @@ import java.util.stream.Collectors;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * The specification for {@link IdempotencyGate}.
@@ -37,6 +40,9 @@ class IdempotencyGateTest extends AbstractPostgresIT {
 
     @Autowired
     IdempotencyGate gate;
+
+    @Autowired
+    ObjectMapper json;
 
     @Test
     @DisplayName("a first request does the work and stores what it answered")
@@ -89,6 +95,30 @@ class IdempotencyGateTest extends AbstractPostgresIT {
                 .as("a second ReserveFunds would debit the sender twice, whatever the API "
                         + "answered")
                 .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("the stored answer carries the transfer's creation time, as a read of it would")
+    void storedResponseCarriesTheCreationTime() {
+        String key = newKey();
+        IdempotentOutcome first = gate.execute(CLIENT, key, transferOf(30_000));
+
+        // The body is serialized once and replayed byte for byte for as long as the key is
+        // retained, so a field missing here is missing from every retry too. createdAt is filled
+        // by @CreationTimestamp at FLUSH, and until M9 the response was built before the flush:
+        // every 202 - and every replay of it - said "createdAt": null while a GET of the same
+        // transfer showed the time.
+        JsonNode body = json.readTree(first.bodyJson());
+        assertThat(body.get("createdAt").isNull())
+                .as("createdAt in the 202 body: %s", body.get("createdAt"))
+                .isFalse();
+
+        OffsetDateTime stored = jdbc.queryForObject(
+                "SELECT created_at FROM transfers WHERE id = ?", OffsetDateTime.class,
+                onlyTransferId());
+        assertThat(OffsetDateTime.parse(body.get("createdAt").asString()).toInstant())
+                .as("the same instant the database recorded, not a second clock reading")
+                .isEqualTo(stored.toInstant());
     }
 
     @Test

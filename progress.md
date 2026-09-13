@@ -4489,3 +4489,95 @@ verify-invariants.sh baseline; again   I1-I5, S1-S4 PASS
 2. The `createdAt: null` in the 202 response (What broke 6).
 3. Deferred, not blocking: gateway partitions (the PSP ceiling, ~40/s), batched offset commits, the
    relay poll interval as the unloaded-latency floor, the PSP call's place in the transaction.
+
+## Session 24, part 2 — 2026-09-13
+
+### Goal
+
+The M9 test from the plan: can a stranger `git clone` the public repository, run the README, and
+get what it says? Then fix what the attempt found.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| How to run a second copy of the stack | Stop the development stack, rename its containers aside, run the clone under its own project name (`-p dpe-clean`), then remove the clone and rename back | The Compose file pins `name: dpe` and fixed container names, and Redpanda keeps its data in an anonymous volume. A plain `down` would have discarded the development broker's data; renaming discards nothing. |
+| Source of the clone | `git clone` from GitHub, not a copy of the working tree | The test is of what a stranger gets, which excludes every ignored and untracked file. |
+| Build | `--no-cache` | Closest to a first build. It is not a cold one: the Dockerfile keeps Maven's repository in a BuildKit cache mount, which `--no-cache` does not clear. |
+| `createdAt` fix location | `TransferService`, reading the managed transfer back after a flush | The detached instance comes from `SagaOrchestrator.start` discarding the entity `save()` returns. Changing the saga to fix a response field would put a DTO concern in the state machine. |
+| The slow shutdown | Recorded with its evidence, not yet fixed | It touches the tracing export configuration in all three services and wants its own before/after measurement. |
+
+### Built
+
+- `TransferService.createTransfer` builds the 202 from the managed transfer after a flush.
+- `IdempotencyGateTest.storedResponseCarriesTheCreationTime`: the stored body's `createdAt` is set
+  and is the same instant the database recorded.
+- README: the quick start now says the command returns before the services are healthy.
+
+### What broke
+
+1. **Every 202, and every replay of it, said `"createdAt": null`.** Two causes, and fixing the
+   obvious one alone did not work. `created_at` is filled by `@CreationTimestamp` when the INSERT
+   is issued, which with an assigned id is at flush, after the response was built. So a flush was
+   added, and the new test still failed. The second cause: `SagaOrchestrator.start` calls
+   `transfers.save(transfer)` on an entity whose id is already set, which Spring Data treats as an
+   existing entity and **merges**. The timestamp lands on the managed copy that `save()` returns
+   and discards, and the reference the response was built from stays detached. The replay mattered
+   more than the 202: the idempotency gate stores this body and replays it byte for byte, so the
+   null was permanent for every key. (Bodies stored before the fix keep their null.)
+2. **Every service takes ~12 s to stop when Jaeger is down, past Docker's 10 s grace, and is
+   SIGKILLed.** Measured on account-service: 1.9 s to stop with Jaeger up, 11.9 s and 12.1 s with
+   it stopped. A thread dump taken 2 s into the slow stop shows the shutdown hook parked in
+   `OpenTelemetrySdk.close()` → `CompletableResultCode.join`, waiting on an OkHttp call to
+   `http://jaeger:4318`. `docker compose stop` stops Jaeger first, because nothing depends on it,
+   so every whole-stack stop hits this: all three services exited 137. Payments are unaffected (the
+   consumers and pools had already closed), but tracing is sitting on the shutdown path, which the
+   rule that tracing must not be load-bearing is meant to exclude.
+3. **`up -d` returns before the services are healthy.** From a fresh clone, all ten containers were
+   healthy about 63 s after the command. The previous README said health checks "gate startup",
+   which is true of the order and not of when the command returns.
+4. **The first `clean verify` after the fix failed, and the output was not captured.** The shell
+   had been inside `target/surefire-reports` one command earlier, the documented cause of `clean`
+   failing on Windows; an immediate re-run from the repository root passed. Probable, not confirmed.
+
+### Verified
+
+```
+git clone (GitHub, e6b418b); every script and yml checked out LF
+docker compose -p dpe-clean ... build --no-cache      exit 0, 169 s, four images
+docker compose -p dpe-clean ... up -d                 returned in 17 s; all 10 healthy at ~63 s
+orchestrator log                                      "no dpe.auth.private-key configured -
+                                                       generated an ephemeral RSA key"
+verify-invariants.sh, empty system                    I1 I2 I4 I5 S1-S4 PASS, I3 SKIP (no baseline)
+README walkthrough, verbatim                          201 x2; 202; replay 202 + Idempotency-Replayed;
+                                                      COMPLETED; alice 70000; bob's account 404 for
+                                                      alice; I1-I5, S1-S4 PASS after the baseline
+console :8084, Grafana, Prometheus, Jaeger            HTTP 200 each; sign-in through the console 200;
+                                                      Prometheus targets 4/4 up
+./chaos/04-gateway-declines-everything.sh             HYPOTHESIS HELD in 44 s (30/30 compensated)
+account-service stop, Jaeger up / down / down         1,923 / 12,140 / 11,928 ms
+clone removed (down -v --rmi local)                   0 containers, 0 volumes, 0 images left
+development stack restored                            same containers; I3 unchanged (3471705000);
+                                                      write_caching_default "false"; lag 0 x3
+
+IdempotencyGateTest, before the fix                   FAILS: createdAt in the 202 body: null
+  with the flush only                                 FAILS: the same
+  flush + the managed instance                        8/8 pass
+./mvnw -pl payment-orchestrator -am clean verify      BUILD SUCCESS - common-messaging 20,
+                                                      payment-orchestrator 127, 0 failures
+orchestrator rebuilt, one live transfer               202, replay and GET: createdAt identical
+                                                      (10:43:54.122422Z); COMPLETED; invariants hold
+```
+
+### Committed
+
+This entry's commit.
+
+### Open / next
+
+1. The shutdown wait on the trace exporter: bound the OTLP export timeout so a stop without Jaeger
+   finishes inside Docker's grace period, then repeat the three-stop measurement.
+2. `SagaOrchestrator.start` merges entities with assigned ids through `save()`. Expected to cost an
+   extra SELECT per entity per transfer (the merge loads the row first); not measured here.
+3. Deferred, not blocking: gateway partitions, batched offset commits, the relay poll interval, the
+   PSP call's place in the transaction.

@@ -114,7 +114,22 @@ public class TransferService {
                 request.currency().toUpperCase(), initiatedBy);
 
         SagaInstance saga = orchestrator.start(transfer);
-        return TransferResponse.of(transfer, saga);
+
+        // M9. Build the response from the MANAGED transfer, after a flush. Until M9 it was built
+        // from `transfer` above, and every 202 - and every replay of it, because the idempotency
+        // gate stores this body and replays it byte for byte - said "createdAt": null. Two causes,
+        // and fixing either alone is not enough:
+        //   1. created_at is filled by @CreationTimestamp when the INSERT is issued, which with an
+        //      assigned id is at flush, which otherwise happens at commit - after this returns.
+        //   2. `transfer` is never the managed instance. start() calls transfers.save() on an
+        //      entity whose id is already set, which Spring Data treats as existing and MERGES:
+        //      the timestamp lands on the managed copy save() returned, and this reference stays
+        //      detached. (Found by the flush alone still failing the test.)
+        // findById inside the transaction is answered from the persistence context, not a SELECT.
+        // Same transaction, same statements, issued earlier: nothing about what commits changes.
+        transfers.flush();
+        Transfer stored = transfers.findById(transfer.getId()).orElseThrow();
+        return TransferResponse.of(stored, saga);
     }
 
     /**

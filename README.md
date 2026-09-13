@@ -233,7 +233,13 @@ docker compose -f infra/docker-compose.yml up -d --build
 ```
 
 This brings up PostgreSQL, Redpanda, Redis, the three services, Prometheus, Grafana, Jaeger and the
-console. Health checks gate startup.
+console. Health checks order the startup, but the command returns before the services are ready:
+from a fresh clone they report healthy about a minute later. Wait for `(healthy)` on all ten before
+the steps below:
+
+```bash
+docker compose -f infra/docker-compose.yml ps
+```
 
 | | |
 |---|---|
