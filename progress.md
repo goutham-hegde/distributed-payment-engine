@@ -4247,3 +4247,138 @@ knee run, CLEARING ×8, lock sampler              7,944/7,944 COMPLETED; I1-I5, 
    arithmetic.
 4. Per-record offset commits; the relay poll interval as the unloaded-latency floor; a memory bound
    for Jaeger; the `users` profile.
+
+## Session 23 — 2026-09-13
+
+### Goal
+
+Finish M8. Garbage collection had become what set the latency tail, so first explain the pauses,
+then fix the memory budget, then bound Jaeger, which had been OOM-killed in nearly every load run.
+Then run the milestone itself: 1,000 concurrent users.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Diagnose before tuning | GC logs always on (`-Xlog:gc*,safepoint`, rotated in `/tmp`), plus a cgroup memory sampler during runs | Micrometer records how long a pause took, not why. The per-pause `User/Sys/Real` line separates collection work (User ≈ Real), kernel work (Sys) and waiting (Real ≫ User+Sys). The previous day's 6.7 s pause could not be explained because nothing had logged it. |
+| JVM memory | A budget, not a heap cap: every region capped, caps summing below a 768M limit | The heap was about half the process. The orchestrator at rest held 171 MiB heap, 149 MiB metaspace, 82 MiB code cache and ~96 MiB native, which is ~500 MiB with the heap not yet at its 256 MiB cap, in a 512M container. |
+| Early full GCs | `-Xms = -Xmx`, `MetaspaceSize=160m`, `SweeperThreshold=60` | Each default trigger was set for a much smaller application: an 8 MiB initial heap that promoted early, a 21 MiB first metaspace threshold, and code-cache unloading every 15% of a 240 MiB cache. |
+| Collector | G1 (2 parallel, 1 concurrent GC threads), replacing SerialGC | With the budget fixed, Serial's remaining full collections became rarer and longer: 1.86 s, all CPU, to mark a 174 MiB old generation holding 89 MiB live. G1 marks the old generation concurrently. The thread cap stops three JVMs on one machine each starting 13 GC threads. |
+| Boot pauses | `-XX:+AlwaysPreTouch` | G1's first evacuations were faulting in never-touched heap pages: 500 ms young pauses at boot, Sys 1.24 s against User 0.17 s. The budget already counts the heap as resident. |
+| Jaeger | `MEMORY_MAX_TRACES` 20000 → 5000, derived from measured bytes per trace, plus `GOMEMLIMIT=300MiB` | The setting counts traces, not bytes. At ~27 KiB per trace, 20000 is ~530 MiB in a 384M container. Go's default GC also lets the heap reach twice its live data. |
+| `max-in-flight` | Stays 150, confirmed by a run to 60/s | Throughput plateaued at the gateway's ceiling with in-flight at the limit and p99 ≤ 5.2 s. A higher limit would only lengthen the queue in front of the gateway. |
+
+### Built
+
+- `infra/docker-compose.yml`: the JVM budget, G1 settings, GC logging and a separate `x-jvm-mem-limit`
+  (768M) for the three services, with Postgres and Redpanda still on 512M; Jaeger's trace count
+  and `GOMEMLIMIT`. The budget is written out as a table in the file, next to the flags.
+
+### Results
+
+**Memory and GC, same knee profile (5 → 40/s):**
+
+| | before (512M, SerialGC, logs on) | budget (768M, SerialGC) |
+|---|---|---|
+| results dir | 20260913T061744Z | 20260913T062948Z |
+| Completed | 7,897 of 7,897 | 8,026 of 8,026 |
+| Worst window p99 | 6.5 s | 4.4 s |
+| Orchestrator full GCs | 5 (allocation), 2 (metaspace), 1 (code cache) | 1 (code cache, 341 ms, CPU-bound) |
+| Worst pause: account / gateway / orchestrator | 294 / 702 / 1,262 ms | 80 / 78 / 341 ms |
+| Orchestrator peak / swapped / `memory.max` hits / major faults | 509 of 512 MiB / 76 MiB / 506 / 7,053 | 563 of 768 MiB / 0 / 0 / 42 |
+
+The slowest pause before the budget (the orchestrator's 1.26 s full GC) was paging, visible from
+three sides at once:
+- `Real 1.26 s` against `User 0.55 s + Sys 0.12 s`;
+- in the same 14 s the cgroup hit `memory.max` about 450 more times, swapped memory rose from
+  4 to 75 MiB, and major faults rose from 197 to 6,878;
+- the mark phase, which visits every live object, took 1.0 s of the 1.26 s.
+
+**Finding the new knee (5 → 60/s, 20260913T063935Z):** 12,458 of 12,458 completed; throughput
+plateaus at 37–38 settled/s from 40/s offered; p99 4–5.2 s at 1.6× overload; 16,600 requests shed.
+The gateway's three consumers are 0.88–0.90 busy while using 0.16 of a core. They are waiting on the
+simulated PSP (50 ms a call), so three concurrent calls at ~75 ms each cap the system near 40/s.
+account-service (0.67) and the orchestrator (0.39) have headroom. In a real deployment this is the
+payment provider's concurrency limit.
+
+**Jaeger:** sampled through a run before the fix, its heap grew ~3.3 KiB per span (~27 KiB per
+trace, averaging polls and payments). It was killed at ~21,400 traces with 654 MiB of heap in use
+and RSS pinned near its limit. After the fix it stored 111,711 traces during the 60/s run and
+survived both 1,000-user runs, peaking at 237 MiB.
+
+**The milestone: 1,000 concurrent users.**
+
+| | U1: think 30–90 s (SerialGC) | U1: same, G1 | U2: think 5–15 s, G1 |
+|---|---|---|---|
+| results dir | 20260913T064948Z | 20260913T070321Z | 20260913T071616Z |
+| Offered (≈ users ÷ (think + settle)) / accepted | ~16/s / 13.6/s | ~16/s / 13.6/s | ~74/s, about 2× capacity / 33.4/s |
+| Completed | 7,278 of 7,278 | 7,307 of 7,307 | 17,974 of 17,974 |
+| Create p95 / p99 | 36 / 56 ms | 37 / 58 ms | 85 / 228 ms |
+| Settle p95 / p99 (customer, from first click) | 3.06 / 3.68 s | 3.06 / 3.55 s | 15.7 / 17.5 s |
+| Worst 30 s window, settle p99 once accepted (server side) | 5.11 s (the window with the full GC) | 3.34 s | 5.42 s |
+| Refused (503) / payments abandoned after 5 attempts | 0 / 0 | 0 / 0 | 48,345 / 5,268 of 23,242 (22.7%) |
+| Worst GC pause during the run | 1,858 ms (a full GC) | 74 ms | 78 ms |
+| SLO verdict | met | met | missed (exit 3) |
+| I1–I5, S1–S4 | pass | pass | pass |
+
+- At the default think time, 1,000 concurrent users are served with large margins against every SLO,
+  and G1 took the worst window from 5.11 s (a 1.86 s full GC in it) to 3.34 s.
+- At 2× capacity the system stays correct and stays fast *for what it accepts*. No timeouts, no
+  compensations, and server-side settle p99 at or under 5.4 s in every window while throughput sat
+  at the gateway ceiling. The excess is pushed back to clients as 503s: 22.7% of payments were abandoned after five refusals,
+  and the accepted ones waited up to ~16 s including back-off, which is what fails the customer
+  settle SLO. A latency SLO cannot be met at twice capacity without more capacity. What this run
+  shows is that the overload is shed rather than accepted and then timed out, as the first knee
+  run (Session 20) did: 1,401 compensations at 40/s.
+
+### What broke
+
+1. **The heap was treated as the whole JVM.** Metaspace (149 MiB for 27,546 classes), the code
+   cache and native memory added up to about as much again. The orchestrator was swapping its own
+   heap before any load test found the latency.
+2. **The first `MEMORY_MAX_TRACES` was a count sized as if it were a byte bound.** The Compose
+   comment called it "a hard ceiling"; at the measured trace size it was 40% above the container.
+3. **A bigger, fixed-size heap made SerialGC's full GCs rarer and longer.** Fixing the
+   budget turned many 200–700 ms full GCs into one 1.86 s full GC per run. Serial's old-generation
+   collection is proportional to the whole generation and single-threaded; that is what G1 exists
+   to avoid.
+4. **A fixed-size heap moved page-faulting into the first GC pauses.** `-Xms` reserves memory but
+   does not touch it. Fixed with `AlwaysPreTouch`.
+5. **Counting GC events by grepping the log counted each full GC twice.** Unified logging writes a
+   `gc,start` line and a completion line with the same text. The first comparison reported 16 full
+   GCs where there were 8. Count the completion lines only (the ones ending in `ms`).
+6. **A Python edit wrote the Compose file back with CRLF line endings.** The stored blob was
+   normalized to LF by `core.autocrlf` (checked with `git cat-file` and `git ls-files --eol`; `git
+   show` displayed CRs that were not in the blob). The working copy was refreshed from the index.
+7. **The gateway's 6.7 s pause from Session 22 remains unexplained.** That container never swapped
+   and nothing had logged the pause. With logging always on, a recurrence will be explained.
+8. **Another project's Kind cluster was running throughout** (1.1–1.8 cores mean), as in Session 22.
+
+### Verified
+
+```
+knee, 512M + SerialGC + GC logs, memory sampler     7,897/7,897; I1-I5, S1-S4 pass;
+                                                    orchestrator swap 76 MiB, 506 memory.max events
+knee, 768M budget, SerialGC                         8,026/8,026; I1-I5, S1-S4 pass; no swap
+knee to 60/s, Jaeger bounded                        12,458/12,458; I1-I5, S1-S4 pass; Jaeger alive, 234 MiB
+PROFILE=users (1,000 VUs, 30-90 s), SerialGC        SLO MET; 7,278/7,278; I1-I5, S1-S4 pass
+PROFILE=users (1,000 VUs, 30-90 s), G1              SLO MET; 7,307/7,307; I1-I5, S1-S4 pass; no full GC
+AlwaysPreTouch                                      boot pauses max 33-40 ms (was 500-531 ms)
+PROFILE=users THINK_MIN=5 THINK_MAX=15, G1           exit 3 (correct, SLO missed); 17,974/17,974;
+                                                    I1-I5, S1-S4 pass; no full GC; Jaeger alive
+docker compose config --quiet                       OK
+```
+
+### Committed
+
+`b69d628` — "infra: a memory budget for the JVMs, G1, always-on GC logs, and a Jaeger bound that is one".
+
+### Open / next
+
+M8 is done: 1,000 concurrent users, invariants held in every run, p99 documented.
+
+1. M9: documentation, ADRs and the README. This milestone produced several decisions that belong
+   in ADRs: admission control and why its limit stayed at 150, sharded CLEARING, test isolation,
+   and the JVM memory budget.
+2. Deferred, not blocking: gateway partitions (the PSP ceiling, ~40/s), batched offset commits,
+   the relay poll interval as the unloaded-latency floor, the PSP call's place in the transaction.
