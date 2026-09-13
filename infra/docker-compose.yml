@@ -28,9 +28,66 @@ x-jwks-env: &jwks-env
   DPE_SECURITY_JWK_SET_URI: http://payment-orchestrator:8081/.well-known/jwks.json
 
 x-jvm-env: &jvm-env
-  # Explicit heap cap. Three JVMs at default sizing will each claim a quarter
-  # of the container's visible RAM and this machine cannot afford that.
-  JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+UseSerialGC"
+  # M8: A MEMORY BUDGET, NOT A HEAP CAP. The heap is about half of what these JVMs use.
+  #
+  # Until M8 this was "-Xmx256m -XX:+UseSerialGC" in a 512M container, sized as if the heap were
+  # the process. Measured on the orchestrator at rest: heap 171 MiB committed (of 256), metaspace
+  # 149 MiB (27,546 classes - Spring Boot, Hibernate, Kafka, OTel), code cache 82 MiB, ~96 MiB
+  # native (thread stacks, GC and JIT working memory). ~500 MiB with the heap 85 MiB short of its
+  # cap. Under the knee run it hit memory.max ~500 times and the kernel swapped 75 MiB of the JVM's
+  # OWN heap out; the next full GC's mark phase faulted it back in: Real 1.26 s for User+Sys 0.67 s,
+  # 6,800 major faults in 14 s. In Kubernetes (no swap) the same budget is an OOMKill.
+  #
+  # So every region is sized, and the caps sum to less than the container limit (x-jvm-mem-limit):
+  #   heap                -Xms256m -Xmx256m            256   (live after full GC 47-111 MiB)
+  #   metaspace           -XX:MaxMetaspaceSize=176m    176   (observed 129-150)
+  #   code cache          -XX:ReservedCodeCacheSize    144   (observed 67-82)
+  #   direct buffers      -XX:MaxDirectMemorySize=32m   32   (observed < 2)
+  #   native, uncapped    stacks, JIT, symbols, and
+  #                       G1's remembered sets/bitmaps ~140
+  #                                                   ----
+  #                                                   ~748  < 768M
+  # A region that outgrows its cap fails LOUDLY (OutOfMemoryError: Metaspace, "CodeCache is full")
+  # instead of the container swapping itself into multi-second pauses.
+  #
+  # And the early full GCs, each a single-threaded stop-the-world collection under SerialGC:
+  #   -Xms = -Xmx          the heap started at 8 MiB and grew by collecting; the young generation
+  #                        started tiny, promoted early and filled the old one (5 allocation-failure
+  #                        full GCs on the orchestrator in one knee run).
+  #   MetaspaceSize=160m   the first "Metadata GC Threshold" is 21 MiB by default, so warm-up crossed
+  #                        it repeatedly on the way to ~150 MiB (full GCs of 200-290 ms).
+  #   SweeperThreshold=60  since JDK 20 compiled code is unloaded by a GC every time the code cache
+  #                        grows by this % of its reserved size - 15% of 240 MiB by default (full GCs
+  #                        of 350-700 ms during warm-up). 60% of 144 MiB is 86 MiB. Under G1 such a
+  #                        trigger starts a CONCURRENT cycle rather than a full collection anyway.
+  #
+  # G1, NOT SERIAL - changed on GC-log evidence. With the budget fixed, SerialGC's full collections
+  # became rarer and LONGER: the 1,000-user run filled a 174 MiB old generation that held 89 MiB of
+  # live data, and marking it took 1.53 s on one thread (User 1.83 s = Real 1.86 s - pure CPU, not
+  # paging). A serial old-generation collection costs time proportional to the whole generation,
+  # stop-the-world. G1 marks the old generation concurrently and reclaims it in mixed collections
+  # under a pause target (MaxGCPauseMillis, 200 ms default). The price is ~10-15% of the heap in
+  # remembered sets and marking bitmaps, counted in the budget above. GC threads are capped: three
+  # JVMs on one laptop must not each start 13 parallel GC threads (the default for 16 CPUs).
+  #
+  # AlwaysPreTouch: -Xms reserves the heap, it does not touch it. G1's first evacuations then copy
+  # into never-touched pages, and the kernel faults and zeroes each one inside the pause - measured
+  # at boot: 500 ms young pauses with User 0.17 s, Sys 1.24 s. Pre-touching pays that once, during
+  # JVM initialisation, before the service takes traffic. The budget already counts the whole heap
+  # as resident, so it costs no memory the budget had not assumed.
+  #
+  # GC logging, always on, rotated, inside the container (docker exec <c> cat /tmp/gc.log). A 6.7 s
+  # pause on the gateway could not be explained after the fact because nothing had logged it -
+  # Micrometer records how long a pause took, not why. gc* includes gc+cpu, whose User/Sys/Real
+  # line is the diagnosis: User ~ Real is CPU-bound collection work, Sys large is the kernel,
+  # Real >> User+Sys is waiting - page faults to swap, or a descheduled process. safepoint adds
+  # time-to-safepoint, which the pause metric does not include.
+  JAVA_TOOL_OPTIONS: >-
+    -XX:+UseG1GC -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -Xms256m -Xmx256m -XX:+AlwaysPreTouch
+    -XX:MetaspaceSize=160m -XX:MaxMetaspaceSize=176m
+    -XX:ReservedCodeCacheSize=144m -XX:SweeperThreshold=60
+    -XX:MaxDirectMemorySize=32m
+    -Xlog:gc*,safepoint:file=/tmp/gc.log:time,uptime,level,tags:filecount=5,filesize=20m
 
 # M6 part 2. Where spans go. Every service gets the same value, because a trace that only some
 # services report is worse than no trace: the gap looks like a service that did not participate
@@ -59,6 +116,14 @@ x-mem-limit: &mem-limit
   resources:
     limits:
       memory: 512M
+
+# M8: the three JVMs' limit, derived from the budget in x-jvm-env - never raise one without the
+# other. 768M x 3 is +768 MB of LIMIT over the old 512M; the measured working set rises by less
+# (~600 MiB each once the fixed-size heap is fully touched).
+x-jvm-mem-limit: &jvm-mem-limit
+  resources:
+    limits:
+      memory: 768M
 
 services:
 
@@ -255,7 +320,7 @@ services:
     ports:
       - "8081:8081"
     healthcheck: *health
-    deploy: *mem-limit
+    deploy: *jvm-mem-limit
 
   account-service:
     build:
@@ -281,7 +346,7 @@ services:
     ports:
       - "8082:8082"
     healthcheck: *health
-    deploy: *mem-limit
+    deploy: *jvm-mem-limit
 
   payment-gateway:
     build:
@@ -313,7 +378,7 @@ services:
     ports:
       - "8083:8083"
     healthcheck: *health
-    deploy: *mem-limit
+    deploy: *jvm-mem-limit
 
   # ---------------------------------------------------------------------------------------
   # M6: observability. All three containers are pure consumers of what the services already
@@ -430,8 +495,19 @@ services:
     container_name: dpe-jaeger
     environment:
       SPAN_STORAGE_TYPE: memory
-      # About an hour of the load test at M8, and a hard ceiling either way. Oldest are evicted.
-      MEMORY_MAX_TRACES: "20000"
+      # M8: a count of TRACES, which is not a bound on MEMORY - sized from a measurement now.
+      #
+      # This was 20000 with a comment calling it "a hard ceiling", and Jaeger was OOM-killed in six
+      # of the seven knee runs before the fix. Sampled through one: the heap grows ~3.3 KiB per span,
+      # ~27 KiB per trace (a payment is a dozen spans across three services, a status poll one or
+      # two), so 20000 traces is ~530 MiB of live data in a 384M container - it died at ~21,000
+      # traces with 654 MiB of heap in use and RSS pinned at the limit, swapping. 5000 traces is
+      # ~130 MiB. Re-derive it if traces get bigger (more spans per request, bigger SQL attributes).
+      MEMORY_MAX_TRACES: "5000"
+      # And Go's GC is told about the container. Left at GOGC=100 with no limit, the heap may reach
+      # twice the live data before a collection - so even a store that fits can OOM on garbage.
+      # A soft limit below the container's makes the collector work harder instead.
+      GOMEMLIMIT: "300MiB"
       # OTLP receivers on 4317/4318. Default since 1.35, stated anyway because it is the entire
       # contract with the three services and a silent default is a bad place for that to live.
       COLLECTOR_OTLP_ENABLED: "true"
