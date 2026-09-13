@@ -4421,6 +4421,11 @@ them are still fresh.
 - `docs/adr/0012-a-jvm-memory-budget.md`: the region-by-region budget, the paging diagnosis from
   the GC log's User/Sys/Real line, why G1, and Jaeger's count-not-bytes bound.
 - `docs/adr/README.md`: the index.
+- `README.md`, rewritten. It had described the target system ("M0 of 10 complete", I5 over every
+  account, a saga with no CLEARING account and no commit reply). It now leads with why the five
+  invariants were not enough, then the chaos and load results (including the unexplained consumer
+  stall, with its counts), the saga as built, each pattern linked to its ADR, a quick start with a
+  hand-run transfer, and the repository layout.
 
 ### What broke
 
@@ -4432,6 +4437,16 @@ them are still fresh.
 3. **The internal development notes still described M5 part 1's HS256 shared secret**, including an
    environment variable that no longer exists, two milestones after part 2 moved to RS256 with the
    private key only in the orchestrator. Corrected.
+4. **The README's walkthrough, followed as written, would have reported an I3 violation.** Opening
+   a funded account issues new money, so the conservation total rises by the opening balance and
+   `verify-invariants.sh` correctly fails against a baseline taken before it: here exactly 100000,
+   the demo account's ₹1000. Found by running the walkthrough before publishing it. The walkthrough
+   now records the baseline after funding, and the README explains why I3 needs one.
+5. **Two check commands were pasted verbatim into this entry's Verified block** and matched the
+   pre-push leak grep they were quoting. Removed in `799c645`.
+6. **Not fixed: `POST /api/v1/transfers` answers with `"createdAt": null`**, while a later `GET` of
+   the same transfer shows the timestamp. Most likely the response is built from the entity before
+   the database-generated value is read back. Cosmetic, and recorded rather than guessed at.
 
 ### Verified
 
@@ -4443,16 +4458,34 @@ jshell, jackson-databind 3.1.5, a default JsonMapper:
 grep -c '<dependency>' common-events/pom.xml                              0
 ```
 
-Every figure in the ADRs was taken from this log, the code or its configuration, not restated
-from memory.
+Every figure in the ADRs and the README was taken from this log, the code or its configuration,
+not restated from memory.
+
+The README's walkthrough, run against the live stack before it was written down:
+
+```
+POST /accounts (operator) x2           201, balances 100000 and 0
+POST /api/v1/transfers                 202, status PENDING, sagaStatus STARTED
+  same request, same Idempotency-Key   202, Idempotency-Replayed: true, same transferId
+GET  /api/v1/transfers/{id} after ~3 s status COMPLETED, sagaStatus COMPLETED
+GET  /api/v1/transfers/{id}/timeline   ReserveFunds relay lag 433 ms, step 1,111 ms; trace id present
+GET  /accounts/{alice}                 balanceMinor 70000
+GET  /accounts/{bob} as alice          404 (read path: a 403 would confirm the account exists)
+verify-invariants.sh                   I3 FAIL: 3471705000 vs baseline 3471605000 (What broke 4)
+verify-invariants.sh baseline; again   I1-I5, S1-S4 PASS
+```
 
 ### Committed
 
 `4c95abb` — "docs: ADRs 0001, 0003 and 0009-0012, and an index".
+`879a568` — "log: Session 24 - the ADRs, and two summaries that had drifted from what they summarise".
+`425718a` — "docs: rewrite the README around what the system proved, not what it planned".
+`799c645` — "log: drop two check commands quoted verbatim in the Session 24 entry".
 
 ### Open / next
 
-1. The README: the M7 chaos results and the M8 load results, a link to the ADR index, and the M9
-   test from the plan: a stranger can `git clone && docker compose up` and understand it.
-2. Deferred, not blocking: gateway partitions (the PSP ceiling, ~40/s), batched offset commits, the
+1. The M9 test from the plan: a stranger can `git clone && docker compose up` and understand it.
+   Not yet run. It needs the running stack stopped first, because the containers have fixed names.
+2. The `createdAt: null` in the 202 response (What broke 6).
+3. Deferred, not blocking: gateway partitions (the PSP ceiling, ~40/s), batched offset commits, the
    relay poll interval as the unloaded-latency floor, the PSP call's place in the transaction.
