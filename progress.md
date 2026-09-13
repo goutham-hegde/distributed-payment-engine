@@ -15,9 +15,9 @@ and what broke along the way. Newest entries at the bottom.
 | M5 | JWT authentication and per-account authorization | ✅ **done** |
 | M6 | Observability — Prometheus metrics, Grafana dashboards, distributed tracing, read endpoints | ✅ **done** |
 | M6.5 | Demo console — React UI: transfer tracker, system view, chaos controls | ✅ **done** |
-| M7 | Chaos suite — 8 injected-failure scenarios | ⬜ |
-| M8 | Load test — k6 to 1,000 concurrent transfers | ⬜ |
-| M9 | Documentation, ADRs, README polish | ⬜ |
+| M7 | Chaos suite — 8 injected-failure scenarios | ✅ **done** |
+| M8 | Load test — k6 to 1,000 concurrent transfers | ✅ **done** |
+| M9 | Documentation, ADRs, README polish | 🔄 **in progress** — ADRs done |
 | M10 | Kubernetes manifests + Helm chart | ⬜ |
 
 ---
@@ -4382,3 +4382,79 @@ M8 is done: 1,000 concurrent users, invariants held in every run, p99 documented
    and the JVM memory budget.
 2. Deferred, not blocking: gateway partitions (the PSP ceiling, ~40/s), batched offset commits,
    the relay poll interval as the unloaded-latency floor, the PSP call's place in the transaction.
+
+## Session 24 — 2026-09-13
+
+### Goal
+
+Start M9 with the architecture decision records: write the two that had been planned since the
+start and never written, and record the four decisions M8 produced while the measurements behind
+them are still fresh.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Numbering | Fill 0001 and 0003 rather than renumber | 0001 was reserved for the saga decision in the original plan, and ADR 0004 had linked to a 0003 that did not exist since M3. Renumbering would break those links. |
+| 0003's evolution rules | Additive within a topic version; a rename, retype or change of meaning goes to `.v2` | The contracts had followed this by habit. Written down, it is checkable in review. |
+| Reason codes | Stay strings, never an enum, now as a stated rule | Checked against jackson-databind 3.1.5: an unknown enum value throws `InvalidFormatException`. That is a technical failure, so the message is retried and dead-lettered: a producer adding a rejection reason would strand payments at every older consumer. |
+| M8 decisions | Four ADRs (0009–0012), each carrying the runs that decided it | A decision like "the limit is 150" is only defensible with the 300 run beside it. Without the evidence an ADR is an assertion. |
+| Alternatives nobody tried | Marked "not measured" | ZGC and turning off Spring's test-context pausing were reasoned about, not run. An ADR must not read as if they were experiments. |
+| An index | `docs/adr/README.md` | Twelve records are past the point where a directory listing tells a reader which one to open. |
+
+### Built
+
+- `docs/adr/0001-orchestration-not-choreography.md`: why orchestration over choreography, 2PC and a
+  workflow engine; the two failure-driven rules M7 added (the charge is the pivot; a participant
+  always answers with the truth); the terminal set written in seven places.
+- `docs/adr/0003-shared-contracts.md`: `common-events` has no dependencies at all; the envelope;
+  versioned topic names; partition counts declared by every service; the evolution rules; the
+  compiler as the compatibility check only while there is one build.
+- `docs/adr/0009-admission-control-and-the-request-bulkhead.md`: the metastable collapse, why the
+  bound is sagas in flight, why it sits after the idempotency claim, the three derivations of 150,
+  the bulkhead's arithmetic and the three runs that switched each fix off in turn.
+- `docs/adr/0010-sharded-clearing.md`: the lock contention measured before and after, the recorded
+  shard, the composite foreign key, the per-shard identity check, the signed `UUID.compareTo` order
+  and the ring test.
+- `docs/adr/0011-tests-have-no-route-to-the-running-stack.md`: the live-group joins, why
+  `auto-startup=false` does not survive a cached context's restart, and the discard-port fix.
+- `docs/adr/0012-a-jvm-memory-budget.md`: the region-by-region budget, the paging diagnosis from
+  the GC log's User/Sys/Real line, why G1, and Jaeger's count-not-bytes bound.
+- `docs/adr/README.md`: the index.
+
+### What broke
+
+1. **ADR 0004 had linked to a nonexistent ADR 0003 since M3.** Nothing checks links inside `docs/`,
+   and the milestone that wrote 0004 never came back for it.
+2. **The milestone table at the top of this log still showed M7 and M8 as not started**, though both
+   were done and pushed. The session entries were current and the summary above them was not. A
+   summary that is updated separately from its source drifts.
+3. **The internal development notes still described M5 part 1's HS256 shared secret**, including an
+   environment variable that no longer exists, two milestones after part 2 moved to RS256 with the
+   private key only in the orchestrator. Corrected.
+
+### Verified
+
+```
+jshell, jackson-databind 3.1.5, a default JsonMapper:
+  DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES.enabledByDefault()   false
+  {"e":"B","s":"x","extra":1} into record R(E e, String s), enum E { A }  InvalidFormatException
+  {"s":"x","extra":1}         into the same record                        R[e=null, s=x]
+grep -c '<dependency>' common-events/pom.xml                              0
+git ls-files | grep -iE 'claude|learning'                                 (empty)
+git grep -inE 'claude|anthropic' -- .                                     (empty)
+```
+
+Every figure in the ADRs was taken from this log, the code or its configuration, not restated
+from memory.
+
+### Committed
+
+`4c95abb` — "docs: ADRs 0001, 0003 and 0009-0012, and an index".
+
+### Open / next
+
+1. The README: the M7 chaos results and the M8 load results, a link to the ADR index, and the M9
+   test from the plan: a stranger can `git clone && docker compose up` and understand it.
+2. Deferred, not blocking: gateway partitions (the PSP ceiling, ~40/s), batched offset commits, the
+   relay poll interval as the unloaded-latency floor, the PSP call's place in the transaction.
