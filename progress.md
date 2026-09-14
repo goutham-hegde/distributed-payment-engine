@@ -18,7 +18,7 @@ and what broke along the way. Newest entries at the bottom.
 | M7 | Chaos suite — 8 injected-failure scenarios | ✅ **done** |
 | M8 | Load test — k6 to 1,000 concurrent transfers | ✅ **done** |
 | M9 | Documentation, ADRs, README polish | ✅ **done** |
-| M10 | Kubernetes manifests + Helm chart | ⬜ |
+| M10 | Kubernetes manifests + Helm chart (optional) | 🔨 built and verified on kind (Session 25); one finding open |
 
 ---
 
@@ -4659,3 +4659,232 @@ The commit after it marks **M9 done**: the ADRs, the README and the clean-clone 
 2. `SagaOrchestrator.start` merges entities with assigned ids through `save()` (part 2).
 3. Deferred, not blocking: gateway partitions, batched offset commits, the relay poll interval, the
    PSP call's place in the transaction.
+
+---
+
+## Session 25 — 2026-09-14
+
+### Goal
+
+M10: run the system on Kubernetes, and find everything Docker Compose had been doing for it
+implicitly. The claim to test: a rolling deploy of every service, under load, loses nothing.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Stateful tier | Plain manifests in `k8s/infra/` (namespace `dpe-infra`); the chart takes addresses | Production points the same chart at managed Postgres/Kafka/Redis. `helm uninstall` must never be able to delete the ledger. |
+| Probes | Startup + liveness on `/actuator/health/liveness`, readiness on `/actuator/health/readiness`, all on the management port | The full `/actuator/health` includes Redis and the database; as liveness it would make Redis load-bearing through a probe, and a database blip would crash-loop every pod at once. |
+| Signing key | A Secret created once by `k8s/up.sh`; the chart refuses >1 orchestrator without one | Helm's `genPrivateKey` would rotate the key on every upgrade. Two generated keys reject each other's tokens (measured below). |
+| Scraping | `kubernetes_sd_configs` role `pod`, namespaced `Role` | Through a Service each scrape lands on a random replica and one series alternates between two pods' counters. |
+| Table-counting gauges | `max by (application)` in alerts, dashboard, console, load report | Every replica counts the same table; `sum` doubled with two orchestrators. |
+| Management-port boundary | NetworkPolicy, default-deny ingress in both namespaces | The pod network is flat; "unpublished" no longer means unreachable. |
+| Resources | Memory request = limit = 768Mi (ADR 0012); CPU request, no CPU limit | A fixed, pre-touched heap is resident from the first second. A CFS quota freezes a GC mid-pause, and the JVM sizes itself from the CPU limit. |
+| Rollout | `maxSurge 1`, `maxUnavailable 0`, `preStop: sleep 5`, 30 s grace, PDB only when replicas > 1 | SIGTERM and endpoint removal start together. |
+| Connection budget | Checked at render: Σ pool × (replicas + 1) ≤ max_connections − 13; pool passed as `SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE` | So the number checked is the number used. |
+| Replicas | Orchestrator 2, account-service 1, gateway 1 | Admission control is already global (counted from `saga_instances`), so it is not divided. The gateway's simulation knobs live in pod memory. |
+| Load generator | k6 as an in-cluster Job against the Service | `kubectl port-forward` pins one pod and dies with it - it cannot see a rollout. |
+
+### Built
+
+- `k8s/kind/cluster.yaml` - one node, `localhost:8084` (console) and `:9090` (Prometheus), API server
+  pinned to 16443.
+- `k8s/infra/` - Postgres and Redpanda StatefulSets, Redis, their NetworkPolicies. The init script
+  and Redpanda bootstrap file are ConfigMaps created from the Compose files, not copies.
+- `k8s/helm/dpe/` - the three services (one templated Deployment + Service + PDB), the console,
+  Prometheus with pod discovery and a Kubernetes-only `ServiceHasNoScrapeTargets` rule, eight
+  NetworkPolicies, and four render-time refusals: no image tag, no alert rules, >1 orchestrator
+  without a key, connection budget exceeded.
+- `k8s/up.sh` (idempotent: cluster, images, infra, key, chart; every call pinned to `--context
+  kind-dpe`), `k8s/verify-netpol.sh`, `k8s/rollout-under-load.sh` (`DISRUPT=rollout|kill`).
+- `scripts/verify-invariants.sh` and `scripts/lib/stranded.sh` take `PG_EXEC`, a command prefix for
+  reaching psql, and keep one I3 baseline per stack.
+- `infra/prometheus/alerts.yml`: `max` for table-counting gauges; `KafkaConsumerFetchSpin` grouped by
+  `instance` too. Same aggregation fix in the Grafana dashboard, the console's System view and the
+  load report.
+- ADR 0013.
+
+### What broke
+
+1. **Two statements in the design brief were wrong, and the code said so.** Admission control was
+   going to be divided by the replica count; `AdmissionControl` counts in-flight sagas from
+   `saga_instances`, so it is already a global bound - dividing would have halved capacity. And "a
+   second orchestrator's consumers get zero partitions" - the range assignor gave one pod two reply
+   partitions per topic and the other one; which pod gets work is decided by member-id order.
+2. **`kind load docker-image` failed on `postgres:16-alpine`**: `ctr: content digest sha256:b882...:
+   not found`. It imports `--all-platforms`, and a multi-platform image in Docker Desktop's
+   containerd store holds only this machine's platform. The four self-built images loaded fine,
+   which made it look like a problem with Postgres. Fixed with `docker save --platform linux/amd64 |
+   ctr images import`.
+3. **Both orchestrators crash-looped on the signing key**: `algid parse error, not a sequence`.
+   OpenSSL 3.2's `genpkey -outform DER` writes an RSA key as PKCS#1 (no algorithm identifier),
+   although its PEM output is PKCS#8. `openssl pkcs8 -topk8` fixes it. The service refusing to
+   start rather than signing with anything else was the right failure. A crash-looping pod picked up
+   the replaced Secret on its next restart, since environment variables from a Secret are resolved
+   at container start.
+4. **I3 "failed" by 3.47 billion on the new cluster.** `verify-invariants.sh` had one baseline file,
+   recorded against the Compose stack's database. The baseline is now per stack.
+5. **The first NetworkPolicy check compared counts** (`count(up == 1)` against a count of pods) and
+   reported "5 of 4 targets up" while a replaced pod was still terminating. It compares names now.
+   And its probe pods ran `sleep` as PID 1, which ignores SIGTERM, so each sat out 30 s and the next
+   run collided with its name.
+6. **`kubectl delete pod --force --grace-period=0` is not a crash.** The first kill scenario used it:
+   partitions were handed over in 4 s and no request failed. Under the classic group protocol a 4 s
+   handover means the consumers sent LeaveGroup - the JVM ran its shutdown. The fault was a
+   graceful stop in disguise, and the scenario passed. It now `kill -9`s the container's host PID
+   from the node, which is what an OOMKill does.
+7. **A crashed orchestrator stalled the whole consumer group for ~23 s.** The crashed container
+   restarted in place ~20 s later and rejoined as new members; under the eager range assignor that
+   started a rebalance, the surviving pod revoked all its partitions, and the coordinator waited for
+   the dead members' 45 s sessions to expire before completing it.
+8. **No payment was wrongly compensated in that crash, but by timing, not by design.** The
+   survivor's sweeper ran for 24 s after the kill and paused when its partitions were revoked; the
+   first stuck saga's deadline was 30 s. A restart slower than ~28 s would have let the survivor
+   time out healthy sagas whose replies sat on orphaned partitions: the readiness gate added at M7
+   covers "this instance cannot hear", not "a sibling's partitions are orphaned". Open.
+9. **The other kind cluster on this machine would not start afterwards**: `bind: An attempt was
+   made to access a socket in a way forbidden by its access permissions` on its API-server port
+   53067. Windows had reserved 53043-53142 (`netsh interface ipv4 show excludedportrange
+   protocol=tcp`) when WSL networking restarted. kind picks that port at random from the dynamic
+   range; this cluster's is now pinned to 16443.
+
+### Verified
+
+```
+helm lint / helm template                     clean; the four refusals each print their reason
+promtool check rules                          alerts.yml 7 rules, Kubernetes rules 3: SUCCESS
+k8s/up.sh                                     deployed; kindest/node v1.36.1, Helm 4.2.4, kind 0.32.0
+rpk cluster config get                        write_caching_default "false", auto_create_topics_enabled false
+Prometheus                                    one target per pod, instance = pod name, 4 of 4 up
+hikaricp_connections_max                      12/12/10/10; account-service set to 11 -> 11 (binding proven)
+walkthrough through localhost:8084            202 -> COMPLETED in ~2 s; I1-I5, S1-S4 pass
+verify-netpol.sh                              10 of 10; with the app policies deleted: 4 FAIL (the
+                                              management port reachable from another namespace)
+two generated keys (kubectl scale past        orchestrator 19/40 401; account-service 20/40 401
+  the chart's guard), 10 logins x 4
+
+rollout-under-load.sh (20 VUs, ~4.6 payments/s, one run each):
+  A rolling restart x3 (57 / 27 / 26 s)       0 of 6,874 failed; 1,298/1,298 COMPLETED; 0 timed out;
+                                              settle p99 3.13 s; k6 exit 0; I1-I5, S1-S4 pass
+  B the same, preStop 0                       4 of 6,834 failed, all "connect: connection refused" to
+                                              the ClusterIP at the two SIGTERM instants; 1,317/1,317
+  C kubectl delete --force --grace-period=0   partitions moved in 4 s; 0 of 6,850 failed; 1,357/1,357
+  D SIGKILL from the node                     partitions orphaned 46 s; 2 of 7,343 failed (0 creates);
+                                              1,139/1,139 COMPLETED, 0 timed out; settle p99 42.5 s,
+                                              max 46.1 s; k6 exit 99 (settle threshold); invariants pass
+
+Compose regression (the shared scripts, rules, dashboard and console changed):
+  verify-invariants.sh (default docker path)  All invariants hold
+  Prometheus rules                            7 rules, all health ok
+  chaos/04-gateway-declines-everything.sh     HYPOTHESIS HELD
+```
+
+Then, on a cluster deleted and recreated from nothing with the final scripts:
+
+```
+k8s/up.sh (cold)                              exit 0; API server on 127.0.0.1:16443 (pinned); both
+                                              orchestrators "signing with the configured RSA key" on
+                                              first boot, 0 restarts
+verify-netpol.sh                              NetworkPolicies are enforced
+rollout-under-load.sh, run A repeated         0 of 6,847 failed; 1,310/1,310 COMPLETED; 0 timed out;
+  (77 / 32 / 36 s)                            settle p99 3.29 s; k6 exit 0; I1-I5, S1-S4 pass
+```
+
+Before that run the host had 1.4 GB free: the Docker VM held 5.8 GB of page cache from the image
+build. Dropping it (`echo 3 > /proc/sys/vm/drop_caches` from a privileged container) returned the
+host to 4.1 GB free.
+
+### Committed
+
+With part 2 - see its list.
+
+### Open / next
+
+1. **Consumer session timeout (45 s) against the saga step timeout (30 s).** Either the session
+   timeout comes under the step timeout, or the step timeout goes above it; test it with a crash
+   whose restart takes longer than 30 s.
+2. Default-deny egress.
+3. Carried over: the unexplained exit 137 (Session 24), `SagaOrchestrator.start`'s `save()` merge,
+   gateway partitions, batched offset commits, the relay poll interval, the PSP call's place in the
+   transaction.
+
+---
+
+## Session 25, part 2 — 2026-09-14
+
+### Goal
+
+Close the finding part 1 left open: a crashed orchestrator's consumer partitions stay orphaned for
+the consumer session timeout (45 s), longer than the saga deadline (30 s). Demonstrate it first,
+then choose between lowering the session timeout and raising the saga deadline.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Which side moves | `dpe.saga.step-timeout` 30 s -> **60 s**; `session.timeout.ms` stays at the 45 s default | 45 s session + rebalance + ~13 s margin. Lowering the session timeout instead would evict a healthy consumer on every long pause; raising the deadline costs only a slower compensation when a participant is genuinely dead. |
+| How to demonstrate it | A new `DISRUPT=freeze` mode: SIGSTOP the orchestrator holding reply partitions | SIGKILL (part 1, run D) was saved by timing: the quick in-place restart forced an early rebalance. A frozen process never rejoins early, so the survivor keeps its partitions and keeps sweeping. |
+| Keeping the chaos suite honest | One `SAGA_DEADLINE` in `chaos/lib.sh`; scenarios 01 and 02 derive their timings from it | Scenario 02's fixed 45 s outage was chosen to pass a 30 s deadline; at 60 s it would end before the deadline and quietly test nothing. |
+
+### Built
+
+- `payment-orchestrator/src/main/resources/application.yml`: `step-timeout: 60s`, with the derivation.
+- `chaos/lib.sh`: `SAGA_DEADLINE=60`; `QUIESCE_TIMEOUT` = deadline + 120. Scenario 01's
+  "sub-deadline" threshold is `SAGA_DEADLINE - 5`; scenario 02's outage is `SAGA_DEADLINE + 15`.
+- `k8s/rollout-under-load.sh`: `DISRUPT=freeze`.
+- ADR 0013 decision 11; README results.
+
+### What broke
+
+1. **At 30 s, freezing one orchestrator failed 13 healthy payments** (9 FAILED, 4 COMPENSATED, all
+   `SAGA_TIMEOUT`). The proof they were healthy: every one had its `FundsReserved` published within a
+   second of acceptance (15:39:16-22 UTC) and was timed out ~30 s later (15:39:49-54) with that reply
+   still unread on the frozen member's partitions. Money stayed correct: the compensations commute.
+2. **The first full chaos run after the change refuted scenario 01 - the Redpanda consumer stall
+   again**, not the deadline. All three gateway consumers and one account-service consumer fetched
+   ~2,400-2,575 times a second with nothing consumed, groups `Stable`, lag 24; the sweeper compensated
+   all 12 payments after 60 s, and three compensations sat behind the stalled account-service
+   consumer (I4 and S1 failed). Restarting the two services cleared it; the stuck compensations
+   finished, the gateway's 24 late charges were refused against the void tombstones, and every
+   invariant held with no reconciliation.
+3. **Stopping that run needed three kills, not one.** The session tooling's "stopped for low memory"
+   ended only the wrapper; `run-all.sh` went on to scenario 02, and after killing it a subshell of
+   scenario 02 survived its parent, still waiting for quiescence - had the service restarts made the
+   system quiescent in its window, it would have killed account-service. Check for survivors by
+   script name before touching the stack.
+4. **Scenario 06 with Redis off is refuted, and has been since M8.** 100 concurrent copies of one
+   request: 54 × 202 and 46 × 503. The 503s are the request bulkhead (`dpe_bulkhead_rejected_total`
+   +46, admission refusals 0): with Redis off every duplicate waits on the unique index while holding
+   one of six permits. Every correctness check passed - one transfer, one idempotency record, bob paid
+   once, every 202 naming the same transfer. The scenario asserts "every caller answered 202", written
+   before the bulkhead existed, and the full suite had not been run since Session 18. Open.
+
+### Verified
+
+```
+DISRUPT=freeze, step-timeout 30 s     orphaned 47 s; 9 of 6,279 requests failed; 1,053 of 1,066
+                                      COMPLETED, 13 timed out; I1-I5, S1-S4 pass
+DISRUPT=freeze, step-timeout 60 s     orphaned 47 s; 0 of 6,138 failed; 1,050 of 1,050 COMPLETED,
+                                      0 timed out; settle p99 39.0 s; I1-I5, S1-S4 pass
+deadline_at - created_at               60 s on sagas after the redeploy (30 s before it)
+./mvnw -B -ntp -pl payment-orchestrator -am verify     127 tests, 0 failures, BUILD SUCCESS
+chaos/run-all.sh (Compose, 60 s)       run 1: 01 REFUTED by the consumer stall (stopped there)
+                                       run 2: 10 of 11 HELD; REFUTED: REDIS=off 06 (What broke 4)
+```
+
+### Committed
+
+`7c0a641` metrics: a gauge that counts a shared table is aggregated with max, not sum  
+`5ff286e` saga: step-timeout 60 s - a deadline must outlast an orphaned partition  
+`b5514bd` M10: Kubernetes - putting back what Compose was doing for free  
+`8a3265f` scripts: the documented entry points are executable in the repository
+and the commit adding this log. Pushed.
+
+### Open / next
+
+1. Scenario 06, Redis off: accept `503 BUSY` as a correct answer to a duplicate (it says "not
+   processed"; the retry with the same key replays), or stop a request waiting on another's
+   idempotency claim from holding a bulkhead permit.
+2. Default-deny egress; the cooperative-sticky assignor (would stop a crashed member's rejoin from
+   stalling the whole group).
+3. Carried over from part 1.
