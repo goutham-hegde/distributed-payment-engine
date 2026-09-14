@@ -37,6 +37,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *                  directly so a background thread cannot race their assertions. Boxed, so that
  *                  an absent key defaults to ON rather than binding to false - a primitive
  *                  boolean would ship the sweeper silently disabled wherever the key is unset.
+ * @param failureCooldown  after a Redis call fails, how long {@link IdempotencyCache} stops asking
+ *                  Redis at all (M10, S25). Without it every request paid the client timeout on
+ *                  each of its three Redis calls while Redis was down - ~0.6 s held inside a
+ *                  request-bulkhead permit - and chaos scenario 06 with Redis stopped had 46 of
+ *                  100 callers refused 503 BUSY. Short, because while it runs the fast path is off
+ *                  even if Redis came back a moment ago: that costs latency and nothing else.
  */
 @ConfigurationProperties(prefix = "dpe.idempotency")
 public record IdempotencyProperties(
@@ -47,7 +53,8 @@ public record IdempotencyProperties(
         Duration lockWait,
         Duration sweepInterval,
         int sweepBatchSize,
-        Boolean scheduled) {
+        Boolean scheduled,
+        Duration failureCooldown) {
 
     public IdempotencyProperties {
         retention = retention == null ? Duration.ofHours(24) : retention;
@@ -60,5 +67,6 @@ public record IdempotencyProperties(
         sweepInterval = sweepInterval == null ? Duration.ofMinutes(5) : sweepInterval;
         sweepBatchSize = sweepBatchSize <= 0 ? 500 : sweepBatchSize;
         scheduled = scheduled == null || scheduled;
+        failureCooldown = failureCooldown == null ? Duration.ofSeconds(5) : failureCooldown;
     }
 }

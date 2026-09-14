@@ -121,6 +121,17 @@ Rules the implementation holds to:
 5. **The lock is released by compare-and-delete in Lua**, never a plain `DEL`. A stalled holder
    whose lease expired would otherwise delete its *successor's* lock — the same Kleppmann failure,
    one level down, inside the optimization.
+6. **A failed Redis is not asked again for a few seconds** (added at M10, Session 25). Rule 1 made
+   each failure cheap *per call* — a 200 ms client timeout — but a request makes three calls, so
+   with Redis down every request paid ~0.6 s, and paid it while holding one of the six permits of
+   the request bulkhead (ADR 0009). Chaos scenario 06 with Redis stopped then refused 46 of 100
+   callers with 503: still correct — one transfer, paid once — but a Redis outage was costing
+   *capacity*, which is load-bearing by another name, and no test noticed because the
+   `IdempotencyWithoutRedisTest` dead port refuses instantly instead of timing out. Now the first
+   failure switches the fast path off for `failure-cooldown` (5 s) and one caller probes after it;
+   a miss, a held lock or an unparseable value are answers and never trip it. Measured with Redis
+   stopped: one request pays 0.24 s, the rest 0.01–0.03 s, same as with Redis up; scenario 06 with
+   Redis off answers 100 of 100.
 
 ## Consequences
 

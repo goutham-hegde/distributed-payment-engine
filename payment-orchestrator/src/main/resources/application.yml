@@ -259,6 +259,11 @@ dpe:
     # How long a caller that lost the lock waits for the winner answer before going to Postgres
     # regardless. Never refuse, never wait forever.
     lock-wait: 500ms
+    # M10 (S25): after a Redis call fails, stop asking Redis for this long; then one request probes.
+    # With Redis down every request used to wait out the 200 ms client timeout three times inside a
+    # bulkhead permit (0.85 s vs 0.23 s measured), so a Redis outage cost CAPACITY - scenario 06
+    # refused 46 of 100 callers. Now one request per cooldown pays it. See IdempotencyCache.
+    failure-cooldown: 5s
     # M4 part 2: garbage collection for expired keys. Frequent and small, because this table
     # is on the path of every write request and a rare enormous DELETE locks exactly the rows
     # the gate is trying to read.

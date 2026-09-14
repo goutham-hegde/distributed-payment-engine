@@ -20,9 +20,9 @@ import org.springframework.boot.test.context.SpringBootTest;
  *
  * <p>This is the test that turns "Redis is not load-bearing" from a claim in an ADR into a fact
  * about the code, and it is deliberately harsher than pulling the container: here the client is
- * configured, enabled, and connecting on every single request - to a port with nothing behind it.
- * Every {@code lookup}, {@code store}, {@code acquireLock} and {@code releaseLock} fails, on the
- * request path, under concurrency.
+ * configured, enabled, and connecting - to a port with nothing behind it. The first call fails, and
+ * since M10 the cache then bypasses Redis for {@code failure-cooldown} with one probe after each
+ * (IdempotencyCacheBypassTest counts the calls); either way nothing here may throw or answer 500.
  *
  * <p>The failure it is looking for is a specific and very common one. A cache added in front of a
  * database, with its exceptions left to propagate, does not degrade - it <b>amplifies</b>: the

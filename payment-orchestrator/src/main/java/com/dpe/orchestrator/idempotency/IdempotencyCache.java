@@ -1,9 +1,14 @@
 package com.dpe.orchestrator.idempotency;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.script.RedisScript;
 import java.util.Optional;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,6 +80,27 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p>The other half of the same discipline lives in the caller: {@link IdempotencyGate} treats a
  * lock it failed to acquire as advice, waits briefly, and goes to the database regardless.
+ *
+ * <h2>"Not for long" had to be enforced across requests too (M10, S25)</h2>
+ *
+ * <p>Each call is bounded by the client timeout (200 ms), and that was the whole defence - per
+ * call. A request makes three (lookup, lock, store), so with Redis down EVERY request, new or
+ * replay, paid ~0.6 s: 0.85 s against 0.23 s, measured. It paid it inside a request-bulkhead
+ * permit, so six permits drained 3.5x slower, and chaos scenario 06 with Redis stopped refused 46
+ * of 100 callers with 503 BUSY. Correct throughout - one transfer, bob paid once - but a Redis
+ * outage was costing capacity, which is load-bearing by another name.
+ *
+ * <p>So after any call to Redis fails, this class stops calling it for
+ * {@code dpe.idempotency.failure-cooldown} and answers as if the cache were switched off:
+ * {@code lookup} misses, {@code acquireLock} is {@link LockOutcome.Unavailable}, the other two do
+ * nothing. When the cooldown ends, exactly ONE caller asks Redis again - whoever wins a
+ * compare-and-set - while the rest keep bypassing until that probe reports. Redis answering
+ * anything at all ends the bypass; failing again re-arms it. One request per cooldown pays the
+ * timeout, instead of all of them.
+ *
+ * <p>What does NOT trip it: a miss, a lock held by someone else, or a stored value that no longer
+ * parses. All three are Redis answering. Tripping on a bad value would switch off the fast path
+ * for every key because of one.
  */
 @Component
 public class IdempotencyCache {
@@ -107,14 +133,70 @@ public class IdempotencyCache {
     private final Counter misses;
     private final Counter unavailable;
 
+    /** True while Redis is being bypassed after a failure. Read by a gauge, so it is a field. */
+    private final AtomicBoolean bypassing = new AtomicBoolean(false);
+    /** nanoClock value before which Redis is not asked. Meaningful only while bypassing. */
+    private final AtomicLong retryAt = new AtomicLong();
+    private final LongSupplier nanoClock;
+    private final long cooldownNanos;
+
+    @Autowired
     public IdempotencyCache(StringRedisTemplate redis, ObjectMapper objectMapper,
                             IdempotencyProperties properties, MeterRegistry registry) {
+        this(redis, objectMapper, properties, registry, System::nanoTime);
+    }
+
+    /** With a clock the test can move, so a cooldown is asserted without sleeping through it. */
+    IdempotencyCache(StringRedisTemplate redis, ObjectMapper objectMapper,
+                     IdempotencyProperties properties, MeterRegistry registry,
+                     LongSupplier nanoClock) {
         this.redis = redis;
         this.objectMapper = objectMapper;
         this.properties = properties;
         this.hits = counter(registry, "hit");
         this.misses = counter(registry, "miss");
         this.unavailable = counter(registry, "unavailable");
+        this.nanoClock = nanoClock;
+        this.cooldownNanos = properties.failureCooldown().toNanos();
+        // Registered at zero from the start, and written back to zero on recovery: a gauge that
+        // only appears once something is wrong is a gap on the graph, not a line at 0.
+        Gauge.builder("dpe.idempotency.cache.bypassed", bypassing, b -> b.get() ? 1 : 0)
+                .description("1 while Redis is being bypassed after a failure, 0 otherwise")
+                .register(registry);
+    }
+
+    /**
+     * May this call go to Redis? Yes if nothing has failed; no while cooling down; and when the
+     * cooldown has ended, yes for exactly one caller - the one whose compare-and-set pushes the
+     * next retry out - so a burst arriving at that instant sends one probe, not a hundred.
+     */
+    private boolean mayAsk() {
+        if (!bypassing.get()) {
+            return true;
+        }
+        long due = retryAt.get();
+        long now = nanoClock.getAsLong();
+        if (now - due < 0) {
+            return false;
+        }
+        return retryAt.compareAndSet(due, now + cooldownNanos);
+    }
+
+    /** Redis replied - whatever it said. */
+    private void answered() {
+        if (bypassing.compareAndSet(true, false)) {
+            log.info("Redis is answering again; idempotency fast path back on");
+        }
+    }
+
+    /** Redis did not reply. Logged once per outage, not once per request. */
+    private void failed(Exception e) {
+        retryAt.set(nanoClock.getAsLong() + cooldownNanos);
+        if (bypassing.compareAndSet(false, true)) {
+            log.warn("Redis did not answer ({}); bypassing the idempotency fast path for {} - "
+                    + "requests go straight to Postgres, which is where the guarantee is",
+                    e.toString(), properties.failureCooldown());
+        }
     }
 
     private static Counter counter(MeterRegistry registry, String result) {
@@ -143,12 +225,29 @@ public class IdempotencyCache {
             unavailable.increment();
             return Optional.empty();
         }
+        if (!mayAsk()) {
+            // Bypassing after a recent failure. Counted as unavailable, because it is: the fast
+            // path is not there for this request, which is all the metric has ever claimed.
+            unavailable.increment();
+            return Optional.empty();
+        }
+        String json;
         try {
-            String json = redis.opsForValue().get(responseKey(clientId, key));
-            if (json == null) {
-                misses.increment();
-                return Optional.empty();
-            }
+            json = redis.opsForValue().get(responseKey(clientId, key));
+        } catch (Exception e) {
+            log.debug("Idempotency cache lookup failed for {}:{}", clientId, key, e);
+            failed(e);
+            // Neither this nor the parse failure below means the request is in trouble: the
+            // caller falls through to the Postgres claim, which is where the guarantee lives.
+            unavailable.increment();
+            return Optional.empty();
+        }
+        answered();
+        if (json == null) {
+            misses.increment();
+            return Optional.empty();
+        }
+        try {
             // Parse BEFORE counting the hit. Counted first, a stored value that no longer
             // deserialises - an old shape left over across a deploy - would increment `hit` and
             // then fall into the catch below and increment `unavailable` as well, so one lookup
@@ -157,10 +256,9 @@ public class IdempotencyCache {
             hits.increment();
             return Optional.of(response);
         } catch (Exception e) {
-            log.debug("Idempotency cache lookup failed for {}:{}", clientId, key, e);
-            // Redis threw, or the stored JSON no longer parses. Both mean the fast path is not
-            // available for this request, and neither means the request is in trouble: the
-            // caller falls through to the Postgres claim, which is where the guarantee lives.
+            // Redis answered; the VALUE is what failed. Not a reason to stop asking Redis - that
+            // would switch the fast path off for every key because of one.
+            log.debug("Idempotency cache entry for {}:{} does not parse", clientId, key, e);
             unavailable.increment();
             return Optional.empty();
         }
@@ -171,11 +269,22 @@ public class IdempotencyCache {
         if (!properties.cache()) {
             return;
         }
+        String json;
         try {
-            String json = objectMapper.writeValueAsString(response);
+            json = objectMapper.writeValueAsString(response);
+        } catch (Exception e) {
+            log.debug("Idempotency cache entry for {}:{} did not serialise", clientId, key, e);
+            return;
+        }
+        if (!mayAsk()) {
+            return;
+        }
+        try {
             redis.opsForValue().set(responseKey(clientId, key), json, properties.cacheTtl());
+            answered();
         } catch (Exception e) {
             log.debug("Idempotency cache store failed for {}:{}", clientId, key, e);
+            failed(e);
         }
     }
 
@@ -190,30 +299,38 @@ public class IdempotencyCache {
 }
 
 public LockOutcome acquireLock(String clientId, String key) {
-    if (!properties.cache()) {
+    if (!properties.cache() || !mayAsk()) {
+        // Switched off, or bypassing after a failure: the same thing to the caller, which goes
+        // straight to Postgres. Unavailable, never HeldByAnother - only that one earns a wait.
         return new LockOutcome.Unavailable();
     }
     try {
         String token = UUID.randomUUID().toString();
         Boolean acquired = redis.opsForValue().setIfAbsent(lockKey(clientId, key), token, properties.lockTtl());
+        answered();
         return Boolean.TRUE.equals(acquired)
                 ? new LockOutcome.Acquired(token)
                 : new LockOutcome.HeldByAnother();
     } catch (Exception e) {
         log.debug("Idempotency lock acquire failed for {}:{}", clientId, key, e);
+        failed(e);
         return new LockOutcome.Unavailable();
     }
 }
 
     /** Releases the lock only if this caller still holds it. Never throws. */
     public void releaseLock(String clientId, String key, String token) {
-        if (!properties.cache()) {
+        // Skipped while bypassing: a lock taken just before Redis failed then expires on its own
+        // lockTtl, which is exactly what a failed release would have left behind anyway.
+        if (!properties.cache() || !mayAsk()) {
             return;
         }
         try {
             redis.execute(RELEASE_SCRIPT, List.of(lockKey(clientId, key)), token);
+            answered();
         } catch (Exception e) {
             log.debug("Idempotency lock release failed for {}:{}", clientId, key, e);
+            failed(e);
         }
     }
 }
