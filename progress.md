@@ -4746,7 +4746,9 @@ implicitly. The claim to test: a rolling deploy of every service, under load, lo
    made to access a socket in a way forbidden by its access permissions` on its API-server port
    53067. Windows had reserved 53043-53142 (`netsh interface ipv4 show excludedportrange
    protocol=tcp`) when WSL networking restarted. kind picks that port at random from the dynamic
-   range; this cluster's is now pinned to 16443.
+   range; this cluster's is now pinned to 16443. Freed later in the session by restarting the
+   Windows NAT service from an elevated shell (`net stop winnat`, `net start winnat`): every dynamic
+   reservation was released and that cluster started with its state intact.
 
 ### Verified
 
@@ -4951,10 +4953,24 @@ verify-invariants.sh                           all hold (I3 re-baselined after t
 
 ### Committed
 
-`IdempotencyCache` bypass and this entry.
+`915561e` idempotency: a failed Redis is not asked again for five seconds  
+`c6ff87f` log: Session 25 part 3 - a dead Redis stops costing capacity  
+`20730a9` M10 done: Kubernetes, with what Compose had been doing implicitly put back
+
+All pushed. **M10 is done** (2026-09-15), which completes M0-M10. Session 25 as a whole pushed
+nine commits, `7c0a641` through `20730a9`, plus the one adding this closing note.
 
 ### Open / next
 
-1. An alert on `dpe_idempotency_cache_bypassed` held at 1 would say "Redis has been down for N
-   minutes" - a warning, not a page, since correctness does not depend on it. Not added.
-2. Carried over from parts 1 and 2.
+Nothing blocks a milestone. What is known and not done:
+
+1. An alert on `dpe_idempotency_cache_bypassed` held at 1 ("Redis has been down for N minutes") -
+   a warning, not a page, since correctness does not depend on it.
+2. Default-deny egress NetworkPolicies (ingress only today).
+3. The cooperative-sticky assignor: under the eager protocol a crashed member's rejoin revokes
+   every member's partitions, which stalled the whole group for ~23 s in part 1.
+4. The consumer stall after a Redpanda broker restart (hit again in part 2): root cause not
+   established, only ever reproduced on Redpanda.
+5. From before M10: the unexplained exit 137 (Session 24), `SagaOrchestrator.start`'s `save()`
+   merge, gateway partitions, batched offset commits, the relay poll interval, and the PSP call's
+   place in the transaction.
