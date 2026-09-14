@@ -13,7 +13,7 @@
 # HYPOTHESIS: the restarted orchestrator publishes every stranded command; no saga is lost, none
 # is started twice, every invariant holds.
 #
-# Watch the timing. The saga deadline is 30s of WALL CLOCK from start(), and it keeps running
+# Watch the timing. The saga deadline (60 s since M10) is WALL CLOCK from start(), and it keeps running
 # while the orchestrator is dead. If the restart takes as long as the deadline, the sweeper and
 # the relay race on first boot for the same sagas. That race is logged, not hidden.
 
@@ -47,7 +47,7 @@ docker unpause "$BROKER_CONTAINER" >/dev/null
 log "START payment-orchestrator"
 docker start dpe-orchestrator >/dev/null
 wait_healthy dpe-orchestrator 180
-log "orchestrator back $((SECONDS - t0))s after the first saga started (deadline is 30s)"
+log "orchestrator back $((SECONDS - t0))s after the first saga started (deadline is ${SAGA_DEADLINE}s)"
 
 wait_terminal "$WORK/ids" || true
 wait_quiescent || true

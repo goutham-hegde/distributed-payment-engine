@@ -49,9 +49,15 @@ if [ -z "${BROKER:-}" ]; then
 fi
 BROKER_CONTAINER="dpe-$BROKER"
 
-# The saga's whole-saga deadline is 30s and the sweeper runs every 5s, so the slowest honest path
-# to a terminal state is ~35s after the last fault clears. Quiescence waits comfortably past that.
-QUIESCE_TIMEOUT="${QUIESCE_TIMEOUT:-150}"
+# The saga's whole-saga deadline - MUST equal dpe.saga.step-timeout in payment-orchestrator's
+# application.yml. Scenarios derive their "shorter than" and "past" the deadline timings from it,
+# so the day the deadline moves, a scenario cannot keep testing the old one. 30 until M10; 60 since
+# (a crashed instance's partitions stay orphaned for the consumer session timeout, 45 s).
+SAGA_DEADLINE="${SAGA_DEADLINE:-60}"
+
+# The sweeper runs every 5s, so the slowest honest path to a terminal state is ~deadline + 5s after
+# the last fault clears. Quiescence waits comfortably past that.
+QUIESCE_TIMEOUT="${QUIESCE_TIMEOUT:-$((SAGA_DEADLINE + 120))}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dpe-chaos.XXXXXX")"
 SCENARIO=""

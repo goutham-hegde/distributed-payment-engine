@@ -61,7 +61,7 @@ const STAGES = __ENV.STAGES || '5:60,10:60,15:60,20:60,30:60,40:60';
 // Fraction of accepted transfers re-sent with the SAME Idempotency-Key, as a client retrying a
 // request whose response it never saw. Each must be answered with the original transfer id.
 const RETRY_RATE = num('RETRY_RATE', 0.02);
-// Must outlast the saga's step-timeout (30 s) plus a sweep (5 s): a transfer the sweeper
+// Must outlast the saga's step-timeout (60 s since M10) plus a sweep (5 s): a transfer the sweeper
 // compensates still settles, and giving up before it does would count a correct FAILED as a hang.
 const POLL_TIMEOUT_S = num('POLL_TIMEOUT', 90);
 const POLL_INTERVAL_S = num('POLL_INTERVAL', 0.5);
@@ -161,7 +161,7 @@ const thresholds = {
 if (PROFILE !== 'knee') {
   Object.assign(thresholds, {
     'http_req_duration{op:create}': ['p(95)<250', 'p(99)<500'],
-    // Below the 30 s step-timeout, with room: a settle time near it means the sweeper is racing
+    // Well below the 60 s step-timeout: a settle time near it means the sweeper is racing
     // healthy sagas, and its compensations are load of their own.
     transfer_settle_ms: ['p(95)<10000', 'p(99)<20000'],
     transfer_completed: ['rate>0.99'],

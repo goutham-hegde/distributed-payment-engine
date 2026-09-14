@@ -8,8 +8,9 @@
 #
 # The OUTAGE length is the variable that matters, and the scenario takes it as a parameter:
 #
-#   OUTAGE=15  (default) shorter than the 30s saga deadline. This is the hypothesis as written.
-#   OUTAGE=45  longer than the deadline. The sweeper runs on the orchestrator's database, which is
+#   OUTAGE=15  (default) shorter than the saga deadline (SAGA_DEADLINE in lib.sh, 60 s since M10).
+#              This is the hypothesis as written.
+#   OUTAGE=75  longer than the deadline (45 before M10, when the deadline was 30 s). The sweeper runs on the orchestrator's database, which is
 #              still up, so it times the sagas out while their ReserveFunds is still sitting in
 #              the outbox - and the outbox does not know the saga gave up. Run this one and look
 #              at S1.
@@ -74,7 +75,8 @@ log "outcomes: $(sql payments_db "SELECT string_agg(status || ' ' || n, ', ') FR
 # serve again. On Redpanda that is a couple of seconds. On Apache Kafka it measured ~14 s, so
 # OUTAGE=15 was a 31 s outage against a 30 s deadline: the four pre-kill sagas timed out 0.85 s
 # before the first publish and were (correctly) compensated, and the old `OUTAGE -lt 30` check
-# called that a refutation. The margin is one sweep interval plus the pre-kill traffic.
+# called that a refutation. The margin is one sweep interval plus the pre-kill traffic. (M10 moved
+# the deadline to 60 s, so Kafka's slow restart is now comfortably sub-deadline too.)
 # Only rows WRITTEN after the kill: they cannot have been published until the broker was back. The
 # first version took the first publish after the kill instant and read 0 s on four runs of six - the
 # relay's in-flight sends from before the kill were acknowledged in the same instant it landed.
@@ -82,7 +84,7 @@ effective="$(sql payments_db "SELECT COALESCE(ROUND(EXTRACT(EPOCH FROM MIN(publi
                                FROM outbox WHERE created_at > '$killed_at'::timestamptz + interval '1 second'
                                  AND published_at IS NOT NULL")"
 log "effective outage (kill -> first publish of a command written after it): ${effective}s, of which ${OUTAGE}s was the broker being down"
-if [ "$effective" -ge 0 ] && [ "$effective" -lt 25 ]; then
+if [ "$effective" -ge 0 ] && [ "$effective" -lt $((SAGA_DEADLINE - 5)) ]; then
     expect_eq "a sub-deadline outage delays payments, it does not fail them: all COMPLETED" \
         "$(sql payments_db "SELECT COUNT(*) FROM saga_instances WHERE transfer_id IN ($ids) AND status = 'COMPLETED'")" "$N"
 else

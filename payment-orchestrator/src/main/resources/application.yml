@@ -205,7 +205,20 @@ dpe:
     # exceed the p99 of a full round trip - relay poll interval, broker, consumer poll, the
     # gateway's own latency - and 30s is that with room to spare while staying observable in a
     # test.
-    step-timeout: 30s
+    #
+    # M10: 60s, and the floor is now a CONSUMER-GROUP number, not a round trip. It must exceed the
+    # longest a reply can sit on a partition that nobody is reading while another instance of this
+    # service is alive and sweeping. A crashed or frozen instance's partitions stay assigned to it
+    # until the broker notices it has stopped heartbeating - session.timeout.ms, 45s by default -
+    # and are then handed over. Measured on Kubernetes with two orchestrators: 46-47s orphaned. At
+    # 30s, freezing one instance under load failed 13 healthy payments whose FundsReserved had been
+    # published within a second of creation and sat unread for ~30s while the SURVIVOR's sweeper
+    # timed them out (ReplyListenerReadiness cannot see this: the survivor holds partitions, so it
+    # can hear - just not the ones these replies are on). 60s = 45s session + rebalance + margin.
+    # Lower session.timeout.ms or raise this, never the other way round. The cost: a payment whose
+    # participant is genuinely dead is compensated after 60s instead of 30s, its money held that
+    # much longer. The deadline is whole-saga, from acceptance (SagaInstance), not per step.
+    step-timeout: 60s
     # How often to look for expired sagas. The sweep is one indexed query against a partial
     # index containing only in-flight sagas, so it is cheap enough to run often.
     sweep-interval: 5s

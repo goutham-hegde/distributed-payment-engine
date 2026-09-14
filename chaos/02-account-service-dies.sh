@@ -25,10 +25,12 @@ source "$(dirname "$0")/lib.sh"
 WHEN="${WHEN:-after-charge}"
 N="${N:-6}"
 AMOUNT=7000
-# The saga deadline is 30s from start() and the sweeper runs every 5s. Staying down 45s past the
-# first POST guarantees every saga in the batch has been swept at least once before the
-# participant comes back - which is the situation the scenario is about.
-OUTAGE="${OUTAGE:-45}"
+# The saga deadline (SAGA_DEADLINE in lib.sh) runs from start() and the sweeper runs every 5s.
+# Staying down 15s past it from the first POST guarantees every saga in the batch has been swept at
+# least once before the participant comes back - which is the situation the scenario is about. This
+# was a fixed 45 against a 30 s deadline until M10 moved the deadline to 60 s; a fixed 45 would
+# now end the outage BEFORE the deadline and quietly test nothing.
+OUTAGE="${OUTAGE:-$((SAGA_DEADLINE + 15))}"
 
 begin_scenario "02 account-service dies ($WHEN)"
 
@@ -53,7 +55,7 @@ if [ "$WHEN" = "before-reserve" ]; then
     log "fired $(wc -l < "$WORK/ids" | tr -d ' ') transfers into a dead participant: $(states)"
 else
     # Slow enough that the kill lands inside the charge, fast enough that the whole batch is
-    # charged well inside the 30s deadline even if every transfer hashes to one partition.
+    # charged well inside the deadline even if every transfer hashes to one partition.
     gateway_set '{"latencyMs":3000}'
     t0=$SECONDS
     fire_transfers "$N" "$N" "$alice_tok" "$alice_acct" "$bob_acct" "$AMOUNT" "$WORK/sent"
