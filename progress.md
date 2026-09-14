@@ -4893,3 +4893,68 @@ and the commit adding this log. Pushed.
 2. Default-deny egress; the cooperative-sticky assignor (would stop a crashed member's rejoin from
    stalling the whole group).
 3. Carried over from part 1.
+
+---
+
+## Session 25, part 3 — 2026-09-14
+
+### Goal
+
+Close the scenario 06 finding from part 2: with Redis stopped, 46 of 100 concurrent duplicates
+were refused 503 BUSY. Measured cause: every request waited out the 200 ms Redis client timeout on
+each of its three cache calls while holding a request-bulkhead permit.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Fix the cause or accept the symptom | Fix the cause: stop calling Redis for a cooldown after it fails | Accepting 503 in the scenario would have been honest about correctness and silent about a Redis outage costing capacity - load-bearing by another name. |
+| Cooldown | `dpe.idempotency.failure-cooldown: 5s`, then one probe | While it runs the fast path is off even if Redis came back - that costs latency and nothing else. One request per cooldown pays the timeout instead of every request. |
+| One probe | Chosen by compare-and-set on the retry time | A burst arriving as the cooldown ends must not send a hundred probes into a Redis that may still be timing out. |
+| What trips it | Only Redis failing to reply | A miss, a held lock and an unparseable stored value are answers; tripping on a bad value would switch off the fast path for every key because of one. |
+| Metrics | Skipped calls count as `result="unavailable"`; new gauge `dpe.idempotency.cache.bypassed` (0/1, registered at 0) | The fast path is unavailable either way, so the existing dashboard panel stays truthful; the gauge says why. |
+
+### Built
+
+- `IdempotencyCache`: the bypass (`mayAsk` / `answered` / `failed`), a WARN when it starts and an
+  INFO when Redis answers again - once per outage, not per request. `lookup` now separates a Redis
+  failure from a value that does not parse.
+- `IdempotencyProperties.failureCooldown`, `application.yml` `failure-cooldown: 5s`.
+- `IdempotencyCacheBypassTest` - five tests against a fake Redis that counts calls, with a clock
+  the test moves.
+- ADR 0002 rule 6; ADR 0009's note points at it.
+
+### What broke
+
+1. **The existing no-Redis test could never have caught this.** `IdempotencyWithoutRedisTest` points
+   the client at port 1, which refuses the connection at once. The outage that costs capacity is the
+   one that times out. The new test counts calls instead of measuring time.
+
+### Verified
+
+```
+IdempotencyCacheBypassTest                     5/5
+  ablation: mayAsk() always true               3 of 5 fail - "forty calls inside the cooldown...",
+                                               "re-armed by the failed probe", "the first failure plus
+                                               exactly one probe"; the other two test that answers do
+                                               not trip, which holds either way
+./mvnw -B -ntp -pl payment-orchestrator -am verify     132 tests, 0 failures, BUILD SUCCESS
+chaos/06 REDIS=off (Compose)                   HYPOTHESIS HELD - 100 x HTTP 202 (was 54 x 202, 46 x 503)
+chaos/06 REDIS=on                              HYPOTHESIS HELD - 100 x HTTP 202
+orchestrator log during it                     one WARN "bypassing the idempotency fast path for PT5S",
+                                               one INFO "fast path back on"
+latency, 6 new + 6 replays each, direct        Redis up: 0.010-0.047 s
+                                               Redis down: first 0.245 s (the trip), then 0.011-0.035 s
+verify-invariants.sh                           all hold (I3 re-baselined after the latency test funded
+                                               an account with 1,000,000 - exactly the difference)
+```
+
+### Committed
+
+`IdempotencyCache` bypass and this entry.
+
+### Open / next
+
+1. An alert on `dpe_idempotency_cache_bypassed` held at 1 would say "Redis has been down for N
+   minutes" - a warning, not a page, since correctness does not depend on it. Not added.
+2. Carried over from parts 1 and 2.
