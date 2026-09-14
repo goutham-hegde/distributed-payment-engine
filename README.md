@@ -10,8 +10,8 @@ and a chaos suite and load test that judge the system by what is in its ledger r
 HTTP status codes it returned.
 
 > [!NOTE]
-> **Status: M0–M9 complete. M10 (Kubernetes + Helm, optional) is built and verified on a one-node
-> kind cluster ([ADR 0013](docs/adr/0013-kubernetes.md)).**
+> **Status: M0–M10 complete, including the optional M10: Kubernetes + Helm on a one-node kind
+> cluster ([ADR 0013](docs/adr/0013-kubernetes.md)).**
 > Every result below comes from a run recorded in [`progress.md`](progress.md), with the command
 > that produced it.
 
@@ -417,4 +417,4 @@ Docker Compose · Kubernetes (kind) + Helm
 | M7 | Chaos suite — 8 scenarios | ✅ done |
 | M8 | Load test — 1,000 concurrent users | ✅ done |
 | M9 | Documentation, ADRs, README | ✅ done |
-| M10 | Kubernetes + Helm (optional) | 🔨 built and verified on kind |
+| M10 | Kubernetes + Helm (optional) | ✅ done |

@@ -18,7 +18,7 @@ and what broke along the way. Newest entries at the bottom.
 | M7 | Chaos suite — 8 injected-failure scenarios | ✅ **done** |
 | M8 | Load test — k6 to 1,000 concurrent transfers | ✅ **done** |
 | M9 | Documentation, ADRs, README polish | ✅ **done** |
-| M10 | Kubernetes manifests + Helm chart (optional) | 🔨 built and verified on kind (Session 25); one finding open |
+| M10 | Kubernetes manifests + Helm chart (optional) | ✅ **done** |
 
 ---
 
