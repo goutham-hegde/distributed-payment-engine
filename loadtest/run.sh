@@ -175,7 +175,7 @@ report() {
     echo "Peaks during the run (Prometheus, ${secs}s window, 10 s scrape - a peak shorter than that is invisible):"
     echo "  outbox backlog (rows):";          prom application "max by (application) (max_over_time(dpe_outbox_backlog[${secs}s]))"
     echo "  oldest unpublished row (s):";     prom application "max by (application) (max_over_time(dpe_outbox_age_seconds[${secs}s]))"
-    echo "  sagas in flight:";                prom application "max by (application) (max_over_time(sum by (application) (dpe_saga_inflight)[${secs}s:10s]))"
+    echo "  sagas in flight:";                prom application "max by (application) (max_over_time(sum by (application) (max by (application, state) (dpe_saga_inflight))[${secs}s:10s]))"
     echo "  Hikari threads waiting:";         prom application "max by (application) (max_over_time(hikaricp_connections_pending[${secs}s]))"
     echo "  consumer lag (records):";         prom application "max by (application) (max_over_time(sum by (application) (kafka_consumer_fetch_manager_records_lag)[${secs}s:10s]))"
     echo "  GC pause, worst (s):";            prom application "max by (application) (max_over_time(jvm_gc_pause_seconds_max[${secs}s]))"

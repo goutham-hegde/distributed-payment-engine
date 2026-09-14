@@ -15,6 +15,14 @@
 # Every threshold below is written next to the reason it is that number rather than another one.
 # An alert whose threshold nobody can defend is an alert that gets silenced during its first
 # incident and never comes back.
+#
+# M10: ONE FACT, N REPORTERS. dpe_outbox_backlog, dpe_outbox_age_seconds, dpe_dlq_depth and
+# dpe_saga_inflight are each a count of a table - and every replica of a service counts the SAME
+# table. With two orchestrators there are two series carrying one number, so `sum` reports double
+# and a threshold of 1000 fires at 500. Those gauges are aggregated with `max`. Counters are the
+# opposite: each pod counts the work IT did, so dpe_saga_terminal_total is summed. Under Compose
+# there is one reporter per service and the two forms agree, which is how `sum` survived to M10.
+# The same rule is applied in the Grafana dashboard and the console's System view.
 
 groups:
   # ---------------------------------------------------------------------------------------------
@@ -54,7 +62,7 @@ groups:
       # placeholder until M8 measures what the relay actually sustains; it is written here rather
       # than omitted so that the k6 run has something to falsify.
       - alert: OutboxBacklogGrowing
-        expr: sum by (application) (dpe_outbox_backlog) > 1000
+        expr: max by (application) (dpe_outbox_backlog) > 1000
         for: 5m
         labels:
           severity: warning
@@ -74,7 +82,7 @@ groups:
       # replay clears it asynchronously - the two-minute wait stops a message that is being
       # replayed right now from paging anyone.
       - alert: DeadLettersPresent
-        expr: sum by (application) (dpe_dlq_depth) > 0
+        expr: max by (application) (dpe_dlq_depth) > 0
         for: 2m
         labels:
           severity: critical
@@ -155,7 +163,7 @@ groups:
       # STARTED is excluded: the timeout sweeper is the designed answer for a saga stuck there, and
       # a sweeper doing its job would otherwise page every time it worked.
       - alert: SagasStuckInFlight
-        expr: min_over_time((sum by (state) (dpe_saga_inflight{state!="STARTED"}))[15m:]) > 0
+        expr: min_over_time((max by (state) (dpe_saga_inflight{state!="STARTED"}))[15m:]) > 0
         for: 5m
         labels:
           severity: warning
@@ -181,16 +189,21 @@ groups:
       # Root cause NOT established. The broker logged "no session with id N found" for the fetch
       # sessions that existed before it restarted, and one of the two consumers in the same process
       # recovered from that while the other did not. A service restart clears it.
+      #
+      # Grouped by `instance` as well (M10). A client id is unique only within one JVM - two replicas
+      # run consumers with the same id - so grouping by id alone adds a healthy replica's consumption
+      # to a stalled replica's spin, the `== 0` half is never true, and the rule goes deaf exactly
+      # when there is a second copy to hide behind. Under Compose `instance` is one per service.
       - alert: KafkaConsumerFetchSpin
         expr: |
-          sum by (application, client_id) (rate(kafka_consumer_fetch_manager_fetch_total[2m])) > 50
-            and on (application, client_id)
-          sum by (application, client_id) (rate(kafka_consumer_fetch_manager_records_consumed_total[2m])) == 0
+          sum by (application, instance, client_id) (rate(kafka_consumer_fetch_manager_fetch_total[2m])) > 50
+            and on (application, instance, client_id)
+          sum by (application, instance, client_id) (rate(kafka_consumer_fetch_manager_records_consumed_total[2m])) == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.application }} consumer {{ $labels.client_id }} is fetching and consuming nothing"
+          summary: "{{ $labels.application }} ({{ $labels.instance }}) consumer {{ $labels.client_id }} is fetching and consuming nothing"
           description: >-
             Fetching at {{ $value | humanize }}/s with zero records consumed for 2 minutes. This is the
             post-broker-restart stall: the group looks Stable and every saga that depends on this

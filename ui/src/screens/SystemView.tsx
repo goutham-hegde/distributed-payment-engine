@@ -93,13 +93,17 @@ export function SystemView() {
  * already answers across all three. The per-service endpoint is the right tool when an operator
  * needs to know WHICH service is holding dead letters - which is what the dead letter screen is
  * for, not this tile.
+ *
+ * The inner `max` is the M10 rule: each gauge counts a table, and every replica of a service counts
+ * the same table, so two orchestrators publish two copies of one number. Collapse the copies per
+ * service (or per state) first, then sum across what is genuinely different.
  */
 async function loadMessaging() {
   const [backlog, age, deadLetters, inFlight] = await Promise.all([
-    promScalar("sum(dpe_outbox_backlog)"),
+    promScalar("sum(max by (application) (dpe_outbox_backlog))"),
     promScalar("max(dpe_outbox_age_seconds)"),
-    promScalar("sum(dpe_dlq_depth)"),
-    promScalar("sum(dpe_saga_inflight)"),
+    promScalar("sum(max by (application) (dpe_dlq_depth))"),
+    promScalar("sum(max by (state) (dpe_saga_inflight))"),
   ]);
 
   return { backlog, age, deadLetters, inFlight };

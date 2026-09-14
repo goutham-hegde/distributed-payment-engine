@@ -203,7 +203,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "sum(dpe_outbox_backlog)",
+          "expr": "sum(max by (application) (dpe_outbox_backlog))",
           "legendFormat": "rows",
           "range": true,
           "editorMode": "code"
@@ -335,7 +335,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "sum(dpe_dlq_depth)",
+          "expr": "sum(max by (application) (dpe_dlq_depth))",
           "legendFormat": "messages",
           "range": true,
           "editorMode": "code"
@@ -397,7 +397,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "sum(dpe_saga_inflight{application=\"payment-orchestrator\"})",
+          "expr": "sum(max by (state) (dpe_saga_inflight{application=\"payment-orchestrator\"}))",
           "legendFormat": "in flight",
           "range": true,
           "editorMode": "code"
@@ -854,7 +854,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "sum by (state) (dpe_saga_inflight{application=\"payment-orchestrator\"})",
+          "expr": "max by (state) (dpe_saga_inflight{application=\"payment-orchestrator\"})",
           "legendFormat": "{{state}}",
           "range": true,
           "editorMode": "code"
@@ -929,7 +929,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "dpe_outbox_backlog",
+          "expr": "max by (application) (dpe_outbox_backlog)",
           "legendFormat": "{{application}}",
           "range": true,
           "editorMode": "code"
@@ -991,7 +991,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "dpe_outbox_age_seconds",
+          "expr": "max by (application) (dpe_outbox_age_seconds)",
           "legendFormat": "{{application}}",
           "range": true,
           "editorMode": "code"
@@ -1276,7 +1276,7 @@
             "type": "prometheus",
             "uid": "dpe-prometheus"
           },
-          "expr": "sum(dpe_saga_inflight{application=\"payment-orchestrator\"})",
+          "expr": "sum(max by (state) (dpe_saga_inflight{application=\"payment-orchestrator\"}))",
           "legendFormat": "in flight",
           "range": true,
           "editorMode": "code"
