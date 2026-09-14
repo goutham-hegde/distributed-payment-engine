@@ -4854,8 +4854,12 @@ then choose between lowering the session timeout and raising the saga deadline.
    script name before touching the stack.
 4. **Scenario 06 with Redis off is refuted, and has been since M8.** 100 concurrent copies of one
    request: 54 × 202 and 46 × 503. The 503s are the request bulkhead (`dpe_bulkhead_rejected_total`
-   +46, admission refusals 0): with Redis off every duplicate waits on the unique index while holding
-   one of six permits. Every correctness check passed - one transfer, one idempotency record, bob paid
+   +46, admission refusals 0). The first explanation recorded here - duplicates waiting on the unique
+   index while holding a permit - was wrong, and a measurement corrected it: with Redis down EVERY
+   request, new or replayed, took ~0.85 s against ~0.23 s with Redis up (five of each, through the
+   console on the cluster), because the gate's three Redis calls (lookup, lock, store) each wait out
+   the 200 ms client timeout while the request holds its permit. Six permits with a 1 s wait cannot
+   absorb a burst of 50 at that hold time. Every correctness check passed - one transfer, one idempotency record, bob paid
    once, every 202 naming the same transfer. The scenario asserts "every caller answered 202", written
    before the bulkhead existed, and the full suite had not been run since Session 18. Open.
 
@@ -4882,9 +4886,10 @@ and the commit adding this log. Pushed.
 
 ### Open / next
 
-1. Scenario 06, Redis off: accept `503 BUSY` as a correct answer to a duplicate (it says "not
-   processed"; the retry with the same key replays), or stop a request waiting on another's
-   idempotency claim from holding a bulkhead permit.
+1. Scenario 06, Redis off: accept `503 BUSY` as a correct answer (it says "not processed"; the
+   retry with the same key replays), or make a dead Redis cheap - the gate pays three 200 ms timeouts
+   per request while holding a bulkhead permit, so a Redis outage currently costs capacity, not just
+   latency.
 2. Default-deny egress; the cooperative-sticky assignor (would stop a crashed member's rejoin from
    stalling the whole group).
 3. Carried over from part 1.
