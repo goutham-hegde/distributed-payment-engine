@@ -5,6 +5,12 @@
 **Related:** ADR 0001 (orchestration — the saga deadline), ADR 0002 (idempotency — the claim this
 check sits behind)
 
+> The saga deadline this record calls 30 s became **60 s at M10** ([ADR 0013](0013-kubernetes.md),
+> decision 11). The measurements below were taken at 30 s and are left as they were; the admission
+> limit is sized against a 10 s wait target, not against the deadline, and stays 150. Also since
+> M8: chaos scenario 06 with Redis off answers 46 of 100 duplicates with this bulkhead's 503 — see
+> `progress.md` Session 25, part 2.
+
 ## Context
 
 `POST /transfers` answers `202 Accepted` as soon as three rows commit — the transfer, the saga and

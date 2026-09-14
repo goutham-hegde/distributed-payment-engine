@@ -1,0 +1,79 @@
+{{- $ctx := dict "name" "prometheus" "root" . }}
+# Prometheus's configuration and rules - a file of their own so the Deployment can checksum them
+# (a template cannot checksum the file it is in: the include renders the annotation, recursively).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 10s
+      evaluation_interval: 10s
+      external_labels:
+        cluster: dpe-kind
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+    scrape_configs:
+      # Same job name as Compose, so every rule and panel written against job="dpe" still applies.
+      - job_name: dpe
+        metrics_path: /actuator/prometheus
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [{{ .Release.Namespace | quote }}]
+        relabel_configs:
+          # One target per container port is discovered; keep the port named `management`.
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: management
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_part_of]
+            regex: dpe
+            action: keep
+          # `service` says which Deployment; `instance` says which pod. Two replicas publish series
+          # that differ only here - the reason the shared-table gauges are aggregated with max
+          # (see the header of alerts.yml).
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            target_label: service
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: instance
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+data:
+  # infra/prometheus/alerts.yml, verbatim - the same rules Compose evaluates.
+  alerts.yml: |
+    {{- .Values.prometheus.alertRules | nindent 4 }}
+  # The one rule pod discovery made necessary. Under Compose a dead service is a static target that
+  # stops answering, and TargetDown fires. Here a Deployment with no pods has no targets at all:
+  # there is nothing to be down, `up == 0` never becomes true, and every rule over that service's
+  # metrics goes quiet - which renders identically to healthy. absent() is the only way to alert on
+  # something that is not there.
+  kubernetes.yml: |
+    groups:
+      - name: dpe-kubernetes
+        interval: 10s
+        rules:
+          {{- range $name, $svc := .Values.services }}
+          - alert: ServiceHasNoScrapeTargets
+            expr: absent(up{job="dpe", service="{{ $name }}"})
+            for: 1m
+            labels:
+              severity: critical
+              service: {{ $name }}
+            annotations:
+              summary: "{{ $name }} has no pods being scraped"
+              description: >-
+                Prometheus discovers no pod for {{ $name }}. Either the Deployment has no pods
+                (scaled to zero, or none can be scheduled) or none exposes a port named
+                `management`. Every other rule over this service is silent until this clears.
+          {{- end }}

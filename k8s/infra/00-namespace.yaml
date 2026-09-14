@@ -1,0 +1,16 @@
+# M10. The stateful half of the stack, in its own namespace and deliberately NOT in the Helm chart.
+#
+# The chart (k8s/helm/dpe) deploys the three services, the console and Prometheus, and takes its
+# database, broker and cache as ADDRESSES in values.yaml. In production those addresses point at a
+# managed Postgres, a managed or operator-run Kafka and a managed Redis, and the chart does not
+# change. Putting a Postgres StatefulSet inside the application chart would make `helm uninstall`
+# able to delete the ledger - the one operation in this repository that must never be one command.
+#
+# These are plain manifests, applied by k8s/up.sh, because on a laptop something still has to run
+# them. Single replicas, no backups, local-path volumes: a laptop's promise, same as Compose.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dpe-infra
+  labels:
+    app.kubernetes.io/part-of: dpe

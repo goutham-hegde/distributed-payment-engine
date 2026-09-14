@@ -1,0 +1,10 @@
+dpe {{ .Values.image.tag }} is installed in namespace {{ .Release.Namespace }}.
+
+  Console      http://localhost:8084     (NodePort {{ .Values.ui.nodePort }})
+  Prometheus   http://localhost:9090     (NodePort {{ .Values.prometheus.nodePort }}) - Status > Targets shows one target per pod
+
+Every kubectl call names the context - this machine's current context may be another cluster:
+
+  kubectl --context kind-dpe -n {{ .Release.Namespace }} get pods
+  ./scripts/verify-invariants.sh        with PG_EXEC set as k8s/README.md shows
+  ./k8s/verify-netpol.sh                proves the NetworkPolicies are enforced, not just stored

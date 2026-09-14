@@ -1,0 +1,68 @@
+{{- $ctx := dict "name" "ui" "root" . }}
+# The console: nginx serving the built SPA and proxying /api/orchestrator, /api/accounts,
+# /api/gateway and a read-only slice of /api/prom to the Services of the same names. nginx.conf is
+# unchanged from Compose, because the Service names are.
+#
+# nginx resolves those names ONCE, at start. That is safe here only because each is a ClusterIP
+# Service, whose address outlives every pod behind it; a headless Service would pin nginx to
+# whichever pod IPs existed when it started.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dpe.selector" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dpe.labels" $ctx | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: ui
+          image: {{ include "dpe.image" $ctx }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+          # httpGet dials the pod IP over IPv4, so the Compose healthcheck's localhost/::1 trap does
+          # not arise here.
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /index.html
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 96Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  type: NodePort
+  selector:
+    {{- include "dpe.selector" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: {{ .Values.ui.nodePort }}

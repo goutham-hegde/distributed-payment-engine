@@ -25,7 +25,18 @@
 set -uo pipefail
 
 PG_CONTAINER="${PG_CONTAINER:-dpe-postgres}"
-BASELINE_FILE="${BASELINE_FILE:-$(dirname "$0")/.i3-baseline}"
+# HOW to reach psql, as a command prefix. Compose by default; M10's cluster sets
+#   PG_EXEC="kubectl --context kind-dpe -n dpe-infra exec -i postgres-0 --"
+# Word-split on purpose, so it stays one variable. lib/stranded.sh reads the same one.
+#
+# The I3 baseline belongs to ONE database, so a stack reached through PG_EXEC gets its own file.
+# With a single file, the first check against the fresh cluster compared it with the Compose
+# stack's baseline and reported I3 violated by 3.47 billion - a number about a different ledger.
+stack_suffix=""
+[ -n "${PG_EXEC:-}" ] && stack_suffix=".$(printf '%s' "$PG_EXEC" | cksum | cut -d' ' -f1)"
+PG_EXEC="${PG_EXEC:-docker exec -i $PG_CONTAINER}"
+export PG_EXEC
+BASELINE_FILE="${BASELINE_FILE:-$(dirname "$0")/.i3-baseline${stack_suffix}}"
 WITH_STRANDED=1
 [ "${1:-}" = "--no-stranded" ] && WITH_STRANDED=0
 
@@ -35,8 +46,7 @@ failures=0
 # rather than printing a notice and returning success.
 q() {
     local db="$1" sql="$2"
-    docker exec -i "$PG_CONTAINER" \
-        psql -U postgres -d "$db" -tAq -v ON_ERROR_STOP=1 -c "$sql" 2>/dev/null | tr -d '[:space:]'
+    $PG_EXEC psql -U postgres -d "$db" -tAq -v ON_ERROR_STOP=1 -c "$sql" 2>/dev/null | tr -d '[:space:]'
 }
 
 table_exists() {
@@ -48,8 +58,8 @@ pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; failures=$((failures + 1)); }
 skip() { printf '  \033[90mSKIP\033[0m  %s\n' "$1"; }
 
-if ! docker exec "$PG_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
-    echo "error: postgres container '$PG_CONTAINER' is not accepting connections" >&2
+if ! $PG_EXEC pg_isready -U postgres >/dev/null 2>&1; then
+    echo "error: postgres is not accepting connections through: $PG_EXEC" >&2
     echo "       start the stack with: docker compose -f infra/docker-compose.yml up -d" >&2
     exit 2
 fi
@@ -79,7 +89,7 @@ if [ "${1:-}" = "baseline" ]; then
     exit 0
 fi
 
-echo "Verifying ledger invariants against '${PG_CONTAINER}'"
+echo "Verifying ledger invariants through: ${PG_EXEC}"
 
 # --------------------------------------------------------------------- I1
 

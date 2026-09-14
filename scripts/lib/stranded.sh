@@ -16,10 +16,11 @@
 #
 # All four assume QUIESCENCE, like I4. Mid-run, an ACTIVE hold is money correctly in flight.
 
-STRANDED_PG="${PG_CONTAINER:-dpe-postgres}"
+# PG_EXEC is the command prefix that reaches psql - see verify-invariants.sh.
+STRANDED_PG_EXEC="${PG_EXEC:-docker exec -i ${PG_CONTAINER:-dpe-postgres}}"
 
 _stranded_sql() {
-    docker exec -i "$STRANDED_PG" psql -U postgres -d "$1" -tAq -v ON_ERROR_STOP=1 -c "$2" \
+    $STRANDED_PG_EXEC psql -U postgres -d "$1" -tAq -v ON_ERROR_STOP=1 -c "$2" \
         | tr -d '\r' | sed '/^$/d'
 }
 

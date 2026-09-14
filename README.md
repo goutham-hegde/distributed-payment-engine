@@ -10,7 +10,8 @@ and a chaos suite and load test that judge the system by what is in its ledger r
 HTTP status codes it returned.
 
 > [!NOTE]
-> **Status: M0–M9 complete. M10 (Kubernetes + Helm) is an optional extra and not started.**
+> **Status: M0–M9 complete. M10 (Kubernetes + Helm, optional) is built and verified on a one-node
+> kind cluster ([ADR 0013](docs/adr/0013-kubernetes.md)).**
 > Every result below comes from a run recorded in [`progress.md`](progress.md), with the command
 > that produced it.
 
@@ -147,6 +148,32 @@ consumers per partition, a pipelined outbox relay, CLEARING sharded across eight
 now set by the simulated payment provider (three concurrent calls of ~75 ms each). Full method in
 [`loadtest/README.md`](loadtest/README.md).
 
+### Kubernetes: a rolling deploy under load
+
+The same k6 script, run as a Job inside a kind cluster against the Service, while every Deployment is
+restarted in turn - two orchestrator replicas, one each of the others. Judged the same way, from
+`saga_instances` and the invariants:
+
+| Disruption, under ~4.6 payments/s | Failed requests | Sagas completed | Settle p99 | I1–I5, S1–S4 |
+|---|---|---|---|---|
+| Rolling restart of all three services | **0 of 6,874** | 1,298 of 1,298 | 3.13 s | pass |
+| The same, without the 5 s `preStop` sleep | 4 of 6,834 | 1,317 of 1,317 | 3.12 s | pass |
+| SIGKILL of an orchestrator (a crash, not a stop) | 2 of 7,343 | 1,139 of 1,139 | **42.5 s** | pass |
+| SIGSTOP of an orchestrator, saga deadline 30 s | 9 of 6,279 | **1,053 of 1,066** | 31.0 s | pass |
+| The same, saga deadline 60 s | 0 of 6,138 | 1,050 of 1,050 | 39.0 s | pass |
+
+The second row is the race between SIGTERM and the pod leaving the Service's endpoints, measured:
+every error was `connection refused` at the instant an old pod was signalled. The third is a crashed
+consumer holding its partitions until its session times out (45 s). The fourth row is what that
+does when the surviving replica keeps sweeping: thirteen payments whose replies had already been
+sent, sitting unread on the frozen replica's partitions, were timed out and failed. Money stayed
+correct; customers were told the wrong thing. The saga deadline now outlasts an orphaned partition
+(60 s), and the same freeze fails nothing.
+[ADR 0013](docs/adr/0013-kubernetes.md) has what else Compose had been doing implicitly: the
+management port's network boundary (now a NetworkPolicy, proven by a test that must see a refusal),
+a signing key two replicas can share, pod-level scraping, and gauges that two replicas would have
+double-counted.
+
 ## Architecture
 
 | Service | API port | Database | Owns |
@@ -214,6 +241,7 @@ promise.
 | **A sharded CLEARING account**, each hold recording its shard | [ADR 0010](docs/adr/0010-sharded-clearing.md) |
 | **A test suite with no route to the running stack** | [ADR 0011](docs/adr/0011-tests-have-no-route-to-the-running-stack.md) |
 | **A JVM memory budget**, G1, and GC logs always on | [ADR 0012](docs/adr/0012-a-jvm-memory-budget.md) |
+| **Kubernetes + Helm**: probes that ignore dependencies, NetworkPolicies proven enforced, a rolling deploy that loses nothing | [ADR 0013](docs/adr/0013-kubernetes.md) |
 
 ### A note on "exactly-once"
 
@@ -310,6 +338,20 @@ docker compose -f infra/docker-compose.yml stop redpanda
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.kafka.yml up -d
 ```
 
+### On Kubernetes
+
+A Helm chart and a one-node kind cluster, built and loaded by one script. It cannot run beside the
+Compose stack (they publish the same host ports), so stop that first:
+
+```bash
+docker compose -f infra/docker-compose.yml stop
+./k8s/up.sh                      # needs kind, kubectl, helm, openssl
+./k8s/verify-netpol.sh           # every forbidden connection must be refused
+./k8s/rollout-under-load.sh      # restart every Deployment under load; DISRUPT=kill for a crash
+```
+
+Details in [`k8s/README.md`](k8s/README.md).
+
 ### Build and test without Compose
 
 ```bash
@@ -320,7 +362,8 @@ cd ui && npm ci && npm run dev             # the console's dev server on :8085
 
 Each service also listens on a management port (9091/9092/9093) carrying the actuator, which
 Compose deliberately does not publish — that network boundary is what lets Prometheus scrape
-without a credential. Reach it through a container:
+without a credential. (On Kubernetes, where every pod can reach every port, a NetworkPolicy has to
+draw it.) Reach it through a container:
 
 ```bash
 docker exec dpe-orchestrator wget -qO- http://localhost:9091/actuator/health
@@ -340,12 +383,13 @@ infra/                  Docker Compose, Prometheus rules, Grafana dashboards, Re
 chaos/                  the eight scenarios and their harness
 loadtest/               k6 script and runner
 scripts/                invariants, reconciliation, token helper
+k8s/                    kind cluster, Helm chart, stateful-tier manifests, rollout and policy tests
 docs/adr/               architecture decision records
 ```
 
 ## Documentation
 
-- [**Architecture decision records**](docs/adr/README.md) — twelve decisions, each with the options
+- [**Architecture decision records**](docs/adr/README.md) — thirteen decisions, each with the options
   rejected, the evidence, and when to revisit it.
 - [**`progress.md`**](progress.md) — the engineering log: every milestone, what broke and why, and
   the exact commands behind every number in this README.
@@ -356,7 +400,7 @@ docs/adr/               architecture decision records
 
 Java 21 · Spring Boot 4.1 · PostgreSQL 16 · Flyway · Kafka API (Redpanda by default, Apache Kafka
 supported) · Redis · Prometheus + Grafana · OpenTelemetry + Jaeger · Testcontainers · k6 · React ·
-Docker Compose
+Docker Compose · Kubernetes (kind) + Helm
 
 ## Progress
 
@@ -373,4 +417,4 @@ Docker Compose
 | M7 | Chaos suite — 8 scenarios | ✅ done |
 | M8 | Load test — 1,000 concurrent users | ✅ done |
 | M9 | Documentation, ADRs, README | ✅ done |
-| M10 | Kubernetes + Helm | ⬜ not started |
+| M10 | Kubernetes + Helm (optional) | 🔨 built and verified on kind |

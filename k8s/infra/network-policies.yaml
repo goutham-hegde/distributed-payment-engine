@@ -1,0 +1,37 @@
+# Who may open a connection to the stateful tier: the application namespace, on each server's one
+# port, and nobody else. Deny first, then allow - a rule nobody wrote for a new port is a refusal,
+# which is `anyRequest().denyAll()` from M5 at the network layer.
+#
+# An API server accepts a NetworkPolicy whether or not the cluster's network plugin enforces it.
+# On a plugin that does not, every object below is stored, listed and ignored. So these count as
+# working only once a connection has been REFUSED - k8s/verify-netpol.sh does that.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: dpe-infra
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-dpe
+  namespace: dpe-infra
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [postgres, redpanda, redis]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dpe
+      ports:
+        - port: 5432
+        - port: 9092
+        - port: 6379

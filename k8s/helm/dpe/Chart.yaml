@@ -1,0 +1,9 @@
+apiVersion: v2
+name: dpe
+description: >-
+  The distributed payment engine's three services, its console and a Prometheus that discovers
+  pods. Postgres, the Kafka-API broker and Redis are NOT in this chart - it takes their addresses
+  as values (see k8s/infra for the laptop versions).
+type: application
+version: 0.1.0
+appVersion: "m10"

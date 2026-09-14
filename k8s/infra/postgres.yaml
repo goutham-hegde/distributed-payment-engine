@@ -1,0 +1,118 @@
+# Postgres: the three databases, one instance - the same concession as infra/docker-compose.yml
+# (database-per-service, one server). The init script is NOT copied here: k8s/up.sh creates the
+# `postgres-init` ConfigMap from infra/postgres/init-databases.sh, so there is one definition of the
+# roles, the databases and the REVOKE CONNECT FROM PUBLIC that makes the boundary real.
+#
+# Like Compose, the script runs only when the data directory is empty - on the FIRST start of this
+# volume. Deleting the pod does not re-run it; deleting the PVC does.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-superuser
+  namespace: dpe-infra
+type: Opaque
+stringData:
+  # The laptop credential Compose also uses. Operator tooling (verify-invariants, reconcile) reaches
+  # the databases through `kubectl exec` as this role; no service ever receives it.
+  POSTGRES_PASSWORD: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: dpe-infra
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: dpe-infra
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: dpe
+    spec:
+      # Postgres does not call the Kubernetes API. A mounted token is a credential nothing uses.
+      automountServiceAccountToken: false
+      # Postgres checkpoints and exits cleanly on SIGTERM ("smart" shutdown waits for clients, the
+      # image sends "fast"). Give it longer than an application pod: a SIGKILL here is crash
+      # recovery on the next start.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_DB
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-superuser
+                  key: POSTGRES_PASSWORD
+            # A subdirectory of the mount, not the mount itself: initdb refuses a non-empty
+            # directory, and some volume types arrive with a lost+found in them.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          # The same question as Compose's pg_isready healthcheck: a server accepting TCP is not a
+          # server that can answer a query. Readiness gates the Service endpoint on it.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+          # Liveness is the process, and pg_isready is cheap and local, so it doubles as that. A
+          # generous threshold: restarting a database that is merely slow turns slowness into an
+          # outage plus crash recovery.
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

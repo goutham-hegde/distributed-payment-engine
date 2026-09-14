@@ -18,3 +18,4 @@ record says so rather than being rewritten to look as if it had been right the f
 | [0010](0010-sharded-clearing.md) | CLEARING is sharded, and each hold records its shard | M8 |
 | [0011](0011-tests-have-no-route-to-the-running-stack.md) | Tests have no route to the running stack | M8 |
 | [0012](0012-a-jvm-memory-budget.md) | A memory budget for the JVMs, not a heap cap; G1, and GC logs always on | M8 |
+| [0013](0013-kubernetes.md) | Kubernetes: putting back what Compose was doing for free | M10 |

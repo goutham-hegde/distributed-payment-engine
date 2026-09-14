@@ -1,0 +1,213 @@
+{{- include "dpe.checks" . -}}
+{{- $root := . -}}
+{{- $orch := index .Values.services "payment-orchestrator" -}}
+{{- range $name, $svc := .Values.services }}
+{{- $ctx := dict "name" $name "root" $root }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ $svc.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dpe.selector" $ctx | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Start the new pod, wait for it to be READY, then stop an old one. Never below the declared
+      # count - with one replica, maxUnavailable 1 would be a deploy that is an outage.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "dpe.labels" $ctx | nindent 8 }}
+    spec:
+      # These services never call the Kubernetes API. A mounted token would be a credential that
+      # nothing here uses and anything that compromised the pod could.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $root.Values.rollout.terminationGracePeriodSeconds }}
+      securityContext:
+        # The image's `USER app` is a NAME, and the kubelet cannot prove a name is not root:
+        # runAsNonRoot alone fails with "image has non-numeric user (app), cannot verify user is
+        # non-root". 100:101 is what `adduser -S` gave `app` in the runtime image (checked with
+        # `docker run --entrypoint id`).
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      # Harmless on one node, and the right shape on several: replicas of one service spread across
+      # nodes when they can be, so a node failure is not a service failure. ScheduleAnyway, because
+      # refusing to schedule a replica is worse than co-locating it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "dpe.selector" $ctx | nindent 14 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "dpe.image" $ctx }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+            # Named, because Prometheus's pod discovery keeps exactly the ports called this.
+            - name: management
+              containerPort: {{ $svc.managementPort }}
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: {{ $root.Values.jvm.toolOptions | quote }}
+            - name: SERVER_PORT
+              value: {{ $svc.port | quote }}
+            - name: MANAGEMENT_PORT
+              value: {{ $svc.managementPort | quote }}
+            - name: DB_URL
+              value: "jdbc:postgresql://{{ $root.Values.infra.postgresHost }}:{{ $root.Values.infra.postgresPort }}/{{ $svc.database }}"
+            - name: DB_USER
+              value: {{ $svc.dbUser | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dpe-db
+                  key: {{ $name }}
+            - name: SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE
+              value: {{ $svc.dbPoolSize | quote }}
+            - name: KAFKA_BOOTSTRAP
+              value: {{ $root.Values.infra.kafkaBootstrap | quote }}
+            {{- if $root.Values.tracing.otlpEndpoint }}
+            - name: OTLP_TRACES_ENDPOINT
+              value: {{ $root.Values.tracing.otlpEndpoint | quote }}
+            {{- else }}
+            - name: TRACING_SAMPLE_RATE
+              value: "0.0"
+            {{- end }}
+            {{- if $svc.usesRedis }}
+            - name: REDIS_HOST
+              value: {{ $root.Values.infra.redisHost | quote }}
+            - name: REDIS_PORT
+              value: {{ $root.Values.infra.redisPort | quote }}
+            {{- end }}
+            {{- if $svc.issuesTokens }}
+            {{- if $root.Values.auth.existingSecret }}
+            - name: DPE_AUTH_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.auth.existingSecret }}
+                  key: private-key
+            - name: DPE_AUTH_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.auth.existingSecret }}
+                  key: public-key
+            {{- end }}
+            {{- else }}
+            # The PUBLIC half, fetched from the orchestrator through its Service. With two
+            # orchestrators this is load-balanced - which is only safe because both hold the same
+            # configured key (auth.existingSecret).
+            - name: DPE_SECURITY_JWK_SET_URI
+              value: "http://payment-orchestrator:{{ $orch.port }}/.well-known/jwks.json"
+            {{- end }}
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            periodSeconds: {{ $root.Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ $root.Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            periodSeconds: {{ $root.Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: management
+            periodSeconds: {{ $root.Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.probes.readiness.failureThreshold }}
+          {{- if gt (int $root.Values.rollout.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              # busybox `sleep` from the alpine runtime image. See rollout.preStopSleepSeconds.
+              exec:
+                command: ["sleep", "{{ $root.Values.rollout.preStopSleepSeconds }}"]
+          {{- end }}
+          resources:
+            {{- toYaml $root.Values.jvm.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # The only writable path: the GC log (always on, ADR 0012), Tomcat's work directory and
+            # the JVM's perf data all live under /tmp. Read it with
+            #   kubectl --context kind-dpe -n dpe exec <pod> -- cat /tmp/gc.log
+            # On disk, not medium: Memory - a tmpfs would be charged to the 768Mi budget.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    {{- include "dpe.selector" $ctx | nindent 4 }}
+  # The API port only. The management port is deliberately not on the Service: Prometheus must
+  # scrape each pod by its own address (through a Service every scrape would land on a random
+  # replica and one series would alternate between two counters), and nothing else needs it.
+  ports:
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+{{- if gt (int $svc.replicas) 1 }}
+---
+# Only for a service with more than one replica. With one, minAvailable 1 would block every node
+# drain forever, and maxUnavailable 1 would permit exactly the outage a PDB exists to prevent.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dpe.selector" $ctx | nindent 6 }}
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dpe-db
+  labels:
+    app.kubernetes.io/part-of: dpe
+type: Opaque
+# The laptop passwords k8s/infra's init script (infra/postgres/init-databases.sh) creates the roles
+# with. One key per service; each pod is given only its own.
+stringData:
+  {{- range $name, $svc := .Values.services }}
+  {{ $name }}: {{ $svc.dbPassword | quote }}
+  {{- end }}

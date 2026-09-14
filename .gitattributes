@@ -9,3 +9,4 @@
 *.yaml      text eol=lf
 *.sql       text eol=lf
 Dockerfile  text eol=lf
+*.tpl       text eol=lf

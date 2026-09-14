@@ -33,10 +33,12 @@ build/
 .vscode/
 
 # Recorded by scripts/verify-invariants.sh at the start of a test run.
-scripts/.i3-baseline
+scripts/.i3-baseline*
 
 # Held by a running chaos scenario, so a second one refuses to start. See chaos/lib.sh.
 chaos/.lock/
 
 # One directory per load run: the k6 summary, its HTML report, container stats and the console log.
 loadtest/results/
+# M10: one directory per k8s/rollout-under-load.sh run - the same shape.
+k8s/results/

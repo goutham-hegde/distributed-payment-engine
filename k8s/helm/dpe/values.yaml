@@ -1,0 +1,165 @@
+# M10. Values for the dpe chart. Defaults are the kind cluster k8s/up.sh builds; every address in
+# `infra` is the one thing that changes for a real environment.
+
+image:
+  # Images are <repository>/<service>:<tag>. k8s/up.sh builds them, tags them with the git commit
+  # and loads them into the kind node - there is no registry.
+  repository: dpe
+  # REQUIRED. Never `latest`: for a `latest` tag Kubernetes defaults the pull policy to Always, and
+  # a kind node with no registry to pull from answers ErrImagePull for an image it already holds.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Where the stateful tier lives. Fully qualified, because the chart is installed in `dpe` and the
+# infrastructure is in `dpe-infra` - a short name would be looked up in the wrong namespace.
+infra:
+  postgresHost: postgres.dpe-infra.svc.cluster.local
+  postgresPort: 5432
+  # Postgres's max_connections, and what the chart reserves out of it. Every pool below, multiplied
+  # by its replica count PLUS the one surge pod a rolling update adds, must fit in what is left -
+  # the chart refuses to render otherwise (see _helpers.tpl, dpe.checkConnectionBudget). The
+  # reserve covers superuser_reserved_connections (3) and an operator's psql sessions.
+  postgresMaxConnections: 100
+  postgresReservedConnections: 13
+  # The broker's ADVERTISED address, i.e. the pod name through the headless Service.
+  kafkaBootstrap: redpanda-0.redpanda.dpe-infra.svc.cluster.local:9092
+  redisHost: redis.dpe-infra.svc.cluster.local
+  redisPort: 6379
+
+auth:
+  # The Secret holding the orchestrator's RSA signing key: `private-key` (base64 PKCS#8 DER) and
+  # `public-key` (base64 X.509 DER). Created OUTSIDE the chart by k8s/up.sh, and that is the point:
+  # Helm's genPrivateKey would mint a new key on every `helm upgrade`, so every deploy would rotate
+  # the key and invalidate every token in flight.
+  #
+  # Empty means the orchestrator generates a key at startup (the Compose behaviour). The chart then
+  # refuses more than one orchestrator replica: two generated keys means a token minted by one pod
+  # is a 401 at the other, by load-balancer luck.
+  existingSecret: dpe-signing-key
+
+tracing:
+  # OTLP/HTTP endpoint. Empty = no trace backend in this cluster (RAM), and the sample rate drops to
+  # 0 so nothing tries to export. Tracing must not be load-bearing either way (ADR 0006).
+  otlpEndpoint: ""
+
+# ADR 0012. A MEMORY BUDGET, NOT A HEAP CAP - the same flags as x-jvm-env in
+# infra/docker-compose.yml, which holds the table. The caps sum to ~748 MiB:
+#   heap 256 + metaspace 176 + code cache 144 + direct 32 + uncapped native ~140
+# so the container limit below is 768Mi, and the two must be changed together.
+jvm:
+  toolOptions: >-
+    -XX:+UseG1GC -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -Xms256m -Xmx256m -XX:+AlwaysPreTouch
+    -XX:MetaspaceSize=160m -XX:MaxMetaspaceSize=176m
+    -XX:ReservedCodeCacheSize=144m -XX:SweeperThreshold=60
+    -XX:MaxDirectMemorySize=32m
+    -Xlog:gc*,safepoint:file=/tmp/gc.log:time,uptime,level,tags:filecount=5,filesize=20m
+
+  resources:
+    requests:
+      # Request = limit for memory. -Xms = -Xmx with AlwaysPreTouch makes the whole heap resident
+      # during JVM start, so this process uses its budget from its first second. A lower request
+      # would let the scheduler place pods on a node that cannot hold them, and under node memory
+      # pressure the kubelet evicts pods using MORE than they requested first.
+      memory: 768Mi
+      cpu: 250m
+    limits:
+      memory: 768Mi
+      # NO cpu limit, deliberately. A limit is a CFS quota enforced per 100 ms period: a G1 pause
+      # that spends the quota is frozen until the next period, which reads in the GC log as
+      # Real >> User+Sys - the waiting signature ADR 0012 taught us to read as swap. And since JDK
+      # 19 the JVM sizes availableProcessors from the limit alone, which silently resizes every
+      # pool derived from it. The cost is Burstable QoS rather than Guaranteed, and that trade is
+      # the decision.
+
+rollout:
+  # 30 s is also Compose's stop_grace_period since S24 p3 (a stop with no trace backend measured up
+  # to ~6.6 s). The countdown INCLUDES preStop.
+  terminationGracePeriodSeconds: 30
+  # Endpoint removal and SIGTERM are sent at the same moment, and kube-proxy (and anything else
+  # watching endpoints) takes a moment to stop routing to the pod. Sleeping first keeps the pod
+  # answering until nobody is sending to it any more; only then does Spring's graceful shutdown
+  # begin. 0 disables it - which is how k8s/rollout-under-load.sh measures what it buys.
+  preStopSleepSeconds: 5
+
+probes:
+  # All three on the MANAGEMENT port - moving the actuator (M6) moved the probes with it, and a
+  # probe on the API port is a 404 that Kubernetes reports only as "probe failed".
+  #
+  # Startup: "don't judge me yet". Boot + Flyway + AlwaysPreTouch is 20-45 s on a quiet machine and
+  # longer with three JVMs starting on one node. Until it passes, liveness is not run at all.
+  startup:
+    periodSeconds: 5
+    failureThreshold: 36        # 3 minutes
+  # Liveness: "restart me". /actuator/health/liveness is the livenessState group ONLY - never the
+  # full /actuator/health, which includes the Redis and database indicators. Pointed there, a Redis
+  # outage would restart every orchestrator (Redis load-bearing through a probe), and a database
+  # blip would crash-loop every pod at once and bring them all back together when it returned.
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  # Readiness: "stop sending me traffic". The readinessState group - also not the dependencies. A
+  # pod whose database is down can do nothing useful, but neither can its siblings, and marking
+  # them ALL unready empties the Service: callers get connection refused instead of the 503 that
+  # says what is wrong. Nor may it include "holds Kafka partitions": with three partitions a second
+  # orchestrator holds none, and would never become ready.
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+# The three Spring Boot services. Names are the Service names, and they are the same as Compose's,
+# so the console's nginx.conf and every JWKS URI work unchanged.
+services:
+  payment-orchestrator:
+    # TWO: the scaling proof. What a second replica adds is HTTP capacity and relay capacity. It
+    # adds NO reply processing - every topic has 3 partitions and each replica already runs 3 reply
+    # consumers, so the second one's are assigned nothing - and it does not move the knee, which is
+    # the simulated PSP. Admission control is NOT divided by this number: it counts in-flight sagas
+    # from saga_instances, so every replica already enforces the same global limit.
+    replicas: 2
+    port: 8081
+    managementPort: 9091
+    database: payments_db
+    dbUser: payments
+    dbPassword: payments
+    # Passed to the service as SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE, so the number the
+    # connection budget checks is the number the pool uses. BulkheadConfig still checks it against
+    # permits + background threads at boot.
+    dbPoolSize: 12
+    issuesTokens: true
+    usesRedis: true
+  account-service:
+    replicas: 1
+    port: 8082
+    managementPort: 9092
+    database: accounts_db
+    dbUser: accounts
+    dbPassword: accounts
+    dbPoolSize: 10
+  payment-gateway:
+    # ONE, and it has to stay one: the simulation knobs (POST /admin/simulation) are held in the
+    # pod's memory, so through a Service they would configure whichever replica answered.
+    replicas: 1
+    port: 8083
+    managementPort: 9093
+    database: gateway_db
+    dbUser: gateway
+    dbPassword: gateway
+    dbPoolSize: 10
+    env:
+      GATEWAY_FAILURE_RATE: "0.0"
+      GATEWAY_LATENCY_MS: "50"
+
+ui:
+  # The console. NodePort 30084, which k8s/kind/cluster.yaml maps to localhost:8084.
+  nodePort: 30084
+
+prometheus:
+  image: prom/prometheus:v3.7.3
+  nodePort: 30090
+  retention: 24h
+  # REQUIRED: the contents of infra/prometheus/alerts.yml, passed with
+  #   --set-file prometheus.alertRules=infra/prometheus/alerts.yml
+  # Helm can only read files inside the chart directory, and a copy here would drift.
+  alertRules: ""

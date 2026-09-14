@@ -1,0 +1,39 @@
+# M10. A one-node kind cluster for the whole stack.
+#
+#   kind create cluster --config k8s/kind/cluster.yaml      (k8s/up.sh does this)
+#
+# ONE node, and that is a statement about what this cluster can prove: that the manifests are right
+# - probes, grace periods, policies, a rolling deploy that loses nothing - and NOT that the system is
+# highly available. Every replica here shares one kernel, one disk and one Docker VM.
+#
+# The name is `dpe`, so the kubectl context is `kind-dpe`. Every script in k8s/ passes
+# `--context kind-dpe` explicitly and never relies on the current context: on this machine the
+# current context is usually another project's kind cluster, and an unpinned `kubectl apply` would
+# land there without a word.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: dpe
+networking:
+  # PINNED, below Windows' dynamic range (49152-65535). Left to kind, the API server gets a random
+  # host port in that range, and Hyper-V/WinNAT reserves blocks of it each time WSL networking
+  # starts - different blocks on different days. The sibling project's cluster had 53067 chosen for
+  # it; after a Docker Desktop restart Windows reserved 53043-53142, and its node would not start:
+  #   bind: An attempt was made to access a socket in a way forbidden by its access permissions.
+  # See `netsh interface ipv4 show excludedportrange protocol=tcp`. Takes effect when the cluster is
+  # CREATED - an existing cluster keeps the port it was born with.
+  apiServerPort: 16443
+nodes:
+  - role: control-plane
+    # Host ports, the same numbers Compose uses, so the README's URLs work against either - which
+    # also means the two cannot run at once: kind publishes these through Docker, and Docker refuses
+    # a second container on a published port ("port is already allocated"), which is the loud
+    # failure we want. 127.0.0.1 only: nothing here should be reachable from the LAN.
+    extraPortMappings:
+      # The console (ui Service, NodePort 30084). It also proxies the three APIs under /api/*.
+      - containerPort: 30084
+        hostPort: 8084
+        listenAddress: 127.0.0.1
+      # Prometheus (NodePort 30090) - its Targets page is where pod discovery is visible.
+      - containerPort: 30090
+        hostPort: 9090
+        listenAddress: 127.0.0.1

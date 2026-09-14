@@ -1,0 +1,102 @@
+# M10. Putting back the network boundary Compose gave us for free.
+#
+# Since M6 the management port (9091-9093) answers /actuator/** with permitAll, and the argument
+# was that the port is unpublished: "that network boundary IS the scrape credential". Kubernetes
+# has no such boundary. Its network is flat - every pod can open a connection to every port of
+# every other pod - so without these objects the permitAll is open to anything that runs in the
+# cluster. Deny all ingress, then allow each path the architecture actually has:
+#
+#   console (ui)          -> the three API ports       the only browser-facing hop
+#   account-service,
+#   payment-gateway       -> orchestrator API port     JWKS, to verify tokens
+#   `dpe/api-client` pods -> the three API ports       k6 and the policy test (see below)
+#   prometheus            -> the three management ports
+#   anyone                -> ui:80, prometheus:9090    NodePorts, reached from the host
+#
+# Services talk to each other through Kafka, not HTTP, which is why this list is short - the
+# policy is a picture of the architecture, and a new arrow in it should be a design decision.
+#
+# Two limits, stated so nobody mistakes this for more than it is:
+#   * It is enforced by the network plugin, not the API server. On a plugin that does not
+#     implement NetworkPolicy these objects are accepted and do nothing. k8s/verify-netpol.sh proves
+#     a refusal; until it has passed on a cluster, assume this file is decoration.
+#   * A label is not an identity. Anything allowed to create pods in this namespace can label one
+#     `dpe/api-client`. That is acceptable only because the API ports still demand a signed token -
+#     this narrows who can knock; M5's rules still decide who gets in.
+#
+# Ingress only. Default-deny EGRESS (a compromised pod cannot reach another service's database) is
+# the next step and needs explicit DNS and API-server allowances; it is not done here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+{{- $orch := index .Values.services "payment-orchestrator" }}
+{{- range $name, $svc := .Values.services }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ui
+        - podSelector:
+            matchLabels:
+              dpe/api-client: "true"
+        {{- if eq $name "payment-orchestrator" }}
+        {{- range $other, $_ := $.Values.services }}
+        {{- if ne $other "payment-orchestrator" }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $other }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - port: {{ $svc.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-management
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: {{ $svc.managementPort }}
+{{- end }}
+---
+# NodePorts. `from` omitted = every source: traffic arriving through a NodePort is source-NATed to
+# the node's address, so no pod selector could match it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nodeports
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [ui, prometheus]
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 80
+        - port: 9090

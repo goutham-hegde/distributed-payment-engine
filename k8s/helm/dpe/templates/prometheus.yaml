@@ -1,0 +1,143 @@
+{{- $ctx := dict "name" "prometheus" "root" . }}
+# Prometheus, discovering PODS rather than scraping names.
+#
+# Compose scrapes `payment-orchestrator:9091`. Here that name would be a Service, which sends each
+# scrape to a random replica: one series would alternate between two pods' counters, rate() would
+# read every switch as a counter reset, and the graphs would be confident nonsense. So Prometheus
+# asks the API server for the pods and scrapes each at its own IP - which needs the RBAC below,
+# scoped to this namespace alone.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+---
+# A Role, not a ClusterRole: it may list pods here and nowhere else. The kubernetes_sd_config (in
+# prometheus-config.yaml) names the namespace for the same reason - left open, it would try to watch
+# the whole cluster and fail on permissions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-discovery
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-discovery
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-discovery
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  # Recreate: the TSDB is locked by one process, and a surge pod would share nothing anyway (the
+  # data is an emptyDir - 24 h on a laptop, lost with the pod, the same promise as Compose's).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "dpe.selector" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dpe.labels" $ctx | nindent 8 }}
+      annotations:
+        # Roll the pod when its rules or config change. Prometheus is not started with
+        # --web.enable-lifecycle (no reload endpoint, same as Compose), so a new file on disk would
+        # otherwise sit unread until something else restarted it.
+        checksum/config: {{ include (print $.Template.BasePath "/prometheus-config.yaml") . | sha256sum | trunc 16 }}
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: {{ .Values.prometheus.image }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.prometheus.retention }}
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 384Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # `prometheus`, the name the console's nginx.conf proxies /api/prom to.
+  name: prometheus
+  labels:
+    {{- include "dpe.labels" $ctx | nindent 4 }}
+spec:
+  type: NodePort
+  selector:
+    {{- include "dpe.selector" $ctx | nindent 4 }}
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      nodePort: {{ .Values.prometheus.nodePort }}
