@@ -232,8 +232,8 @@ groups:
             (9091/9092/9093), unpublished to the host by design, so this can also mean the
             management connector failed to bind while the API stayed up.
 
-      # Session 25. Redis is unreachable and requests are going straight to Postgres. By design
-      # nothing breaks - IdempotencyCache stops asking a failed Redis for a few seconds at a time,
+      # Session 26, for the bypass added in Session 25. Redis is unreachable and requests are
+      # going straight to Postgres. By design nothing breaks - IdempotencyCache stops asking a failed Redis for a few seconds at a time,
       # so payments stay correct and about as fast - which is exactly why this needs an alert: an
       # outage the system absorbs completely is an outage nobody notices. What is lost while it
       # lasts is the response cache and the anti-stampede lock, so a retry storm now lands on

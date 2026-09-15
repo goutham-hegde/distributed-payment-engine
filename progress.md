@@ -4974,3 +4974,110 @@ Nothing blocks a milestone. What is known and not done:
 5. From before M10: the unexplained exit 137 (Session 24), `SagaOrchestrator.start`'s `save()`
    merge, gateway partitions, batched offset commits, the relay poll interval, and the PSP call's
    place in the transaction.
+
+---
+
+## Session 26 — 2026-09-15
+
+### Goal
+
+An alert for the Redis bypass added in Session 25 part 3. The system now absorbs a Redis outage
+completely - payments stay correct and about as fast - so without an alert nobody would know one
+was happening, while the response cache and the anti-stampede lock are off.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| What the gauge reports | `dpe.idempotency.cache.bypassed` is 1 only inside an active cooldown | Only a request that reaches Redis can clear the bypass flag, so on an idle system after an outage the flag stays set indefinitely; a gauge reading it would keep an alert firing about an outage that may have ended hours ago. |
+| The rule | `max by (application) (sum_over_time(dpe_idempotency_cache_bypassed[10m:30s])) / 20 > 0.5`, `for: 1m`, warning | The fraction of a fixed 10 minute window spent bypassing: a steady outage fires ~5-6 minutes in, a blip never does, a flapping Redis still does, and the gauge's momentary 0 between a cooldown and the next probe does not reset it. Warning, because correctness never depended on Redis. |
+| Testing rules | `infra/prometheus/alerts.test.yml`, run by `promtool test rules` | A rule's behaviour pinned by written-out series instead of discovered during an incident. |
+
+### Built
+
+- `IdempotencyCache`: the gauge reads "inside a cooldown", not the raw flag; test
+  `theGaugeDrainsWhenIdle`.
+- `infra/prometheus/alerts.yml`: `IdempotencyCacheBypassed`.
+- `infra/prometheus/alerts.test.yml`: five cases - steady outage on one of two replicas, a
+  3-minute blip, a fresh pod meeting a 2-minute blip, flapping, recovery.
+- ADR 0002, rule 6: names the alert.
+
+### What broke
+
+1. **The first version of the rule fired in 60-120 seconds instead of ~6 minutes.** It used
+   `avg_over_time(x[10m])`, which averages only the samples present. On its first live run the
+   orchestrator had been restarted a few minutes earlier, the series was young, and "more than half"
+   arrived almost at once. Every Kubernetes rollout starts fresh series, so it would have paged on a
+   2-minute blip after any deploy. The promtool tests had passed, because every series in them had
+   full history. Fixed by dividing by the window's step count, and pinned by a fresh-pod test that
+   the first version fails.
+2. **The gauge as first written would have stuck at 1** on an idle system after an outage (see the
+   decision above). Caught before the rule was written, by asking what clears it.
+3. **The second live run had to wait for a later sitting.** It was attempted while the first run's samples were
+   still inside the 10-minute window (fraction 0.75 left over), which would have made it fire at
+   once and prove nothing. A rule over a window needs an empty window before it can be tested live:
+   check the expression reads 0 first.
+4. **The promtool run command in `alerts.test.yml`'s header had lost its line continuation** - the
+   `\` and newline were gone, leaving `#` in the middle of a copyable command. Harmless as a comment,
+   broken the first time someone pastes it.
+
+### Verified
+
+```
+promtool check rules alerts.yml                SUCCESS: 8 rules
+promtool test rules alerts.test.yml            SUCCESS (5 cases)
+  ablation: == 1 with for: 5m                  FAILED (misses flapping, mistimes the steady outage)
+  ablation: > 0                                FAILED (fires on the blip and early)
+  ablation: avg_over_time (the first version)  FAILED at the fresh-pod case, 11m30s and 12m30s
+IdempotencyCacheBypassTest                     6/6; with the raw flag as the gauge, theGaugeDrainsWhenIdle fails
+./mvnw -B -ntp -pl payment-orchestrator -am verify     133 tests, 0 failures, BUILD SUCCESS
+live, first rule version, Compose              Redis stopped, a payment every 0.5 s: 628 of 628 answered 202;
+                                               gauge 1 within 30 s; alert pending at 60 s, firing at 120 s (the
+                                               flaw above); one scrape read 0 mid-outage and the alert held;
+                                               20 s after traffic stopped, Redis still down, gauge 0
+```
+
+The fixed rule, live on Compose, later the same day. The orchestrator had been started ~5 minutes before
+the outage, so its series was young - the exact case that broke the first version. Beforehand: the
+window's expression read 0, promtool 8 rules + 5 cases SUCCESS, all nine checks held.
+
+```
+t+  1s  gauge=0  frac=0     inactive   Redis stopped, a payment every 0.5 s
+t+ 30s  gauge=1  frac=0.05  inactive
+t+210s  gauge=0  frac=0.35  inactive   a scrape between a cooldown and the next probe
+t+300s  gauge=1  frac=0.5   inactive
+t+330s  gauge=1  frac=0.55  inactive
+t+360s  gauge=1  frac=0.6   pending
+t+420s  gauge=1  frac=0.65  firing
+t+470s  gauge=0  frac=0.7   firing     traffic stopped 20 s earlier, Redis STILL down: gauge drained
+t+487s  gauge=0  frac=0.7   firing     Redis started, idle
++4m45s after traffic stopped            frac 0.5, inactive - resolved on its own
+
+payments                                      570 sent, 570 x 202, 570 sagas COMPLETED
+verify-invariants.sh                          I1, I2, I4, I5, S1-S4 hold; I3 higher by exactly
+                                              100,000,000 - the opening balance of the account the
+                                              check funded; re-baselined, then all hold
+IdempotencyCacheBypassTest                    6/6
+```
+
+Pending at 5.5-6 minutes and firing at 6.5-7, as predicted; the old rule fired at 120 s under the
+same conditions.
+
+### Committed
+
+`7a20079` alerts: IdempotencyCacheBypassed - an outage the system absorbs is one nobody sees  
+plus this log (which also corrects the session named in the rule's comment - it is Session 26's
+alert for Session 25's bypass).
+
+### Open / next
+
+M0-M10 are done and nothing is in progress. Known and not done, none of it blocking:
+
+1. Default-deny egress NetworkPolicies (ingress only today).
+2. The cooperative-sticky assignor: under the eager protocol a crashed member's rejoin revokes
+   every member's partitions, which stalled the whole group for ~23 s in Session 25 part 1.
+3. The consumer stall after a Redpanda broker restart: root cause not established, only ever
+   reproduced on Redpanda.
+4. From before M10: the unexplained exit 137 (Session 24), `SagaOrchestrator.start`'s `save()`
+   merge, gateway partitions, batched offset commits, the relay poll interval, and the PSP call's
+   place in the transaction.
