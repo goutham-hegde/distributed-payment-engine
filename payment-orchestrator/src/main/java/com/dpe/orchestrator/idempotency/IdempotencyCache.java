@@ -158,11 +158,25 @@ public class IdempotencyCache {
         this.unavailable = counter(registry, "unavailable");
         this.nanoClock = nanoClock;
         this.cooldownNanos = properties.failureCooldown().toNanos();
-        // Registered at zero from the start, and written back to zero on recovery: a gauge that
-        // only appears once something is wrong is a gap on the graph, not a line at 0.
-        Gauge.builder("dpe.idempotency.cache.bypassed", bypassing, b -> b.get() ? 1 : 0)
-                .description("1 while Redis is being bypassed after a failure, 0 otherwise")
+        // Registered at zero from the start: a gauge that only appears once something is wrong is
+        // a gap on the graph, not a line at 0. `this` is the object held, and it is a bean, so the
+        // weak reference Micrometer keeps to it cannot be collected out from under the gauge.
+        Gauge.builder("dpe.idempotency.cache.bypassed", this, IdempotencyCache::bypassedNow)
+                .description("1 while inside a Redis-failure cooldown, 0 otherwise")
                 .register(registry);
+    }
+
+    /**
+     * 1 only while a cooldown started by a real failure is running - not merely while the flag is
+     * set. Only a request that reaches Redis can clear the flag, so on an idle system after an
+     * outage it would stay set indefinitely, and an alert on it would report a Redis outage that
+     * may have ended hours ago: the drained-gauge trap. When a cooldown ends with nobody to probe,
+     * the true answer is "not bypassing" - the next request will ask Redis. Under traffic against
+     * a Redis that is still down, every probe re-arms the cooldown, so the gauge reads 1 except in
+     * the gap between a cooldown ending and the next request; the alert averages over that.
+     */
+    private double bypassedNow() {
+        return bypassing.get() && nanoClock.getAsLong() - retryAt.get() < 0 ? 1 : 0;
     }
 
     /**

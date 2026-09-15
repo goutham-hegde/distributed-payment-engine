@@ -231,3 +231,43 @@ groups:
             silent for that service - not passing, silent. Note the target is a MANAGEMENT port
             (9091/9092/9093), unpublished to the host by design, so this can also mean the
             management connector failed to bind while the API stayed up.
+
+      # Session 25. Redis is unreachable and requests are going straight to Postgres. By design
+      # nothing breaks - IdempotencyCache stops asking a failed Redis for a few seconds at a time,
+      # so payments stay correct and about as fast - which is exactly why this needs an alert: an
+      # outage the system absorbs completely is an outage nobody notices. What is lost while it
+      # lasts is the response cache and the anti-stampede lock, so a retry storm now lands on
+      # Postgres in full. Warning, not critical: correctness never depended on Redis.
+      #
+      # The fraction of the last 10 minutes each pod spent bypassing, above half - not `== 1` with
+      # a `for:`. Three reasons. A steady outage crosses one half 5 minutes in, which ignores a
+      # Redis restart and fails over. A Redis that answers one probe in three flaps the gauge
+      # between 0 and 1, and `for:` would reset on every 0 and never fire, while the average sees
+      # it. And under traffic the gauge reads 0 for the moment between a cooldown ending and the
+      # next request's probe, which a scrape can land on.
+      #
+      # The fraction of the WINDOW, not of the samples: 20 steps of 30 s, summed and divided by 20,
+      # so steps before a series existed count as not bypassing. The first version used
+      # avg_over_time, which averages only the samples present - and on its first live run, against
+      # an orchestrator restarted a few minutes earlier, it went pending 60 s into the outage and
+      # fired at 120 s. Every Kubernetes rollout starts fresh series, so it would have paged on a
+      # 2-minute blip after any deploy. The promtool tests had not caught it: every series in them
+      # had full history (alerts.test.yml now has the fresh-pod case).
+      #
+      # It says "requests are bypassing Redis", not "Redis is down": the gauge is set by requests
+      # that tried, so with no traffic there is nothing to bypass and it reads 0. And it drains:
+      # after a cooldown ends with nobody left to probe, it reads 0 rather than a stale 1.
+      # `max by (application)` fires if ANY replica is bypassing - one pod with a broken path to
+      # Redis is worth knowing about even if its siblings are fine.
+      - alert: IdempotencyCacheBypassed
+        expr: max by (application) (sum_over_time(dpe_idempotency_cache_bypassed[10m:30s])) / 20 > 0.5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.application }}: requests are bypassing Redis"
+          description: >-
+            For more than half of the last 10 minutes requests could not reach Redis and went
+            straight to Postgres. Payments are unaffected, but the idempotency response cache and
+            the anti-stampede lock are off, so retry storms reach the database in full. Check the
+            Redis container and the network path to it.

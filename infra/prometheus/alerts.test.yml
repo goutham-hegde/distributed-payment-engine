@@ -1,0 +1,114 @@
+# Unit tests for alerts.yml, run by promtool against series written out below - so a rule's
+# behaviour is pinned by a test instead of discovered during an incident. Not loaded by
+# Prometheus (prometheus.yml lists alerts.yml only). Run from the repo root:
+#
+#   MSYS_NO_PATHCONV=1 docker run --rm -v "$(cygpath -m "$PWD/infra/prometheus"):/r:ro" \
+#     --entrypoint promtool prom/prometheus:v3.7.3 test rules /r/alerts.test.yml
+#
+# (drop the cygpath and MSYS_NO_PATHCONV outside Git Bash on Windows.)
+#
+# promtool compares annotations as well as labels, so a firing expectation repeats the rule's
+# rendered text. Change a description and its test changes with it - the price of asserting that
+# the alert an operator reads is the one the rule produces.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 10s
+
+tests:
+  # ---------------------------------------------------------------------- IdempotencyCacheBypassed
+  # 30 s scrapes, so a 10 minute window holds 20 samples and "more than half" is 11 of them.
+
+  # A steady outage from t=5m, on one of two replicas. Crosses one half at 10m (11 of 20), fires at
+  # 11m after its minute of `for`. The healthy replica does not hide it: max by (application).
+  - interval: 30s
+    input_series:
+      - series: 'dpe_idempotency_cache_bypassed{application="payment-orchestrator",instance="o1"}'
+        values: '0x9 1x29'
+      - series: 'dpe_idempotency_cache_bypassed{application="payment-orchestrator",instance="o2"}'
+        values: '0x39'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+      - eval_time: 10m30s
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              application: payment-orchestrator
+            exp_annotations:
+              summary: "payment-orchestrator: requests are bypassing Redis"
+              description: "For more than half of the last 10 minutes requests could not reach Redis and went straight to Postgres. Payments are unaffected, but the idempotency response cache and the anti-stampede lock are off, so retry storms reach the database in full. Check the Redis container and the network path to it."
+
+  # A 3 minute blip - a Redis restart, a failover. At most 6 of 20 samples: never fires.
+  - interval: 30s
+    input_series:
+      - series: 'dpe_idempotency_cache_bypassed{application="payment-orchestrator",instance="o1"}'
+        values: '0x19 1x5 0x40'
+    alert_rule_test:
+      - eval_time: 13m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+
+  # A pod that started at t=10m (a rollout, a restart) meets a 2 minute blip right away. It has
+  # little history, and a rule that averaged only the samples present saw 4 of 4 bypassing and
+  # fired - the first live run did exactly that. Over the whole window it is 4 of 20: silent.
+  - interval: 30s
+    input_series:
+      - series: 'dpe_idempotency_cache_bypassed{application="payment-orchestrator",instance="o-new"}'
+        values: '_x19 1x3 0x20'
+    alert_rule_test:
+      - eval_time: 11m30s
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+      - eval_time: 12m30s
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []
+
+  # Flapping: Redis answering one probe in three. The gauge is never 1 for a whole minute, so
+  # "== 1 for 5m" would never fire; two thirds of the window is bypassing, and this does.
+  - interval: 30s
+    input_series:
+      - series: 'dpe_idempotency_cache_bypassed{application="payment-orchestrator",instance="o1"}'
+        values: '1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 '
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              application: payment-orchestrator
+            exp_annotations:
+              summary: "payment-orchestrator: requests are bypassing Redis"
+              description: "For more than half of the last 10 minutes requests could not reach Redis and went straight to Postgres. Payments are unaffected, but the idempotency response cache and the anti-stampede lock are off, so retry storms reach the database in full. Check the Redis container and the network path to it."
+
+  # Recovery at t=15m: still firing at 16m (17 of 20 samples), resolved by 21m (7 of 20). The
+  # average that ignores a blip also clears about five minutes late - the cost of that choice.
+  - interval: 30s
+    input_series:
+      - series: 'dpe_idempotency_cache_bypassed{application="payment-orchestrator",instance="o1"}'
+        values: '1x29 0x40'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              application: payment-orchestrator
+            exp_annotations:
+              summary: "payment-orchestrator: requests are bypassing Redis"
+              description: "For more than half of the last 10 minutes requests could not reach Redis and went straight to Postgres. Payments are unaffected, but the idempotency response cache and the anti-stampede lock are off, so retry storms reach the database in full. Check the Redis container and the network path to it."
+      - eval_time: 21m
+        alertname: IdempotencyCacheBypassed
+        exp_alerts: []

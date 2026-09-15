@@ -102,6 +102,21 @@ class IdempotencyCacheBypassTest {
     }
 
     @Test
+    @DisplayName("an idle system does not report a bypass that nobody has checked since")
+    void theGaugeDrainsWhenIdle() {
+        redis.up = false;
+        cache.lookup("c", "k");
+        assertThat(bypassed()).isEqualTo(1.0);
+
+        now.addAndGet(COOLDOWN.toNanos());
+        assertThat(bypassed())
+                .as("the cooldown ended and no request has probed: a stale 1 here would keep the "
+                        + "bypass alert firing about an outage that may be long over")
+                .isEqualTo(0.0);
+        assertThat(redis.calls).as("reading the gauge never asks Redis").hasValue(1);
+    }
+
+    @Test
     @DisplayName("a burst arriving as the cooldown ends sends one probe, not one per request")
     void oneProbeNotAHundred() {
         redis.up = false;

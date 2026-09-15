@@ -131,7 +131,9 @@ Rules the implementation holds to:
    failure switches the fast path off for `failure-cooldown` (5 s) and one caller probes after it;
    a miss, a held lock or an unparseable value are answers and never trip it. Measured with Redis
    stopped: one request pays 0.24 s, the rest 0.01–0.03 s, same as with Redis up; scenario 06 with
-   Redis off answers 100 of 100.
+   Redis off answers 100 of 100. Because the system now absorbs a Redis outage completely, nothing
+   would show one: `IdempotencyCacheBypassed` (a warning) fires when a pod has spent more than half
+   of the last 10 minutes bypassing.
 
 ## Consequences
 
