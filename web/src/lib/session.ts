@@ -109,3 +109,35 @@ export async function resetSession(sessionId: string): Promise<void> {
 export async function sweepOldSessions(): Promise<void> {
   await query("DELETE FROM sessions WHERE last_seen_at < now() - interval '24 hours'");
 }
+
+const SWEEP_EVERY_MS = 10 * 60 * 1000;
+declare global {
+  // eslint-disable-next-line no-var
+  var __dpeLastSweep: number | undefined;
+}
+
+/**
+ * The sweep, on the way past.
+ *
+ * It used to hang off the reset endpoint alone, which meant abandoned worlds were only collected
+ * when somebody happened to press Reset - so the one visitor who tidies up paid for everyone who
+ * did not, and a demo nobody resets never collects at all. Hanging it off the tick instead means
+ * any traffic at all keeps the database trimmed.
+ *
+ * Throttled per warm instance rather than run every tick: the page polls this several times a
+ * second while a payment is in flight, and a DELETE scanning the session table that often would
+ * cost more than the rows it reclaims. Several instances each sweeping on their own clock is
+ * harmless - the statement is idempotent and deletes nothing twice.
+ *
+ * Never awaited by a request, and never allowed to fail one. Housekeeping that can break a
+ * payment is not housekeeping.
+ */
+export function maybeSweepOldSessions(): void {
+  const now = Date.now();
+  if (global.__dpeLastSweep && now - global.__dpeLastSweep < SWEEP_EVERY_MS) return;
+  global.__dpeLastSweep = now;
+  sweepOldSessions().catch(() => {
+    // Let the next tick try again rather than waiting out the full interval.
+    global.__dpeLastSweep = undefined;
+  });
+}

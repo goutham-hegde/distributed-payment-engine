@@ -69,6 +69,42 @@ npm run dev
 The schema applies itself on first request; every statement is `IF NOT EXISTS`, so it is safe to
 repeat and needs no migration step.
 
+## Testing
+
+`test/engine.test.mjs` is the chaos suite in miniature, built the same way as `chaos/` in the Java
+system: it drives the real HTTP API against a real PostgreSQL, injects one fault per scenario,
+waits for the system to go quiet, and judges it by what is in the ledger rather than by the status
+codes it returned. There are no mocks and no stubbed database — every guarantee under test lives
+in a constraint, and a fake would only be a test of the fake.
+
+Plain JavaScript and `node:test`, so it needs no build step and no dependency.
+
+```bash
+npm run build && npm start        # one terminal, with DATABASE_URL set
+npm test                          # another
+BASE_URL=http://127.0.0.1:3999 npm test   # if the server is not on :3000
+```
+
+Twelve tests, about 70 seconds — most of it spent genuinely waiting for saga deadlines to expire.
+
+| | |
+|---|---|
+| A world opens balanced | Funding issues money against an issuance account, so I1 holds before anything happens |
+| Happy path | Settles; all nine checks pass |
+| Idempotency | The same key returns the original payment and writes no further ledger entries |
+| Card declined | The sender ends *exactly* whole |
+| Broker dies | Payments still accepted, nothing moves, the backlog drains on restore |
+| Every message twice | The recipient is paid once — 8 ledger entries, not 12 |
+| Insufficient funds | Terminal, with nothing to compensate and no entry written |
+| Provider never answers | Before the pivot, the deadline unwinds and the sender is made whole |
+| **Timeout after the charge, unwinding** | **I1–I5 green, S2 red**, and `/api/invariants` answers 409 |
+| **Timeout after the charge, finishing** | Completes; all nine pass |
+| Isolation | One visitor's faults cannot reach another's ledger |
+| Validation | Bad amounts and self-payment are refused before anything is written |
+
+The two pivot tests are the ones worth reading. The money is conserved inside our own books in
+*both* cases, which is precisely why I1–I5 cannot tell them apart and why S2 had to be written.
+
 ## Deploying
 
 Any host that runs Next.js and can reach a Postgres. On Vercel, set the project's **Root

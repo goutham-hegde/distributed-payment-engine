@@ -1,4 +1,4 @@
-import { currentSession } from "@/lib/session";
+import { currentSession, maybeSweepOldSessions } from "@/lib/session";
 import { tick } from "@/lib/engine";
 import { readState } from "@/lib/state";
 import { withSession } from "@/lib/respond";
@@ -15,6 +15,7 @@ export const runtime = "nodejs";
  */
 export async function POST() {
   const session = await currentSession();
+  maybeSweepOldSessions();
   const result = await tick(session.id);
   const state = await readState(session.id);
   return withSession({ ...state, tick: result }, session.id);
