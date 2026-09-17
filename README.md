@@ -9,10 +9,18 @@ Saga orchestration, a transactional outbox and inbox, idempotent consumers, a do
 and a chaos suite and load test that judge the system by what is in its ledger rather than by the
 HTTP status codes it returned.
 
-**[Run the system in your browser →](https://goutham-hegde.github.io/distributed-payment-engine/)**
-A project page with a simulation of the saga: pick a fault — a decline, a broker outage, a
-duplicated reply, a timeout after the gateway charge — and watch the messages, the ledger entries
-and the invariants as it recovers. No install; the simulation is client-side.
+**[Send a payment, then break it → goutham-payment-engine.vercel.app](https://goutham-payment-engine.vercel.app/)**
+
+A second implementation of this design, running: the same saga, the same double-entry ledger, the
+same outbox and inbox, against a real PostgreSQL database. Payments you send write real rows and
+the invariants on the page are SQL queries over them. Throw a fault switch — decline the card,
+kill the broker, deliver every message twice, lose the commit — and watch what the ledger says.
+
+The switch worth finding is **Lose the commit, once** together with **Unwind it**: the card is
+charged, the deadline unwinds the payment anyway, and I1–I5 all stay green while S2 goes red. That
+is the defect the chaos suite found, reproducible in about fifteen seconds. Source in
+[`web/`](web/); what is faithful to the Java system and what is not is set out in
+[`web/README.md`](web/README.md).
 
 > [!NOTE]
 > **Status: M0–M10 complete, including the optional M10: Kubernetes + Helm on a one-node kind
