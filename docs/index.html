@@ -1,0 +1,1436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Distributed Payment Engine</title>
+<meta name="description" content="A fault-tolerant money-transfer system across three Spring Boot microservices, with an interactive simulation of the saga, the ledger and the failures it survives.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%E2%9A%96%EF%B8%8F</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=Libre+Franklin:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  color-scheme: light;
+  --paper:#fbfbf9; --paper-2:#f2f4ef; --card:#ffffff;
+  --ink:#17211d; --ink-2:#4c5a54; --ink-3:#7d8a84;
+  --rule:#d9e0d6; --rule-2:#e9ede5; --greenbar:#eaf1e7;
+  --accent:#1a6b4f; --accent-soft:#e0efe7;
+  --debit:#a33a2f; --ok:#1a6b4f; --warn:#8a6410; --bad:#a33a2f;
+
+  /* The machine panel keeps the real console's palette (ui/src/styles.css), in both themes. */
+  --m-bg:#0f1116; --m-panel:#171a21; --m-panel-2:#1d212a; --m-line:#2a2f3a;
+  --m-text:#e6e8ee; --m-muted:#949bab; --m-dim:#6b7280;
+  --m-accent:#6ea8fe; --m-ok:#4ade80; --m-warn:#fbbf24; --m-bad:#f87171; --m-info:#a78bfa;
+
+  --serif:"Spectral",Georgia,"Times New Roman",serif;
+  --sans:"Libre Franklin","Helvetica Neue",Arial,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --paper:#11150f; --paper-2:#161b14; --card:#151a13;
+    --ink:#e6ece2; --ink-2:#a8b3a2; --ink-3:#7a8574;
+    --rule:#28301f; --rule-2:#1e2618; --greenbar:#171d14;
+    --accent:#6fc79c; --accent-soft:#15241c;
+    --debit:#e0897c; --ok:#6fc79c; --warn:#d6a745; --bad:#e0897c;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --paper:#11150f; --paper-2:#161b14; --card:#151a13;
+  --ink:#e6ece2; --ink-2:#a8b3a2; --ink-3:#7a8574;
+  --rule:#28301f; --rule-2:#1e2618; --greenbar:#171d14;
+  --accent:#6fc79c; --accent-soft:#15241c;
+  --debit:#e0897c; --ok:#6fc79c; --warn:#d6a745; --bad:#e0897c;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font:400 16px/1.62 var(--sans); -webkit-font-smoothing:antialiased;
+}
+img{max-width:100%}
+[hidden]{display:none!important}
+a{color:var(--accent); text-underline-offset:2px; text-decoration-thickness:1px}
+a:hover{text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:2px}
+
+.wrap{max-width:1140px; margin:0 auto; padding-inline:20px}
+.measure{max-width:68ch}
+.band{padding-block:clamp(40px,6vw,76px); border-top:1px solid var(--rule)}
+.band:first-of-type{border-top:0}
+
+h1,h2,h3{font-family:var(--serif); font-weight:600; text-wrap:balance; margin:0}
+h1{font-size:clamp(34px,6vw,54px); line-height:1.08; letter-spacing:-.015em}
+h2{font-size:clamp(25px,3.4vw,33px); line-height:1.2; margin-bottom:14px}
+h3{font-size:19px; line-height:1.3; margin-bottom:8px}
+p{margin:0 0 16px}
+.lede{font-size:clamp(17px,2vw,19.5px); line-height:1.6; color:var(--ink-2)}
+.eyebrow{
+  font:500 11.5px/1 var(--mono); letter-spacing:.14em; text-transform:uppercase;
+  color:var(--ink-3); margin-bottom:14px; display:block;
+}
+strong{font-weight:600; color:var(--ink)}
+code{font:400 .89em/1.4 var(--mono); background:var(--paper-2); padding:1px 5px; border-radius:3px; border:1px solid var(--rule-2)}
+
+/* ---------------------------------------------------------------- masthead */
+.masthead{padding-block:clamp(44px,7vw,84px) clamp(30px,4vw,44px)}
+.rule-under{border-bottom:2px solid var(--ink); padding-bottom:6px; margin-bottom:26px}
+.rule-under .kicker{
+  font:500 11.5px/1 var(--mono); letter-spacing:.16em; text-transform:uppercase; color:var(--ink-2);
+  display:flex; flex-wrap:wrap; gap:10px 18px; justify-content:space-between;
+}
+.claim{
+  font-family:var(--serif); font-size:clamp(19px,2.6vw,25px); line-height:1.38; font-weight:500;
+  margin:26px 0 0; padding-left:18px; border-left:3px solid var(--accent); max-width:30ch;
+}
+.claim em{font-style:italic; color:var(--accent)}
+
+.facts{
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(168px,1fr));
+  gap:0; margin-top:34px; border-top:1px solid var(--rule);
+}
+.fact{padding:16px 18px 14px 0; border-bottom:1px solid var(--rule)}
+.fact b{display:block; font:500 clamp(23px,3vw,29px)/1.1 var(--mono); letter-spacing:-.02em}
+.fact span{display:block; font-size:13px; line-height:1.4; color:var(--ink-2); margin-top:5px}
+
+.links{display:flex; flex-wrap:wrap; gap:10px; margin-top:28px}
+.btn{
+  display:inline-flex; align-items:center; gap:7px; font:500 14px/1 var(--sans);
+  padding:11px 16px; border-radius:5px; text-decoration:none; border:1px solid var(--ink);
+  background:var(--ink); color:var(--paper);
+}
+.btn:hover{opacity:.87}
+.btn.ghost{background:transparent; color:var(--ink); border-color:var(--rule)}
+.btn.ghost:hover{border-color:var(--ink); opacity:1}
+
+/* ------------------------------------------------------------ prose blocks */
+.failures{list-style:none; margin:22px 0 0; padding:0; border-top:1px solid var(--rule)}
+.failures li{
+  padding:13px 0; border-bottom:1px solid var(--rule);
+  display:grid; grid-template-columns:1fr auto; gap:6px 20px; align-items:baseline;
+}
+.failures .then{
+  font:500 13.5px/1.4 var(--mono); color:var(--debit); white-space:nowrap;
+}
+@media (max-width:560px){
+  .failures li{grid-template-columns:1fr}
+  .failures .then{white-space:normal}
+}
+
+/* --------------------------------------------------------------- the panel */
+.machine{
+  background:var(--m-bg); color:var(--m-text); border:1px solid var(--m-line);
+  border-radius:10px; overflow:hidden; margin-top:26px;
+  font-family:var(--sans);
+}
+.m-head{
+  display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:space-between;
+  padding:14px 16px; border-bottom:1px solid var(--m-line); background:var(--m-panel);
+}
+.m-title{font:500 11.5px/1 var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--m-muted)}
+.segs{display:flex; flex-wrap:wrap; gap:6px}
+.seg{
+  font:500 12.5px/1 var(--sans); padding:8px 11px; border-radius:5px; cursor:pointer;
+  background:var(--m-panel-2); color:var(--m-muted); border:1px solid var(--m-line);
+}
+.seg:hover{color:var(--m-text)}
+.seg[aria-pressed="true"]{background:var(--m-accent); border-color:var(--m-accent); color:#0f1116}
+.seg:disabled{opacity:.4; cursor:not-allowed}
+
+.m-controls{
+  display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center;
+  padding:12px 16px; border-bottom:1px solid var(--m-line); background:var(--m-panel);
+}
+.ctl{
+  font:500 13px/1 var(--sans); padding:9px 14px; border-radius:5px; cursor:pointer;
+  background:var(--m-panel-2); color:var(--m-text); border:1px solid var(--m-line);
+  display:inline-flex; align-items:center; gap:7px;
+}
+.ctl:hover{border-color:var(--m-muted)}
+.ctl.primary{background:var(--m-ok); border-color:var(--m-ok); color:#0b1410}
+.ctl.primary:hover{opacity:.88}
+.ctl:disabled{opacity:.38; cursor:not-allowed}
+.speed{display:flex; align-items:center; gap:8px; margin-left:auto}
+.speed span{font:500 11px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--m-dim)}
+
+/* services + wire */
+.stage{padding:18px 16px 4px}
+.svcs{display:grid; grid-template-columns:repeat(4,1fr); gap:8px}
+.svc{
+  background:var(--m-panel); border:1px solid var(--m-line); border-radius:7px;
+  padding:11px 10px; min-width:0; transition:border-color .2s, background .2s;
+}
+.svc.lit{border-color:var(--m-accent); background:var(--m-panel-2)}
+.svc.dead{opacity:.42; border-style:dashed}
+.svc-n{
+  font:500 10.5px/1.2 var(--mono); letter-spacing:.08em; text-transform:uppercase;
+  color:var(--m-muted); margin-bottom:7px; overflow-wrap:anywhere;
+}
+.svc-s{font:400 12px/1.5 var(--mono); color:var(--m-dim); overflow-wrap:anywhere}
+.svc-s b{display:block; font-weight:500; color:var(--m-text)}
+.svc-s .pill{
+  display:inline-block; padding:1px 6px; border-radius:20px; font-size:10.5px;
+  border:1px solid currentColor; margin-top:3px;
+}
+.long{display:inline}
+.short{display:none}
+@media (max-width:640px){
+  .long{display:none} .short{display:inline}
+  .svc{padding:9px 7px}
+  .svc-s{font-size:11px}
+  .chip{font-size:10px; padding:5px 7px}
+  .brokerbar{font-size:10px}
+}
+
+.wire{position:relative; height:74px; margin-top:2px}
+.lifelines{position:absolute; inset:0; display:grid; grid-template-columns:repeat(4,1fr)}
+.lifelines i{display:block; width:1px; margin:0 auto; height:100%; background:var(--m-line)}
+.brokerbar{
+  position:absolute; left:0; right:0; top:4px; text-align:center;
+  font:500 11px/1.4 var(--mono); color:var(--m-bad);
+  border-top:1px dashed var(--m-bad); border-bottom:1px dashed var(--m-bad);
+  padding:4px 8px; background:rgba(248,113,113,.07);
+}
+.chip{
+  position:absolute; top:22px; transform:translateX(-50%);
+  font:500 11.5px/1 var(--mono); padding:6px 9px; border-radius:4px; white-space:nowrap;
+  background:var(--m-panel-2); border:1px solid var(--m-accent); color:var(--m-accent);
+  opacity:0; pointer-events:none; max-width:92%; overflow:hidden; text-overflow:ellipsis;
+}
+.chip.reply{border-color:var(--m-ok); color:var(--m-ok)}
+.chip.lost{border-color:var(--m-bad); color:var(--m-bad); text-decoration:line-through}
+.chip.dropped{border-color:var(--m-warn); color:var(--m-warn)}
+.chip.show{opacity:1}
+.moving{transition:left var(--fly,900ms) cubic-bezier(.45,.05,.3,1), opacity .22s linear}
+
+.narrate{
+  margin:6px 16px 16px; padding:14px 16px; border-radius:7px;
+  background:var(--m-panel); border:1px solid var(--m-line); border-left:3px solid var(--m-accent);
+  min-height:96px;
+}
+.narrate .step-n{font:500 10.5px/1 var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--m-dim)}
+.narrate p{margin:8px 0 0; font-size:14.5px; line-height:1.58; color:var(--m-text)}
+.narrate .note{
+  margin:10px 0 0; padding-top:9px; border-top:1px dashed var(--m-line);
+  font-size:13px; line-height:1.55; color:var(--m-warn);
+}
+.narrate .note b{color:var(--m-warn)}
+
+.readouts{
+  display:grid; grid-template-columns:minmax(0,1.45fr) minmax(0,1fr); gap:1px;
+  background:var(--m-line); border-top:1px solid var(--m-line);
+}
+@media (max-width:760px){ .readouts{grid-template-columns:1fr} }
+.pane{background:var(--m-bg); padding:14px 16px; min-width:0}
+.pane h4{
+  margin:0 0 10px; font:500 10.5px/1 var(--mono); letter-spacing:.12em;
+  text-transform:uppercase; color:var(--m-muted);
+  display:flex; justify-content:space-between; align-items:baseline; gap:10px;
+}
+.pane h4 em{font-style:normal; color:var(--m-dim); letter-spacing:0; text-transform:none; font-size:11px}
+
+.ledger-scroll{max-height:216px; overflow:auto; border:1px solid var(--m-line); border-radius:5px}
+table.led{width:100%; border-collapse:collapse; font:400 12px/1 var(--mono)}
+table.led th{
+  position:sticky; top:0; background:var(--m-panel); color:var(--m-dim); text-align:left;
+  font-weight:500; padding:7px 9px; border-bottom:1px solid var(--m-line); font-size:10.5px;
+  letter-spacing:.06em; text-transform:uppercase; z-index:1;
+}
+table.led td{padding:6px 9px; border-bottom:1px solid var(--m-line); color:var(--m-text); white-space:nowrap}
+table.led tr:last-child td{border-bottom:0}
+table.led tr.fresh td{background:rgba(110,168,254,.12)}
+table.led .num{text-align:right; font-variant-numeric:tabular-nums}
+table.led .dr{color:var(--m-bad)}
+table.led .cr{color:var(--m-ok)}
+table.led .muted{color:var(--m-dim)}
+.sum{
+  display:flex; justify-content:space-between; align-items:baseline; gap:10px;
+  margin-top:9px; padding-top:9px; border-top:1px solid var(--m-line);
+  font:500 12.5px/1 var(--mono); color:var(--m-muted);
+}
+.sum b{color:var(--m-ok); font-variant-numeric:tabular-nums}
+
+.bals{list-style:none; margin:0 0 14px; padding:0; font:400 12.5px/1 var(--mono)}
+.bals li{
+  display:flex; justify-content:space-between; gap:10px; align-items:baseline;
+  padding:7px 0; border-bottom:1px solid var(--m-line);
+}
+.bals li:last-child{border-bottom:0}
+.bals .who{color:var(--m-muted); overflow-wrap:anywhere}
+.bals .amt{font-weight:500; font-variant-numeric:tabular-nums; white-space:nowrap}
+.bals .amt.moved{color:var(--m-accent)}
+.bals li.sys .who{color:var(--m-dim)}
+
+.inv-grid{display:flex; flex-wrap:wrap; gap:5px}
+.inv{
+  font:500 11px/1 var(--mono); padding:5px 7px; border-radius:4px;
+  border:1px solid var(--m-line); background:var(--m-panel); color:var(--m-dim);
+  cursor:help; white-space:nowrap;
+}
+.inv.pass{color:var(--m-ok); border-color:rgba(74,222,128,.42)}
+.inv.fail{color:var(--m-bad); border-color:var(--m-bad); background:rgba(248,113,113,.12)}
+.inv.wait{color:var(--m-dim)}
+.inv-note{margin:9px 0 0; font-size:11.5px; line-height:1.5; color:var(--m-dim)}
+
+.log{list-style:none; margin:0; padding:0; font:400 11.5px/1 var(--mono); max-height:120px; overflow:auto}
+.log li{padding:5px 0; border-bottom:1px solid var(--m-line); color:var(--m-muted); display:flex; gap:8px}
+.log li:last-child{border-bottom:0}
+.log .ar{color:var(--m-dim); white-space:nowrap}
+.log .nm{color:var(--m-text); overflow-wrap:anywhere}
+.log li.drop .nm{color:var(--m-warn); text-decoration:line-through}
+.log li.lost .nm{color:var(--m-bad); text-decoration:line-through}
+
+.legend{
+  display:flex; flex-wrap:wrap; gap:8px 20px; padding:12px 16px;
+  border-top:1px solid var(--m-line); background:var(--m-panel);
+  font:400 12px/1.5 var(--mono); color:var(--m-dim);
+}
+.legend b{color:var(--m-muted); font-weight:500}
+
+.variant{
+  display:flex; flex-wrap:wrap; align-items:center; gap:10px;
+  padding:11px 16px; border-bottom:1px solid var(--m-line);
+  background:rgba(251,191,36,.07); font-size:13px; color:var(--m-warn);
+}
+.variant .lbl{font:500 11px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase}
+
+/* ------------------------------------------------------------ data tables */
+.tbl-scroll{overflow-x:auto; margin-top:20px; border:1px solid var(--rule); border-radius:7px}
+table.data{width:100%; border-collapse:collapse; font-size:14px; background:var(--card)}
+table.data th{
+  text-align:left; font:500 11px/1.3 var(--mono); letter-spacing:.09em; text-transform:uppercase;
+  color:var(--ink-2); padding:11px 13px; border-bottom:1px solid var(--rule); white-space:nowrap;
+  background:var(--paper-2);
+}
+table.data td{padding:11px 13px; border-bottom:1px solid var(--rule-2); vertical-align:top}
+table.data tbody tr:nth-child(even){background:var(--greenbar)}
+table.data tr:last-child td{border-bottom:0}
+table.data .n{font-family:var(--mono); font-variant-numeric:tabular-nums; white-space:nowrap}
+table.data .held{color:var(--ok); font-weight:500}
+table.data .miss{color:var(--debit); font-weight:500}
+.tbl-note{font-size:13.5px; color:var(--ink-2); margin-top:12px}
+
+/* findings */
+.finds{list-style:none; margin:24px 0 0; padding:0; counter-reset:f}
+.finds li{
+  padding:18px 0 18px 46px; border-bottom:1px solid var(--rule); position:relative; counter-increment:f;
+}
+.finds li:first-child{border-top:1px solid var(--rule)}
+.finds li::before{
+  content:counter(f,decimal-leading-zero); position:absolute; left:0; top:19px;
+  font:500 12px/1 var(--mono); color:var(--debit); letter-spacing:.04em;
+}
+.finds h3{margin-bottom:6px}
+.finds p{margin:0; color:var(--ink-2); font-size:15px}
+.finds .fix{display:block; margin-top:8px; padding-left:13px; border-left:2px solid var(--accent); color:var(--ink)}
+
+/* flow diagram */
+.flow{margin-top:24px; border:1px solid var(--rule); border-radius:7px; overflow-x:auto; background:var(--card)}
+.flow-in{min-width:640px; padding:20px}
+.frow{display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:14px}
+.fbox{border:1px solid var(--rule); border-radius:6px; padding:12px 13px; background:var(--paper-2)}
+.fbox b{display:block; font:500 12.5px/1.3 var(--mono); color:var(--accent); margin-bottom:5px}
+.fbox span{display:block; font-size:12.5px; line-height:1.5; color:var(--ink-2)}
+.fseq{list-style:none; margin:0; padding:0; font:400 13px/1 var(--mono); counter-reset:s}
+.fseq li{
+  padding:9px 0 9px 24px; border-bottom:1px dashed var(--rule); position:relative;
+  display:flex; flex-wrap:wrap; gap:4px 12px; align-items:baseline;
+}
+.fseq li:last-child{border-bottom:0}
+.fseq li::before{content:"→"; position:absolute; left:0; color:var(--ink-3)}
+.fseq .m{color:var(--ink); font-weight:500}
+.fseq .d{color:var(--ink-2); font-family:var(--sans); font-size:13px}
+.fseq li.pivot{background:var(--accent-soft); margin-inline:-8px; padding-inline:8px 8px; border-radius:4px}
+.fseq li.pivot::before{left:8px}
+
+/* misc */
+.two{display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:30px 40px; margin-top:24px}
+.stack-list{font-family:var(--mono); font-size:13.5px; line-height:1.9; color:var(--ink-2)}
+.caveat{
+  margin-top:24px; padding:18px 20px; background:var(--paper-2);
+  border:1px solid var(--rule); border-left:3px solid var(--warn); border-radius:6px;
+}
+.caveat h3{margin-bottom:8px}
+.caveat p{margin-bottom:0; font-size:15px; color:var(--ink-2)}
+footer{border-top:1px solid var(--rule); padding-block:34px 46px; color:var(--ink-3); font-size:13.5px}
+footer a{color:var(--ink-2)}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation-duration:.001ms!important; animation-iteration-count:1!important}
+  .moving{transition-duration:.001ms!important}
+  .svc{transition:none}
+}
+</style>
+</head>
+<body>
+
+<header class="wrap masthead">
+  <div class="rule-under">
+    <div class="kicker">
+      <span>Distributed Systems &middot; Portfolio Project</span>
+      <span>Java 21 &middot; Spring Boot 4.1 &middot; Kafka &middot; PostgreSQL</span>
+    </div>
+  </div>
+
+  <h1>Distributed<br>Payment Engine</h1>
+
+  <p class="claim">Money is never created and never destroyed. <em>Only moved.</em></p>
+
+  <div class="measure" style="margin-top:28px">
+    <p class="lede">
+      A money-transfer system split across three independently-failing services, built to hold that
+      one guarantee under failure &mdash; and then broken on purpose, eight different ways, to find
+      out where it didn&rsquo;t.
+    </p>
+  </div>
+
+  <div class="facts">
+    <div class="fact"><b>17,974</b><span>of 17,974 accepted payments settled, at twice the system&rsquo;s rated capacity</span></div>
+    <div class="fact"><b>8 / 8</b><span>injected faults survived with the ledger still balanced</span></div>
+    <div class="fact"><b>5</b><span>real defects the chaos suite found in code whose tests were all green</span></div>
+    <div class="fact"><b>0</b><span>requests failed during a rolling deploy of every service under load</span></div>
+  </div>
+
+  <div class="links">
+    <a class="btn" href="https://github.com/goutham-hegde/distributed-payment-engine">View the source</a>
+    <a class="btn ghost" href="#simulation">Run the simulation</a>
+  </div>
+</header>
+
+<!-- ------------------------------------------------------------- problem -->
+<section class="wrap band">
+  <div class="measure">
+    <span class="eyebrow">The problem</span>
+    <h2>In one database this is trivial. Across three services it is not.</h2>
+    <p>
+      Alice has &#8377;1,000. Bob has &#8377;500. Alice sends Bob &#8377;300. Inside a single
+      database that is one transaction and there is nothing to discuss. Split the work across
+      three services that can each fail on their own, and every one of these becomes possible:
+    </p>
+  </div>
+
+  <ul class="failures measure">
+    <li><span>The account service crashes after debiting Alice, before crediting Bob</span><span class="then">&#8377;300 vanishes</span></li>
+    <li><span>The network drops the message that credits Bob</span><span class="then">&#8377;300 vanishes</span></li>
+    <li><span>The network delays it, the client retries, and it lands twice</span><span class="then">Bob gets &#8377;600</span></li>
+    <li><span>Two transfers read Alice&rsquo;s balance at the same moment</span><span class="then">Alice goes negative</span></li>
+    <li><span>The card processor times out mid-charge</span><span class="then">nobody knows the outcome</span></li>
+  </ul>
+
+  <div class="measure" style="margin-top:26px">
+    <p>
+      This project implements the standard industrial answer to each &mdash; saga orchestration, a
+      transactional outbox and inbox, idempotent consumers, a double-entry ledger &mdash; and then
+      attacks it to find out which answers were incomplete. Five of them were.
+    </p>
+  </div>
+</section>
+
+<!-- ---------------------------------------------------------- simulation -->
+<section class="wrap band" id="simulation">
+  <div class="measure">
+    <span class="eyebrow">Watch it work</span>
+    <h2>The whole system, running, in one panel</h2>
+    <p>
+      Below is a faithful simulation of the real thing: the same four participants, the same
+      messages between them, the same ledger entries written in the same order. Pick a scenario,
+      press <strong>Run</strong>, and read the caption at each step &mdash; or press
+      <strong>Step</strong> and move through it yourself.
+    </p>
+  </div>
+
+  <div class="machine">
+    <div class="m-head">
+      <span class="m-title">Scenario</span>
+      <div class="segs" id="scenarios" role="group" aria-label="Choose a scenario"></div>
+    </div>
+
+    <div class="variant" id="variantBar" hidden>
+      <span class="lbl">Recovery</span>
+      <div class="segs" id="variantSegs" role="group" aria-label="Choose a recovery strategy"></div>
+    </div>
+
+    <div class="m-controls">
+      <button class="ctl primary" id="btnRun" type="button">&#9654;&nbsp; Run</button>
+      <button class="ctl" id="btnStep" type="button">Step</button>
+      <button class="ctl" id="btnReset" type="button">Reset</button>
+      <div class="speed">
+        <span>Speed</span>
+        <div class="segs" id="speedSegs" role="group" aria-label="Playback speed"></div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="svcs" id="svcs"></div>
+      <div class="wire" id="wire">
+        <div class="lifelines"><i></i><i></i><i></i><i></i></div>
+        <div class="brokerbar" id="brokerBar" hidden>Message broker down &mdash; commands wait in the outbox</div>
+        <div class="chip" id="chip"></div>
+      </div>
+    </div>
+
+    <div class="narrate">
+      <span class="step-n" id="stepN">Ready</span>
+      <p id="say">Alice has &#8377;1,000 and wants to send Bob &#8377;300. The ledger below already
+        holds the two entries that funded her account &mdash; every rupee in this system entered it
+        as a balanced pair, which is why the column adds to zero before anything has happened.</p>
+      <p class="note" id="note" hidden></p>
+    </div>
+
+    <div class="readouts">
+      <div class="pane">
+        <h4>Ledger &mdash; append-only <em id="ledCount">2 entries</em></h4>
+        <div class="ledger-scroll">
+          <table class="led">
+            <thead><tr><th>Transfer</th><th>Account</th><th>Type</th><th class="num">Paise</th></tr></thead>
+            <tbody id="ledBody"></tbody>
+          </table>
+        </div>
+        <div class="sum"><span>Sum of every entry &mdash; invariant I1</span><b id="ledSum">0</b></div>
+      </div>
+
+      <div class="pane">
+        <h4>Balances</h4>
+        <ul class="bals" id="bals"></ul>
+        <h4>Invariants</h4>
+        <div class="inv-grid" id="invs"></div>
+        <p class="inv-note" id="invNote">I4 and S1 are only meaningful once the system is at rest,
+          so they read &ldquo;&mdash;&rdquo; while a payment is still in flight.</p>
+        <h4 style="margin-top:16px">Messages</h4>
+        <ul class="log" id="log"></ul>
+      </div>
+    </div>
+
+    <div class="legend">
+      <span><b>CLIENT</b> &mdash; Alice&rsquo;s app</span>
+      <span><b>ORCHESTRATOR</b> &mdash; the API and the saga</span>
+      <span><b>ACCOUNT&#8209;SERVICE</b> &mdash; the money</span>
+      <span><b>GATEWAY</b> &mdash; the card processor</span>
+    </div>
+  </div>
+
+  <p class="tbl-note measure">
+    A debit is stored as a negative number and a credit as a positive one, so &ldquo;no money was
+    created&rdquo; is a plain <code>SUM()</code> over one column rather than a rule somebody has to
+    remember. The real system checks it after every chaos scenario and every load run.
+  </p>
+</section>
+
+<!-- ------------------------------------------------------------ proof -->
+<section class="wrap band">
+  <div class="measure">
+    <span class="eyebrow">How correctness is proven</span>
+    <h2>Not by HTTP 200s</h2>
+    <p>
+      A service can answer every request successfully and still have lost your money. So the system
+      is judged by what is in its ledger. Five invariants are asserted after every fault injection
+      and every load run:
+    </p>
+  </div>
+
+  <div class="tbl-scroll">
+    <table class="data">
+      <thead><tr><th>&nbsp;</th><th>Invariant</th><th>In plain terms</th></tr></thead>
+      <tbody>
+        <tr><td class="n">I1</td><td class="n">SUM(ledger_entries) = 0</td><td>No money was created or destroyed anywhere in the system.</td></tr>
+        <tr><td class="n">I2</td><td class="n">balance = SUM(its entries)</td><td>Every stored balance still agrees with the entries behind it.</td></tr>
+        <tr><td class="n">I3</td><td class="n">balances + holds constant</td><td>The total is the same at the end of a run as at the start.</td></tr>
+        <tr><td class="n">I4</td><td class="n">no saga left non-terminal</td><td>Nothing is stuck half-done once the system goes quiet.</td></tr>
+        <tr><td class="n">I5</td><td class="n">no customer balance &lt; 0</td><td>Nobody was overdrawn, however concurrent the traffic was.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="measure" style="margin-top:30px">
+    <h3>The five invariants turned out not to be enough</h3>
+    <p>
+      The chaos suite&rsquo;s first run found five saga defects. Only one of them tripped any of
+      I1&ndash;I5. The rest passed all five while money sat stranded mid-flight, or while the card
+      network held a charge for a payment that had been refunded. Money can be perfectly conserved
+      inside your own books and still be wrong about the outside world.
+    </p>
+    <p>Four more checks now run alongside them, each joining two services&rsquo; databases:</p>
+  </div>
+
+  <div class="tbl-scroll">
+    <table class="data">
+      <thead><tr><th>&nbsp;</th><th>Check</th><th>What it catches</th></tr></thead>
+      <tbody>
+        <tr><td class="n">S1</td><td>No active hold once the system is at rest</td><td>Money parked mid-flight with nothing left alive to move it &mdash; which I3 counts as conserved.</td></tr>
+        <tr><td class="n">S2</td><td>Every approved charge belongs to a completed transfer</td><td>A customer refunded in our ledger while the card network kept the charge.</td></tr>
+        <tr><td class="n">S3</td><td>Every completed transfer has an approved charge</td><td>Money moved without the payment provider ever agreeing to it.</td></tr>
+        <tr><td class="n">S4</td><td>No pending transfer under a finished saga</td><td>A customer told &ldquo;processing&rdquo; about something that finished long ago.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ----------------------------------------------------------- findings -->
+<section class="wrap band">
+  <div class="measure">
+    <span class="eyebrow">What breaking it found</span>
+    <h2>Five defects, in code whose tests were all green</h2>
+    <p>
+      Each scenario states a hypothesis, injects one fault into the running stack &mdash; a kill
+      signal, a frozen container, a network cut aimed at an open transaction, a processor that
+      declines or answers twice &mdash; waits for the system to go quiet, then asserts both the
+      invariants and the outcome the design promised.
+    </p>
+  </div>
+
+  <ol class="finds measure">
+    <li>
+      <h3>A refund that paid the customer out of our own books</h3>
+      <p>
+        A timeout <em>after</em> the card was charged recovered the same way as a timeout before it:
+        by unwinding. The customer got their money back and the card network kept the charge.
+        Every one of I1&ndash;I5 stayed green throughout.
+        <span class="fix">The charge is now the saga&rsquo;s pivot. Before it, recovery runs
+        backward; after it, only forward &mdash; the system retries the step it already committed
+        to rather than unwinding something the outside world has already done.</span>
+      </p>
+    </li>
+    <li>
+      <h3>A participant that answered with silence</h3>
+      <p>
+        Asked to act on a hold that had already been settled, the account service logged the fact
+        and replied with nothing, so the saga could only ever learn from its own deadline.
+        <span class="fix">It now replies with what actually happened to the hold. A reply is a
+        statement of fact, not an acknowledgement &mdash; and silence was never the third option.</span>
+      </p>
+    </li>
+    <li>
+      <h3>A compensation that raced the step it was compensating</h3>
+      <p>
+        A timeout is decided from a clock, not from the message order, so it can fire before the
+        step it is cancelling has even arrived. The cancellation sent nothing, the late step landed
+        anyway, and the money stayed stranded mid-flight forever.
+        <span class="fix">Compensations are addressed by transfer and leave a tombstone behind, so
+        they commute with the step they compensate &mdash; whichever one arrives first.</span>
+      </p>
+    </li>
+    <li>
+      <h3>A replayed dead letter that charged a cancelled payment</h3>
+      <p>
+        A message rescued from the dead-letter queue and replayed went on to charge a transfer that
+        had already been refunded.
+        <span class="fix">Fixed the same way, at the gateway: a cancelled transfer leaves a
+        tombstone that a later charge collides with instead of overwriting.</span>
+      </p>
+    </li>
+    <li>
+      <h3>A restarted service that timed out payments it could already hear</h3>
+      <p>
+        After a crash the orchestrator served traffic and ran its timeout sweeper for roughly 23
+        seconds before its message consumer rejoined the group &mdash; and failed payments whose
+        replies were sitting unread, waiting for it.
+        <span class="fix">The sweeper now waits until the reply listener actually holds its
+        partitions. A service must not declare things dead while it is deaf.</span>
+      </p>
+    </li>
+  </ol>
+</section>
+
+<!-- ------------------------------------------------------------ results -->
+<section class="wrap band">
+  <div class="measure">
+    <span class="eyebrow">Results</span>
+    <h2>Eight faults, a thousand users, and a rolling deploy</h2>
+  </div>
+
+  <h3 style="margin-top:26px">Chaos &mdash; faults injected into the running stack</h3>
+  <div class="tbl-scroll">
+    <table class="data">
+      <thead><tr><th>Fault injected</th><th>Outcome</th></tr></thead>
+      <tbody>
+        <tr><td>Message broker killed while payments are being accepted</td><td><span class="held">held</span> &mdash; the API keeps accepting; commands wait in the outbox</td></tr>
+        <tr><td>Account service killed before the debit, and again after the charge</td><td><span class="held">held</span> &mdash; after the charge it completes; before it, the sender is made exactly whole</td></tr>
+        <tr><td>Orchestrator killed holding committed, unpublished commands</td><td><span class="held">held</span> &mdash; every command published once; no payment timed out while it was deaf</td></tr>
+        <tr><td>Card processor declines every charge</td><td><span class="held">held</span> &mdash; every payment compensated, each sender restored exactly</td></tr>
+        <tr><td>Processor answers twice, then goes silent; dead letters replayed</td><td><span class="held">held</span> &mdash; no double credit; the replay charged nobody</td></tr>
+        <tr><td>One idempotency key sent 100 times at once, with the cache on and off</td><td><span class="held">held</span> &mdash; exactly one payment, every caller told about it</td></tr>
+        <tr><td>90 concurrent payments from an account with room for 60</td><td><span class="held">held</span> &mdash; exactly 60 completed, 30 refused, balance exactly 0, zero deadlocks</td></tr>
+        <tr><td>Account service cut off <em>inside</em> an open database transaction</td><td><span class="held">held</span> &mdash; the orphaned transaction reaped 27&ndash;41 s after the cut</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="margin-top:36px">Load &mdash; 1,000 concurrent users</h3>
+  <div class="tbl-scroll">
+    <table class="data">
+      <thead><tr><th>1,000 users</th><th>At rated capacity</th><th>At roughly twice capacity</th></tr></thead>
+      <tbody>
+        <tr><td>Offered / accepted</td><td class="n">~16/s &middot; 13.6/s</td><td class="n">~74/s &middot; 33.4/s</td></tr>
+        <tr><td>Payments settled</td><td class="n held">7,307 of 7,307</td><td class="n held">17,974 of 17,974 accepted</td></tr>
+        <tr><td>Create latency, p99</td><td class="n">58 ms</td><td class="n">228 ms</td></tr>
+        <tr><td>Settle latency, p99</td><td class="n">3.55 s</td><td class="n">&le; 5.4 s server-side</td></tr>
+        <tr><td>Turned away up front</td><td class="n">0</td><td class="n">48,345</td></tr>
+        <tr><td>Every invariant</td><td class="n held">pass</td><td class="n held">pass</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="tbl-note measure">
+    The overloaded run is the interesting one. The system stays correct and stays fast
+    <em>for what it accepts</em>, and refuses the excess at the front door instead of accepting it
+    and timing it out thirty seconds later. Getting there meant finding a metastable collapse
+    first: past about 15 payments a second, customers&rsquo; status polls took every database
+    connection the payment pipeline needed, payments timed out, their compensations added more
+    work, and the system stayed down after the load stopped &mdash; with every paisa still
+    conserved. Capacity went from ~15/s to ~38/s.
+  </p>
+
+  <h3 style="margin-top:36px">Kubernetes &mdash; a rolling deploy under load</h3>
+  <div class="tbl-scroll">
+    <table class="data">
+      <thead><tr><th>Disruption, under load</th><th>Failed requests</th><th>Payments settled</th><th>Invariants</th></tr></thead>
+      <tbody>
+        <tr><td>Rolling restart of all three services</td><td class="n held">0 of 6,874</td><td class="n">1,298 of 1,298</td><td class="n held">pass</td></tr>
+        <tr><td>The same, without the shutdown grace period</td><td class="n">4 of 6,834</td><td class="n">1,317 of 1,317</td><td class="n held">pass</td></tr>
+        <tr><td>Hard kill of an orchestrator &mdash; a crash, not a stop</td><td class="n">2 of 7,343</td><td class="n">1,139 of 1,139</td><td class="n held">pass</td></tr>
+        <tr><td>An orchestrator frozen mid-flight, 30 s deadline</td><td class="n">9 of 6,279</td><td class="n miss">1,053 of 1,066</td><td class="n held">pass</td></tr>
+        <tr><td>The same freeze, 60 s deadline</td><td class="n held">0 of 6,138</td><td class="n">1,050 of 1,050</td><td class="n held">pass</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="tbl-note measure">
+    The fourth row is the one worth reading. Thirteen payments whose replies had already been sent
+    were sitting unread on a frozen replica&rsquo;s partitions, and the surviving replica timed
+    them out. The money stayed correct; the customers were told the wrong thing. A deadline has to
+    outlast an orphaned partition, so it is now 60 seconds &mdash; and the same freeze fails nothing.
+  </p>
+</section>
+
+<!-- ------------------------------------------------------- architecture -->
+<section class="wrap band">
+  <div class="measure">
+    <span class="eyebrow">Architecture</span>
+    <h2>Three services, three databases, one conversation</h2>
+    <p>
+      Each service owns its database and nothing else. No service reads another&rsquo;s tables;
+      they talk only through message topics. Every arrow below is a row written to an outbox in the
+      same transaction as the change it reports, published by a relay, and de-duplicated on arrival.
+    </p>
+  </div>
+
+  <div class="flow">
+    <div class="flow-in">
+      <div class="frow">
+        <div class="fbox"><b>payment-orchestrator</b><span>The public API, the saga state machine, idempotency, tokens.</span></div>
+        <div class="fbox"><b>account-service</b><span>The money. Double-entry ledger, holds, and the clearing accounts.</span></div>
+        <div class="fbox"><b>payment-gateway</b><span>A simulated card processor, with failure injection you can turn on at runtime.</span></div>
+      </div>
+      <ul class="fseq">
+        <li><span class="m">POST /api/v1/transfers</span><span class="d">One transaction: the idempotency claim, the admission check, the transfer, the saga and the first command &mdash; then 202 Accepted. No money has moved.</span></li>
+        <li><span class="m">ReserveFunds</span><span class="d">One transaction: lock both accounts in id order, debit the sender, credit a clearing shard, open a hold, write the reply.</span></li>
+        <li class="pivot"><span class="m">ChargeGateway &rarr; approved</span><span class="d">The pivot. Before this point recovery runs backward; after it, only forward.</span></li>
+        <li><span class="m">CommitFunds</span><span class="d">Debit clearing, credit the recipient. The payment is complete.</span></li>
+        <li><span class="m">ReleaseFunds</span><span class="d">The compensation, on a decline or a timeout before the pivot: debit clearing, credit the sender back.</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="two">
+    <div>
+      <h3>Money in flight lives somewhere</h3>
+      <p style="color:var(--ink-2); font-size:15px">
+        Between the debit and the credit, the money sits in a clearing account &mdash; never
+        nowhere. Completing and cancelling a payment both write the <em>identical</em> ledger
+        entry against that account, under a uniqueness constraint. So doing both to the same
+        payment is impossible in the schema, not merely something the orchestrator promises not
+        to do.
+      </p>
+    </div>
+    <div>
+      <h3>A note on &ldquo;exactly once&rdquo;</h3>
+      <p style="color:var(--ink-2); font-size:15px">
+        This system does not provide exactly-once delivery, because that is impossible over an
+        unreliable network. A crash between &ldquo;the broker acknowledged&rdquo; and &ldquo;the
+        row is marked published&rdquo; republishes. What it provides is at-least-once delivery with
+        idempotent consumers, which gives effectively-once <em>processing</em>. The distinction is
+        the whole design.
+      </p>
+    </div>
+  </div>
+
+  <div class="caveat measure">
+    <h3>One open issue, recorded honestly</h3>
+    <p>
+      After a broker restart, a message consumer occasionally stops fetching while its group still
+      reports it healthy. It reproduced in 4 of 10 restarts on one broker implementation and 0 of
+      13 on another, with identical client code. The root cause is not established, and it would be
+      wrong to describe it as known. Since the fixes above it strands no money; an alert catches it
+      and a restart clears it.
+    </p>
+  </div>
+</section>
+
+<footer class="wrap">
+  <div class="measure">
+    <p style="margin-bottom:10px">
+      Java 21 &middot; Spring Boot 4.1 &middot; PostgreSQL 16 &middot; Flyway &middot; Kafka
+      &middot; Redis &middot; Prometheus &amp; Grafana &middot; OpenTelemetry &amp; Jaeger &middot;
+      Testcontainers &middot; k6 &middot; React &middot; Docker Compose &middot; Kubernetes &amp; Helm
+    </p>
+    <p style="margin-bottom:0">
+      Every figure on this page comes from a recorded run, with the command that produced it, in the
+      engineering log in the repository. &mdash;
+      <a href="https://github.com/goutham-hegde/distributed-payment-engine">goutham-hegde/distributed-payment-engine</a>
+    </p>
+  </div>
+</footer>
+
+<script>
+(function(){
+"use strict";
+
+var AMT = 30000, FUND = 100000;
+var REDUCED = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+var SVC = [
+  {k:"cli", long:"Client",       short:"CLIENT"},
+  {k:"orc", long:"Orchestrator", short:"ORCH"},
+  {k:"acc", long:"Account-service", short:"ACCT"},
+  {k:"gwy", long:"Gateway",      short:"GATE"}
+];
+
+var ACCOUNTS = [
+  {k:"issuance", label:"Issuance (system)", sys:true},
+  {k:"alice",    label:"Alice",  sys:false},
+  {k:"clearing", label:"Clearing", sys:false},
+  {k:"bob",      label:"Bob",    sys:false}
+];
+
+function rupees(p){
+  var neg = p < 0, v = Math.abs(p);
+  return (neg?"-":"") + "₹" + (Math.floor(v/100)).toLocaleString("en-IN") + "." +
+         String(v%100).padStart(2,"0");
+}
+function paise(n){ return (n>0?"+":"") + n.toLocaleString("en-IN"); }
+
+// ------------------------------------------------------------------- state
+function fresh(){
+  return {
+    bal:{issuance:-FUND, alice:FUND, clearing:0, bob:0},
+    ledger:[
+      {t:"fund", acct:"issuance", type:"DEBIT",  amt:-FUND},
+      {t:"fund", acct:"alice",    type:"CREDIT", amt: FUND}
+    ],
+    holds:[], sagas:{}, transfers:{}, charges:{},
+    outbox:{orc:0, acc:0, gwy:0},
+    broker:true, dead:{}, inbox:[],
+    accepted:0, replayed:0, shards:{},
+    log:[], fresh:0
+  };
+}
+
+function shardOf(tid){ // hash(transfer) mod 8, as the real reserve picks it
+  var h = 0; for(var i=0;i<tid.length;i++){ h = (h*31 + tid.charCodeAt(i)) >>> 0; }
+  return h % 8;
+}
+function clearingLabel(s, tid){ return "CLEARING·" + (s.shards[tid] !== undefined ? s.shards[tid] : 0); }
+
+function reserve(s, tid){
+  s.shards[tid] = shardOf(tid);
+  s.ledger.push({t:tid, acct:"alice",    type:"DEBIT",  amt:-AMT});
+  s.ledger.push({t:tid, acct:"clearing", type:"CREDIT", amt: AMT, shard:s.shards[tid]});
+  s.bal.alice -= AMT; s.bal.clearing += AMT;
+  s.holds.push({t:tid, status:"ACTIVE"});
+  s.fresh = 2;
+}
+function commit(s, tid){
+  s.ledger.push({t:tid, acct:"clearing", type:"DEBIT",  amt:-AMT, shard:s.shards[tid]});
+  s.ledger.push({t:tid, acct:"bob",      type:"CREDIT", amt: AMT});
+  s.bal.clearing -= AMT; s.bal.bob += AMT;
+  var h = find(s.holds, tid); if(h) h.status = "COMMITTED";
+  s.fresh = 2;
+}
+function release(s, tid){
+  s.ledger.push({t:tid, acct:"clearing", type:"DEBIT",  amt:-AMT, shard:s.shards[tid]});
+  s.ledger.push({t:tid, acct:"alice",    type:"CREDIT", amt: AMT});
+  s.bal.clearing -= AMT; s.bal.alice += AMT;
+  var h = find(s.holds, tid); if(h) h.status = "RELEASED";
+  s.fresh = 2;
+}
+function find(hs, tid){ for(var i=0;i<hs.length;i++){ if(hs[i].t===tid) return hs[i]; } return null; }
+
+// --------------------------------------------------------------- scenarios
+// from/to are indexes into SVC. kind: http | cmd | reply | event | drop | lost
+function S(o){ return o; }
+
+var T1 = "a3f1", T2 = "b7c2", T3 = "c4d8";
+
+function accept(s, tid){
+  s.accepted++;
+  s.sagas[tid] = "STARTED";
+  s.transfers[tid] = "PENDING";
+  s.outbox.orc++;
+}
+
+var SCENARIOS = [
+  {
+    id:"happy", name:"Happy path",
+    blurb:"Alice sends Bob ₹300 and nothing goes wrong.",
+    steps:[
+      S({from:0,to:1,kind:"http",msg:"POST /transfers",
+        say:"Alice asks to send Bob ₹300. In a single database transaction the orchestrator writes the payment, the saga, and a ReserveFunds command into its outbox — then answers 202 Accepted.",
+        note:"<b>202, not 200.</b> The request was accepted; no money has moved yet. Writing the command as a database row in the same transaction is what avoids the dual-write bug this whole design exists to prevent.",
+        act:function(s){ accept(s,T1); }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReserveFunds",
+        say:"A relay picks the committed row out of the outbox and publishes it. The database write and the publish were never two separate operations that could disagree.",
+        act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"The account service locks both accounts in a fixed order, debits Alice, credits a clearing account, opens a hold, and writes its reply — all in one transaction.",
+        note:"Money in flight lives in a <b>clearing account</b>, never nowhere. Locking in a fixed id order is what makes deadlock structurally impossible rather than merely detected.",
+        act:function(s){ reserve(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReserved",
+        say:"The reply comes back. The saga moves to RESERVED and immediately emits the next command.",
+        act:function(s){ s.outbox.acc--; s.sagas[T1]="RESERVED"; s.outbox.orc++; }}),
+      S({from:1,to:3,kind:"cmd",msg:"ChargeGateway",
+        say:"The orchestrator asks the card processor to take the money from Alice's card.",
+        act:function(s){ s.outbox.orc--; }}),
+      S({from:3,to:1,kind:"reply",msg:"GatewayApproved",
+        say:"Approved. The saga moves to CHARGED.",
+        note:"<b>This is the pivot.</b> Something has now happened in the outside world that we cannot take back. Before this point recovery runs backward; after it, only forward.",
+        act:function(s){ s.charges[T1]="APPROVED"; s.sagas[T1]="CHARGED"; s.outbox.orc++; }}),
+      S({from:1,to:2,kind:"cmd",msg:"CommitFunds",
+        say:"With the charge approved, the orchestrator tells the account service to finish the move.",
+        act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"The clearing account is debited and Bob is credited. The hold is marked committed.",
+        act:function(s){ commit(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsCommitted",
+        say:"Bob has the money and the saga is COMPLETED. The ledger still sums to zero — and it summed to zero at every intermediate step too, which is the point.",
+        act:function(s){ s.outbox.acc--; s.sagas[T1]="COMPLETED"; s.transfers[T1]="COMPLETED"; }})
+    ]
+  },
+
+  {
+    id:"decline", name:"The card is declined",
+    blurb:"The processor refuses. Alice must end up exactly whole.",
+    steps:[
+      S({from:0,to:1,kind:"http",msg:"POST /transfers",
+        say:"Same start: the payment is accepted and a ReserveFunds command is committed to the outbox.",
+        act:function(s){ accept(s,T1); }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReserveFunds",
+        say:"The relay publishes it.", act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"Alice is debited ₹300 and a clearing account is credited. Her money is in flight.",
+        act:function(s){ reserve(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReserved",
+        say:"Reserved.", act:function(s){ s.outbox.acc--; s.sagas[T1]="RESERVED"; s.outbox.orc++; }}),
+      S({from:1,to:3,kind:"cmd",msg:"ChargeGateway",
+        say:"The orchestrator asks the processor to charge the card.", act:function(s){ s.outbox.orc--; }}),
+      S({from:3,to:1,kind:"reply",msg:"GatewayDeclined",
+        say:"Declined. Nothing has gone wrong technically — this is an ordinary business outcome, so the handler commits its reply rather than throwing.",
+        note:"A <b>business</b> failure must commit; a <b>technical</b> failure must throw. Throwing here would roll back the record of having consumed the message, the broker would redeliver it, and you would have built an infinite retry loop around a card that is never going to be approved.",
+        act:function(s){ s.charges[T1]="DECLINED"; s.sagas[T1]="COMPENSATING"; s.outbox.orc++; }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReleaseFunds",
+        say:"The saga runs its compensation: give the money back.", act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"The clearing account is debited and Alice is credited back. The hold is released.",
+        note:"A release writes the <b>identical</b> ledger entry that a commit would have — same payment, same clearing account, same type — under a uniqueness constraint. Completing and cancelling one payment are therefore mutually exclusive in the schema itself, not by the orchestrator's good behaviour.",
+        act:function(s){ release(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReleased",
+        say:"Alice has exactly her ₹1,000 back. Not approximately — exactly, and the ledger records both the taking and the giving back.",
+        act:function(s){ s.outbox.acc--; s.sagas[T1]="COMPENSATED"; s.transfers[T1]="COMPENSATED"; }})
+    ]
+  },
+
+  {
+    id:"broker", name:"The broker dies",
+    blurb:"The messaging layer goes down mid-payment. Customers should not notice.",
+    steps:[
+      S({from:0,to:1,kind:"http",msg:"POST /transfers",
+        say:"A first payment is accepted and its command committed to the outbox.",
+        act:function(s){ accept(s,T1); }}),
+      S({from:null,to:null,kind:"event",msg:"broker killed",
+        say:"The message broker is killed. The relay's publishes start failing.",
+        note:"Nothing is lost. The command is a <b>committed database row</b>, not a message that existed only in memory. This is exactly what the outbox buys you.",
+        act:function(s){ s.broker = false; }}),
+      S({from:0,to:1,kind:"http",msg:"POST /transfers",
+        say:"A second customer pays while the broker is still down — and gets a normal 202 Accepted.",
+        note:"A broker outage is not a customer-visible outage. The API keeps taking work because accepting a payment only requires its own database.",
+        act:function(s){ accept(s,T2); }}),
+      S({from:null,to:null,kind:"event",msg:"outbox backing up",
+        say:"Two commands are now waiting in the orchestrator's outbox. Nothing is retrying frantically and nothing is dropped; the rows simply stay unpublished.",
+        act:function(s){ }}),
+      S({from:null,to:null,kind:"event",msg:"broker restored",
+        say:"The broker comes back. The relay drains the backlog in order.",
+        act:function(s){ s.broker = true; }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReserveFunds × 2",
+        say:"Both commands publish, oldest first.", act:function(s){ s.outbox.orc -= 2; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"Both payments reserve their funds.",
+        act:function(s){ reserve(s,T1); reserve(s,T2); s.outbox.acc += 2; s.fresh = 4; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReserved × 2",
+        say:"Both replies land and both sagas advance.",
+        act:function(s){ s.outbox.acc -= 2; s.sagas[T1]="RESERVED"; s.sagas[T2]="RESERVED"; }}),
+      S({from:3,to:1,kind:"reply",msg:"GatewayApproved × 2",
+        say:"Both charges are approved.",
+        act:function(s){ s.charges[T1]="APPROVED"; s.charges[T2]="APPROVED"; s.sagas[T1]="CHARGED"; s.sagas[T2]="CHARGED"; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsCommitted × 2",
+        say:"Both payments complete. The outage cost latency and nothing else — no payment failed, and no customer was told anything untrue.",
+        act:function(s){
+          commit(s,T1); commit(s,T2); s.fresh = 4;
+          s.sagas[T1]="COMPLETED"; s.sagas[T2]="COMPLETED";
+          s.transfers[T1]="COMPLETED"; s.transfers[T2]="COMPLETED";
+        }})
+    ]
+  },
+
+  {
+    id:"dupe", name:"The same message twice",
+    blurb:"The broker delivers a reply twice. Bob must not be paid twice.",
+    steps:[
+      S({from:0,to:1,kind:"http",msg:"POST /transfers",
+        say:"The payment is accepted.", act:function(s){ accept(s,T1); }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReserveFunds",
+        say:"Published.", act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"Alice is debited, clearing is credited.",
+        act:function(s){ reserve(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReserved",
+        say:"Reserved.", act:function(s){ s.outbox.acc--; s.sagas[T1]="RESERVED"; s.outbox.orc++; }}),
+      S({from:1,to:3,kind:"cmd",msg:"ChargeGateway",
+        say:"Charge requested.", act:function(s){ s.outbox.orc--; }}),
+      S({from:3,to:1,kind:"reply",msg:"GatewayApproved",
+        say:"The approval arrives, carrying message id m7. Before doing any work the orchestrator writes m7 into an inbox table — in the same transaction as the work itself.",
+        act:function(s){ s.inbox.push("m7"); s.charges[T1]="APPROVED"; s.sagas[T1]="CHARGED"; s.outbox.orc++; }}),
+      S({from:3,to:1,kind:"drop",msg:"GatewayApproved (m7 again)",
+        say:"The broker delivers m7 a second time. That is permitted — delivery is at-least-once and always will be.",
+        note:"The insert of m7 collides with the row already there, so the duplicate is <b>discarded before it can do anything</b>. Because that row was written in the same transaction as the work, “have I already handled this?” cannot race with “do the work”.",
+        act:function(s){ }}),
+      S({from:1,to:2,kind:"cmd",msg:"CommitFunds",
+        say:"The saga proceeds exactly once.", act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"Clearing is debited, Bob is credited — once.",
+        act:function(s){ commit(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsCommitted",
+        say:"Bob received ₹300, not ₹600. The system never promised exactly-once delivery — that is impossible — it promised at-least-once delivery with consumers that can absorb a repeat.",
+        act:function(s){ s.outbox.acc--; s.sagas[T1]="COMPLETED"; s.transfers[T1]="COMPLETED"; }})
+    ]
+  },
+
+  {
+    id:"idem", name:"100 clicks, one payment",
+    blurb:"The same request arrives a hundred times at once.",
+    steps:[
+      S({from:0,to:1,kind:"http",msg:"POST /transfers × 100",
+        say:"Alice's phone loses signal and retries. A hundred identical requests arrive at once, all carrying the same Idempotency-Key.",
+        act:function(s){ }}),
+      S({from:1,to:1,kind:"work",msg:"",
+        say:"One request wins a unique index on that key. The other ninety-nine block on the uncommitted row, then find the winner's payment and return it — marked as a replay.",
+        note:"The claim on the key is committed <b>in the same transaction as the payment it guards</b>. Claim first in its own transaction and a crash leaves a key saying “done” pointing at a payment that does not exist, refusing every retry forever. Do the work first and the retry makes a second payment.",
+        act:function(s){ accept(s,T1); s.accepted = 1; s.replayed = 99; }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReserveFunds",
+        say:"Exactly one command is published.", act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"Alice is debited once.",
+        act:function(s){ reserve(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReserved",
+        say:"Reserved.", act:function(s){ s.outbox.acc--; s.sagas[T1]="RESERVED"; }}),
+      S({from:3,to:1,kind:"reply",msg:"GatewayApproved",
+        say:"Charged once.",
+        act:function(s){ s.charges[T1]="APPROVED"; s.sagas[T1]="CHARGED"; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsCommitted",
+        say:"One payment, a hundred happy callers. A cache sits in front of this to make the common case fast, but it is deliberately not load-bearing: switch it off and the system is slower, never wrong.",
+        act:function(s){
+          commit(s,T1); s.sagas[T1]="COMPLETED"; s.transfers[T1]="COMPLETED";
+        }})
+    ]
+  },
+
+  {
+    id:"pivot", name:"Timeout after the charge",
+    blurb:"The defect the chaos suite found — and why five green invariants were not enough.",
+    variants:[
+      {id:"naive", label:"Unwind it (the naive fix)"},
+      {id:"fixed", label:"Finish it (this system)"}
+    ],
+    steps:[
+      S({from:0,to:1,kind:"http",msg:"POST /transfers",
+        say:"The payment is accepted.", act:function(s){ accept(s,T1); }}),
+      S({from:1,to:2,kind:"cmd",msg:"ReserveFunds",
+        say:"Published.", act:function(s){ s.outbox.orc--; }}),
+      S({from:2,to:2,kind:"work",msg:"",
+        say:"Alice is debited, clearing is credited, a hold is opened.",
+        act:function(s){ reserve(s,T1); s.outbox.acc++; }}),
+      S({from:2,to:1,kind:"reply",msg:"FundsReserved",
+        say:"Reserved.", act:function(s){ s.outbox.acc--; s.sagas[T1]="RESERVED"; s.outbox.orc++; }}),
+      S({from:1,to:3,kind:"cmd",msg:"ChargeGateway",
+        say:"Charge requested.", act:function(s){ s.outbox.orc--; }}),
+      S({from:3,to:1,kind:"reply",msg:"GatewayApproved",
+        say:"The card processor approves. Alice's card has genuinely been charged — out there, in the real card network, outside anything we control.",
+        note:"<b>The pivot has been crossed.</b>",
+        act:function(s){ s.charges[T1]="APPROVED"; s.sagas[T1]="CHARGED"; s.outbox.orc++; }}),
+      S({from:1,to:2,kind:"cmd",msg:"CommitFunds",
+        say:"The orchestrator sends the command that finishes the move.", act:function(s){ s.outbox.orc--; }}),
+      S({from:1,to:2,kind:"lost",msg:"reply never arrives",
+        say:"…and then nothing comes back. The account service is unreachable, or its reply is lost. The saga sits in CHARGED with its deadline ticking down.",
+        act:function(s){ }}),
+      S({from:null,to:null,kind:"event",msg:"deadline expires",
+        say:"The deadline expires. A sweeper finds the stalled payment and has to decide what to do — and this is precisely where the original implementation was wrong.",
+        note:"Use the <b>Recovery</b> switch above to choose what happens next.",
+        act:function(s){ }}),
+
+      // branch
+      S({branch:true,
+        naive:{
+          from:1,to:2,kind:"cmd",msg:"ReleaseFunds",
+          say:"The naive answer: a stalled payment gets unwound, the same as a stall before the charge. Give the customer their money back.",
+          act:function(s){ }
+        },
+        fixed:{
+          from:1,to:2,kind:"cmd",msg:"CommitFunds (again)",
+          say:"This system re-sends the commit instead, stays in CHARGED, and pushes the deadline out by one step. A forward step has nothing to give up in favour of.",
+          note:"Past the pivot there is nothing to unwind: the card network has already acted. The only correct move is to keep trying to finish.",
+          act:function(s){ }
+        }}),
+
+      S({branch:true,
+        naive:{
+          from:2,to:1,kind:"reply",msg:"FundsReleased",
+          say:"Alice is refunded and the saga ends as COMPENSATED. Look at the invariants: all five are green. The books balance perfectly.",
+          note:"And the payment is <b>wrong</b>. Alice was refunded out of our own books while the card network still holds her ₹300 — we have simply paid for her transfer ourselves. Check S2.",
+          act:function(s){
+            release(s,T1); s.sagas[T1]="COMPENSATED"; s.transfers[T1]="COMPENSATED";
+          }
+        },
+        fixed:{
+          from:2,to:1,kind:"reply",msg:"FundsCommitted",
+          say:"The account service comes back, the retried commit lands, and the payment completes. Bob has the money, the charge that was taken is the charge that was delivered, and every check passes — including S2.",
+          act:function(s){
+            commit(s,T1); s.sagas[T1]="COMPLETED"; s.transfers[T1]="COMPLETED";
+          }
+        }})
+    ]
+  }
+];
+
+// ------------------------------------------------------------------ engine
+var el = {
+  scen:document.getElementById("scenarios"),
+  varBar:document.getElementById("variantBar"),
+  varSegs:document.getElementById("variantSegs"),
+  speed:document.getElementById("speedSegs"),
+  run:document.getElementById("btnRun"),
+  step:document.getElementById("btnStep"),
+  reset:document.getElementById("btnReset"),
+  svcs:document.getElementById("svcs"),
+  chip:document.getElementById("chip"),
+  brokerBar:document.getElementById("brokerBar"),
+  stepN:document.getElementById("stepN"),
+  say:document.getElementById("say"),
+  note:document.getElementById("note"),
+  ledBody:document.getElementById("ledBody"),
+  ledCount:document.getElementById("ledCount"),
+  ledSum:document.getElementById("ledSum"),
+  bals:document.getElementById("bals"),
+  invs:document.getElementById("invs"),
+  log:document.getElementById("log")
+};
+
+var cur = SCENARIOS[0], variant = "fixed", speed = 1, idx = 0, playing = false, timer = null;
+var s = fresh();
+var INTRO = el.say.innerHTML;
+
+function stepList(){
+  return cur.steps.map(function(st){
+    return st.branch ? st[variant] : st;
+  });
+}
+
+// --- controls -------------------------------------------------------------
+SCENARIOS.forEach(function(sc){
+  var b = document.createElement("button");
+  b.type = "button"; b.className = "seg"; b.textContent = sc.name;
+  b.title = sc.blurb;
+  b.setAttribute("aria-pressed", sc === cur ? "true" : "false");
+  b.addEventListener("click", function(){ pick(sc); });
+  el.scen.appendChild(b);
+});
+
+[["0.6","Slow",0.6],["1","Normal",1],["1.9","Fast",1.9]].forEach(function(o){
+  var b = document.createElement("button");
+  b.type = "button"; b.className = "seg"; b.textContent = o[1];
+  b.setAttribute("aria-pressed", o[2] === 1 ? "true" : "false");
+  b.addEventListener("click", function(){
+    speed = o[2];
+    [].forEach.call(el.speed.children, function(c){
+      c.setAttribute("aria-pressed", c === b ? "true" : "false");
+    });
+  });
+  el.speed.appendChild(b);
+});
+
+function buildVariants(){
+  el.varSegs.innerHTML = "";
+  if(!cur.variants){ el.varBar.hidden = true; return; }
+  el.varBar.hidden = false;
+  cur.variants.forEach(function(v){
+    var b = document.createElement("button");
+    b.type = "button"; b.className = "seg"; b.textContent = v.label;
+    b.setAttribute("aria-pressed", v.id === variant ? "true" : "false");
+    b.addEventListener("click", function(){
+      variant = v.id;
+      [].forEach.call(el.varSegs.children, function(c){
+        c.setAttribute("aria-pressed", c === b ? "true" : "false");
+      });
+      reset();
+    });
+    el.varSegs.appendChild(b);
+  });
+}
+
+function pick(sc){
+  cur = sc;
+  [].forEach.call(el.scen.children, function(c, i){
+    c.setAttribute("aria-pressed", SCENARIOS[i] === sc ? "true" : "false");
+  });
+  buildVariants();
+  reset();
+}
+
+el.run.addEventListener("click", function(){ playing ? pause() : play(); });
+el.step.addEventListener("click", function(){ pause(); advance(); });
+el.reset.addEventListener("click", function(){ reset(); });
+
+function play(){
+  if(idx >= stepList().length){ reset(); }
+  playing = true;
+  el.run.innerHTML = "&#10073;&#10073;&nbsp; Pause";
+  el.run.classList.remove("primary");
+  tick();
+}
+function pause(){
+  playing = false;
+  if(timer){ clearTimeout(timer); timer = null; }
+  el.run.innerHTML = "&#9654;&nbsp; Run";
+  el.run.classList.add("primary");
+}
+function tick(){
+  if(!playing) return;
+  advance();
+  if(idx >= stepList().length){ pause(); return; }
+  timer = setTimeout(tick, 1500 / speed);
+}
+function reset(){
+  pause();
+  s = fresh(); idx = 0;
+  el.stepN.textContent = "Ready";
+  el.say.innerHTML = cur.blurb ? cur.blurb + " Press Run, or walk through it a step at a time." : INTRO;
+  el.note.hidden = true;
+  el.chip.classList.remove("show","moving","reply","lost","dropped");
+  el.chip.style.opacity = "0";
+  render();
+  el.step.disabled = false;
+}
+
+function advance(){
+  var list = stepList();
+  if(idx >= list.length){ return; }
+  var st = list[idx]; idx++;
+
+  el.stepN.textContent = "Step " + idx + " of " + list.length;
+  el.say.innerHTML = st.say;
+  if(st.note){ el.note.innerHTML = st.note; el.note.hidden = false; }
+  else { el.note.hidden = true; }
+
+  s.fresh = 0;
+  st.act(s);
+
+  if(st.msg){
+    s.log.push({msg:st.msg, from:st.from, to:st.to, kind:st.kind});
+    if(s.log.length > 14) s.log.shift();
+  }
+
+  fly(st);
+  render();
+  el.step.disabled = idx >= list.length;
+}
+
+// --- the flying message ---------------------------------------------------
+function colPct(i){ return ((i + 0.5) / 4) * 100; }
+
+function fly(st){
+  var c = el.chip;
+  c.className = "chip";
+  if(st.kind === "event" || st.kind === "work" || st.from === null || st.from === st.to){
+    c.style.opacity = "0";
+    return;
+  }
+  if(st.kind === "reply") c.classList.add("reply");
+  if(st.kind === "lost")  c.classList.add("lost");
+  if(st.kind === "drop")  c.classList.add("dropped");
+  c.textContent = st.msg;
+
+  var dur = REDUCED ? 1 : Math.round(820 / speed);
+  c.style.setProperty("--fly", dur + "ms");
+  c.classList.remove("moving");
+  c.style.left = colPct(st.from) + "%";
+  c.style.opacity = "0";
+  // force a reflow so the starting position is committed before the transition
+  void c.offsetWidth;
+  c.classList.add("moving","show");
+  c.style.opacity = "1";
+  c.style.left = colPct(st.kind === "lost" ? (st.from + st.to) / 2 : st.to) + "%";
+
+  setTimeout(function(){
+    c.style.opacity = "0";
+  }, dur + (REDUCED ? 60 : 380));
+}
+
+// --- rendering ------------------------------------------------------------
+function sagaSummary(){
+  var ks = Object.keys(s.sagas);
+  if(!ks.length) return {text:"—", tone:""};
+  var counts = {};
+  ks.forEach(function(k){ counts[s.sagas[k]] = (counts[s.sagas[k]] || 0) + 1; });
+  var parts = Object.keys(counts).map(function(st){
+    return counts[st] > 1 ? st + " ×" + counts[st] : st;
+  });
+  var only = ks.length === 1 ? s.sagas[ks[0]] : null;
+  var tone = only === "COMPLETED" ? "var(--m-ok)"
+           : only === "COMPENSATED" ? "var(--m-info)"
+           : only === "FAILED" ? "var(--m-bad)" : "var(--m-warn)";
+  return {text:parts.join(", "), tone:tone};
+}
+
+function render(){
+  // services
+  var sg = sagaSummary();
+  var active = s.holds.filter(function(h){ return h.status === "ACTIVE"; }).length;
+  var chg = Object.keys(s.charges).map(function(k){ return s.charges[k]; });
+  var chgText = chg.length ? (chg.length > 1 ? chg[0] + " ×" + chg.length : chg[0]) : "—";
+
+  var boxes = [
+    {n:0, state:"<b>" + (s.accepted || 0) + " accepted</b>" +
+        (s.replayed ? "<span class=\"pill\" style=\"color:var(--m-info)\">" + s.replayed + " replayed</span>" : "")},
+    {n:1, state:"<b style=\"color:" + sg.tone + "\">" + sg.text + "</b>outbox " + s.outbox.orc},
+    {n:2, state:"<b>" + active + " hold" + (active === 1 ? "" : "s") + " active</b>outbox " + s.outbox.acc},
+    {n:3, state:"<b style=\"color:" + (chgText.indexOf("APPROVED") === 0 ? "var(--m-ok)" : chgText.indexOf("DECLINED") === 0 ? "var(--m-bad)" : "var(--m-dim)") + "\">" + chgText + "</b>charges " + chg.length}
+  ];
+
+  el.svcs.innerHTML = boxes.map(function(b){
+    var sv = SVC[b.n];
+    return "<div class=\"svc\" data-i=\"" + b.n + "\">" +
+      "<div class=\"svc-n\"><span class=\"long\">" + sv.long + "</span><span class=\"short\">" + sv.short + "</span></div>" +
+      "<div class=\"svc-s\">" + b.state + "</div></div>";
+  }).join("");
+
+  el.brokerBar.hidden = s.broker;
+
+  // ledger
+  var rows = s.ledger.map(function(e, i){
+    var isFresh = s.fresh > 0 && i >= s.ledger.length - s.fresh;
+    var name = e.acct === "clearing"
+      ? "CLEARING·" + (e.shard !== undefined ? e.shard : 0)
+      : e.acct === "issuance" ? "ISSUANCE" : e.acct;
+    return "<tr" + (isFresh ? " class=\"fresh\"" : "") + ">" +
+      "<td class=\"muted\">" + e.t + "</td>" +
+      "<td>" + name + "</td>" +
+      "<td class=\"" + (e.type === "DEBIT" ? "dr" : "cr") + "\">" + e.type + "</td>" +
+      "<td class=\"num " + (e.type === "DEBIT" ? "dr" : "cr") + "\">" + paise(e.amt) + "</td></tr>";
+  }).join("");
+  el.ledBody.innerHTML = rows;
+  el.ledCount.textContent = s.ledger.length + " entries";
+
+  var sum = s.ledger.reduce(function(a, e){ return a + e.amt; }, 0);
+  el.ledSum.textContent = sum === 0 ? "0 ✓" : String(sum);
+  el.ledSum.style.color = sum === 0 ? "var(--m-ok)" : "var(--m-bad)";
+
+  var sc = el.ledBody.parentNode.parentNode;
+  sc.scrollTop = sc.scrollHeight;
+
+  // balances
+  el.bals.innerHTML = ACCOUNTS.map(function(a){
+    var v = s.bal[a.k];
+    var moved = (a.k === "alice" && v !== FUND) || (a.k === "bob" && v !== 0) || (a.k === "clearing" && v !== 0);
+    return "<li" + (a.sys ? " class=\"sys\"" : "") + ">" +
+      "<span class=\"who\">" + a.label + "</span>" +
+      "<span class=\"amt" + (moved ? " moved" : "") + "\">" + rupees(v) + "</span></li>";
+  }).join("");
+
+  // invariants
+  var quiet = Object.keys(s.sagas).length > 0 &&
+              Object.keys(s.sagas).every(function(k){
+                var st = s.sagas[k];
+                return st === "COMPLETED" || st === "COMPENSATED" || st === "FAILED";
+              });
+  var anySaga = Object.keys(s.sagas).length > 0;
+
+  var i1 = sum === 0;
+  var i2 = true;
+  var totals = {};
+  s.ledger.forEach(function(e){ totals[e.acct] = (totals[e.acct] || 0) + e.amt; });
+  ACCOUNTS.forEach(function(a){ if((totals[a.k] || 0) !== s.bal[a.k]) i2 = false; });
+  var held = s.holds.filter(function(h){ return h.status === "ACTIVE"; }).length * AMT;
+  var i3 = (s.bal.alice + s.bal.bob + held) === FUND;
+  var i5 = s.bal.alice >= 0 && s.bal.bob >= 0;
+
+  var s1 = quiet ? held === 0 : null;
+  var s2 = true;
+  Object.keys(s.charges).forEach(function(k){
+    if(s.charges[k] === "APPROVED" && s.transfers[k] !== "COMPLETED") s2 = false;
+  });
+  var s3 = true;
+  Object.keys(s.transfers).forEach(function(k){
+    if(s.transfers[k] === "COMPLETED" && s.charges[k] !== "APPROVED") s3 = false;
+  });
+  var s4 = true;
+  Object.keys(s.sagas).forEach(function(k){
+    var t = s.sagas[k];
+    if((t === "COMPLETED" || t === "COMPENSATED" || t === "FAILED") && s.transfers[k] === "PENDING") s4 = false;
+  });
+
+  var defs = [
+    ["I1", i1, "Every ledger entry sums to zero — no money created or destroyed."],
+    ["I2", i2, "Each stored balance equals the sum of its own ledger entries."],
+    ["I3", i3, "Balances plus money held in flight is the same total we started with."],
+    ["I4", anySaga ? (quiet ? true : null) : null, "No payment left half-finished once the system is at rest."],
+    ["I5", i5, "No customer account is negative."],
+    ["S1", s1, "No money still parked in flight once the system is at rest."],
+    ["S2", s2, "Every approved card charge belongs to a completed payment."],
+    ["S3", s3, "Every completed payment has an approved card charge behind it."],
+    ["S4", s4, "Nobody is still being told “processing” about a finished payment."]
+  ];
+
+  el.invs.innerHTML = defs.map(function(d){
+    var cls = d[1] === null ? "wait" : d[1] ? "pass" : "fail";
+    var mark = d[1] === null ? "—" : d[1] ? "✓" : "✕";
+    return "<span class=\"inv " + cls + "\" title=\"" + d[2] + "\">" + d[0] + " " + mark + "</span>";
+  }).join("");
+
+  // log
+  el.log.innerHTML = s.log.slice(-8).map(function(m){
+    var arrow = (m.from === null || m.from === m.to)
+      ? "•"
+      : SVC[m.from].short + " → " + SVC[m.to].short;
+    var cls = m.kind === "drop" ? " class=\"drop\"" : m.kind === "lost" ? " class=\"lost\"" : "";
+    return "<li" + cls + "><span class=\"ar\">" + arrow + "</span><span class=\"nm\">" + m.msg + "</span></li>";
+  }).join("");
+  el.log.scrollTop = el.log.scrollHeight;
+}
+
+// --- boot -----------------------------------------------------------------
+buildVariants();
+render();
+
+// Open in a live state rather than an empty shell.
+if(!REDUCED){
+  setTimeout(function(){
+    if(idx === 0 && !playing) play();
+  }, 1400);
+}
+})();
+</script>
+
+</body>
+</html>
