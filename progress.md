@@ -5081,3 +5081,182 @@ M0-M10 are done and nothing is in progress. Known and not done, none of it block
 4. From before M10: the unexplained exit 137 (Session 24), `SagaOrchestrator.start`'s `save()`
    merge, gateway partitions, batched offset commits, the relay poll interval, and the PSP call's
    place in the transaction.
+
+---
+
+## Session 27 — 2026-09-18
+
+### Goal
+
+Make the system viewable by someone who will not clone the repository and wait for ten containers
+to report healthy. Two artefacts: a project page, and a second implementation of the engine
+deployed and running, so a reader can throw the fault switches themselves rather than read about
+somebody else having thrown them.
+
+### Decisions made
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| What a reader is shown | A working implementation, not a recording or an animation | The claims this project makes — a compensation returns the sender *exactly* whole, a duplicate delivery pays once — are all falsifiable, and a recording cannot be falsified by the person watching it. A reader who sets the gateway to decline and watches the balance come back has checked the claim; a reader watching an animation has taken it on trust. |
+| Where the live engine runs | Next.js on Vercel, PostgreSQL on Neon | A serverless platform cannot host three JVMs, a broker and Redis. It can host the *design*, and the design is what is on trial. |
+| What gets ported | The constraints, not the topology | Correctness here never lived in the application layer. The signed amounts, the sign-matches-type CHECK, the one-leg-per-account UNIQUE, the non-negative customer balance and the idempotency index carry over unchanged and do the same work; the three-process split does not survive and did not need to. |
+| Kafka's replacement | The outbox table, drained by a relay the watching page invokes | Serverless has no background thread to run a relay loop. This changes *who turns the crank*, not what the loop guarantees: the message is still a committed row published separately from the transaction that wrote it, delivery is still at-least-once, and the consumer still claims its inbox row inside the transaction that does the work. Every failure the pattern exists to handle is still reachable, which is the test of whether the port is honest. |
+| Isolation between visitors | `session_id` on every table, scoped by cookie | One visitor setting the gateway to DECLINE would otherwise break the next visitor's payment, and I1 would be a sum over strangers' ledgers — true, but meaningless as a statement about anything. |
+| `saga_compensation_needs_a_hold` | Dropped in the port, deliberately | A STARTED timeout sends a transfer-addressed compensation before any hold exists. In the deployed system that path is rare; here it is one click, so the constraint would have had to be worked around rather than satisfied. Recorded rather than quietly omitted. |
+| A void over an approved charge | Refused | See "What broke" 1. This is not a simplification — it is the pivot. |
+| The saga deadline | 12 s, against 60 s deployed | 60 s exists to outlast a Kafka partition orphaned by a crashed replica (45 s session timeout plus rebalance plus margin). Nothing here can orphan a partition, and a visitor will not wait a minute to watch a timeout. |
+| Neon's region | AWS `us-east-1` | Vercel Hobby runs functions in `iad1`. The latency that matters is function-to-database, not browser-to-database, and one payment makes several round trips inside a transaction; a database near the reader instead of near the functions would have added roughly 200 ms per query. |
+| The connection string | Pooled, with the app pool capped at 3 | A serverless platform opens many short-lived connections, and each warm instance holding a fat pool is how a small Postgres runs out of connections while every instance believes it is being modest. |
+| How the port is tested | Drive the real HTTP API against a real PostgreSQL; no mocks | Every guarantee under test lives in a constraint. A stubbed database would be a test of the stub. Same shape as `chaos/`: inject one fault, wait for quiescence, judge by the ledger. |
+
+### Built
+
+- `docs/index.html`, `docs/.nojekyll` — a single self-contained page, served by GitHub Pages from
+  `main:/docs`. No build step and no dependency beyond a web font. It carries a client-side
+  animation of the saga for readers who only want to look.
+- `web/` — a Next.js 16 application, deployed at `goutham-payment-engine.vercel.app`, with the
+  project's root directory set to `web`:
+  - `lib/schema.ts` — the schema, every statement `IF NOT EXISTS` plus idempotent `ALTER`s, applied
+    on first request. No migration step to run and nothing to forget on a redeploy.
+  - `lib/accounts.ts` — reserve, commit, release. A transfer-scoped advisory lock before any row
+    lock, accounts locked in one global id order, the clearing shard recorded on the hold and read
+    back rather than recomputed, and an answer-with-what-happened path for a command about a hold
+    that has already settled.
+  - `lib/saga.ts` — the state machine and the timeout sweeper, with forward recovery past the pivot.
+  - `lib/gateway.ts` — the simulated provider and its knobs.
+  - `lib/engine.ts` — the relay, the inbox claim and the dispatch loop. One hop per round, so a
+    payment can be watched moving.
+  - `lib/invariants.ts` — I1–I5 and S1–S4 as SQL. I4 and S1 report "not yet" rather than "failed"
+    until the system is at rest, for the same reason the deployed `/admin/invariants` reports I4
+    with `requiresQuiescence`.
+  - Six routes: `/api/state`, `/api/transfers`, `/api/tick`, `/api/invariants`, `/api/faults`,
+    `/api/reset`.
+- `web/test/engine.test.mjs` — twelve scenarios over the live API. Plain JavaScript and
+  `node:test`, so no build step and no test dependency.
+
+### What broke
+
+1. **The gateway would void a charge that had already been approved, which made the one scenario
+   built to fail S2 pass instead.** The upsert had no guard, so the compensation tidily erased the
+   evidence and every check went green. The code was wrong about the world, not merely about the
+   test: an authorization can be voided before capture, but once the money has moved, undoing it is
+   a *refund* — a new movement outward — not an erasure of the old one. A void is now refused over
+   an APPROVED row and the reply says so. This is exactly what makes the approval a pivot; without
+   it, "pivot" is just a name for a step.
+2. **The "lose the commit" fault dropped the reply instead of the command.** The money moved, the
+   saga never heard, the deadline fired, the compensation found a hold that was already COMMITTED,
+   and the participant's truthful answer was dropped by the same fault — so the saga sat in
+   COMPENSATING forever, re-sending. Correct behaviour from every component and a useless
+   demonstration. It now drops the `CommitFunds` *command*, once per payment: a service briefly
+   unreachable, not one that ceased to exist. A fault that swallows every retry forever makes
+   forward recovery impossible to show, which is the half worth showing.
+3. **Four of the six routes never sent the session cookie back.** The session helper opens and
+   seeds a world whenever it does not recognise the caller, so a first request to `/api/faults`
+   created a ledger and threw away the only handle to it; a visitor whose first click was a fault
+   switch would have watched every later click land in a different world. Every response now goes
+   through one helper, so it cannot be remembered in one route and forgotten in another.
+4. **The test for 3 passed against a stale server, and the pass was worthless.** `next start` takes
+   its port from `PORT` in the environment, so a kill filtered on the process command line matched
+   nothing; the replacement died on `EADDRINUSE` into a log nobody was reading, and curl went on
+   talking to the old build. The fix is to kill by the PID holding the port
+   (`netstat -ano | grep :PORT`), and the lesson is the one this project keeps relearning: a green
+   result is evidence only when you know what produced it.
+5. **The session sweep only ran from `/api/reset`.** Abandoned worlds were collected only when
+   somebody happened to press Reset — the one visitor who tidies up paying for everyone who did
+   not, and a deployment nobody resets never collecting at all. Moved onto the tick, throttled to
+   once per ten minutes per warm instance because the page polls that endpoint several times a
+   second while a payment is in flight.
+6. **`node --test test/` resolves the directory as a module** and dies with `MODULE_NOT_FOUND`
+   rather than saying anything about directories. It needs a quoted glob.
+7. **`npm audit fix --omit=dev` pruned the dev dependencies**, so TypeScript vanished from
+   `node_modules`; `npx tsc` then downloaded and ran an unrelated package of that name from the
+   registry, which prints a friendly message and exits 0. A typecheck that cannot fail is worse
+   than no typecheck. Call `./node_modules/.bin/tsc`.
+8. **Next 15.5.4 shipped with a published advisory**, and the 15.x line still resolves a vulnerable
+   `postcss`. Moved to 16.3.5, which builds unchanged and leaves `npm audit` clean.
+9. **The Windows `node` build cannot open a POSIX path** — the same trap `python3` set at M8, hit
+   again by a test helper reading a file under `/tmp`. Pipe through stdin.
+
+### Verified
+
+```
+web, local, PostgreSQL 16 in a container
+  npm run build                                 compiled; 6 dynamic routes, 1 static page
+  ./node_modules/.bin/tsc --noEmit              exit 0
+  npm audit --omit=dev                          found 0 vulnerabilities
+  BASE_URL=http://127.0.0.1:3999 npm test       tests 12  pass 12  fail 0   69.0 s
+```
+
+The twelve, each against a real database and judged from the ledger:
+
+```
+a world opens balanced                 I1 holds before anything happens; issuance = -150000
+happy path                             202; COMPLETED; alice 70000 bob 80000; all nine pass
+idempotency                            replay returns the original id; no entry written
+card declined                          COMPENSATED; alice exactly 100000; S1 holds
+broker dies                            two 202s while down, >=2 unpublished, nothing moved;
+                                       drains on restore to alice 40000 bob 110000
+every message twice                    COMPLETED; 8 ledger entries, not 12
+insufficient funds                     FAILED; 4 entries; no compensation
+provider never answers (pre-pivot)     COMPENSATED; alice whole; a VOIDED tombstone
+timeout after the charge, UNWINDING    COMPENSATED; alice refunded to 100000; charge still
+                                       APPROVED; I1-I5, I4, S1, S3 and S4 all hold; S2 FAILS;
+                                       /api/invariants answers 409
+timeout after the charge, FINISHING    COMPLETED; alice 70000 bob 80000; all nine pass; 200
+worlds are isolated                    a DECLINE world compensates while a second world completes
+validation                             0, -1, 1.5 and 1000001 refused 400; self-payment 400;
+                                       nothing written
+```
+
+The session sweep, proven rather than assumed — three sessions aged past the cutoff, then one tick
+on a freshly started instance:
+
+```
+stale sessions before                          3
+stale sessions after one tick                  0
+rows orphaned by the cascade                   0 ledger_entries, 0 outbox
+```
+
+Against production, the same scenarios through the deployed URL:
+
+```
+GET  /                                         200, 38149 bytes, 0.20 s
+GET  /api/state                                schema applied itself; accounts seeded
+POST /api/transfers                            202 in 0.43 s
+happy path                                     COMPLETED; alice 70000 bob 80000; all nine pass
+replay                                         replayed: true
+card declined                                  COMPENSATED; alice exactly 100000
+timeout after the charge, UNWINDING            I1-I5 green, S2 red
+timeout after the charge, FINISHING            all nine green
+```
+
+### Committed
+
+`93c4520` site: a simulation, because a README cannot show money moving
+`f39cac4` README: link the project page
+`f3b0768` web: a second implementation, running, that anyone can break
+`295e245` web: every response carries the session cookie, not just two of them
+`ddb2941` README: point at the live engine
+`10a8841` web: a chaos suite for the port, and a sweep that actually runs
+
+plus this log.
+
+### Open / next
+
+M0–M10 remain done; this session added no milestone and closed no gap in the Java system. Known
+and not done, none of it blocking:
+
+1. Nothing runs `web`'s tests automatically. They need a live server and a database, so they are a
+   deliberate command rather than a build step — but a workflow that starts a Postgres service
+   container and runs them on push would stop the port drifting from the design it claims to
+   implement.
+2. Two pages now describe one project: `docs/` (static, animated, no dependency) and `web/` (live,
+   real). The live one is the better front door and the README points at it; the static one is kept
+   because it survives the database going away. They can drift, and nothing checks that they do not.
+3. Neon's free tier pauses a database that is idle long enough. The first request after that pays
+   the wake-up; the sweep keeps the size down but does nothing about the pause.
+4. Carried forward from Session 26: default-deny egress NetworkPolicies, the cooperative-sticky
+   assignor, and the consumer stall after a Redpanda broker restart (root cause still not
+   established). From Session 24: the unexplained exit 137, `SagaOrchestrator.start`'s `save()`
+   merge, gateway partitions, batched offset commits, the relay poll interval, and the PSP call's
+   place in the transaction.
