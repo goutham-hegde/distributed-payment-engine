@@ -9,6 +9,11 @@ Saga orchestration, a transactional outbox and inbox, idempotent consumers, a do
 and a chaos suite and load test that judge the system by what is in its ledger rather than by the
 HTTP status codes it returned.
 
+**[Run the system in your browser →](https://goutham-hegde.github.io/distributed-payment-engine/)**
+A project page with a simulation of the saga: pick a fault — a decline, a broker outage, a
+duplicated reply, a timeout after the gateway charge — and watch the messages, the ledger entries
+and the invariants as it recovers. No install; the simulation is client-side.
+
 > [!NOTE]
 > **Status: M0–M10 complete, including the optional M10: Kubernetes + Helm on a one-node kind
 > cluster ([ADR 0013](docs/adr/0013-kubernetes.md)).**
