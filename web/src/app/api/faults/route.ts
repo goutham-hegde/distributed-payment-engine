@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { currentSession } from "@/lib/session";
 import { query } from "@/lib/db";
 import { readState } from "@/lib/state";
+import { withSession } from "@/lib/respond";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -28,5 +29,5 @@ export async function POST(req: Request) {
     }
   }
 
-  return NextResponse.json(await readState(session.id));
+  return withSession(await readState(session.id), session.id);
 }

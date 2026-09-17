@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
 import { currentSession } from "@/lib/session";
 import { invariants } from "@/lib/invariants";
+import { withSession } from "@/lib/respond";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -12,5 +12,5 @@ export const runtime = "nodejs";
 export async function GET() {
   const session = await currentSession();
   const report = await invariants(session.id);
-  return NextResponse.json(report, { status: report.allHold ? 200 : 409 });
+  return withSession(report, session.id, { status: report.allHold ? 200 : 409 });
 }

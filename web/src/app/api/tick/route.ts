@@ -1,7 +1,7 @@
-import { NextResponse } from "next/server";
-import { currentSession, COOKIE } from "@/lib/session";
+import { currentSession } from "@/lib/session";
 import { tick } from "@/lib/engine";
 import { readState } from "@/lib/state";
+import { withSession } from "@/lib/respond";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -17,12 +17,5 @@ export async function POST() {
   const session = await currentSession();
   const result = await tick(session.id);
   const state = await readState(session.id);
-  const res = NextResponse.json({ ...state, tick: result });
-  res.cookies.set(COOKIE, session.id, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 60 * 60 * 24,
-  });
-  return res;
+  return withSession({ ...state, tick: result }, session.id);
 }

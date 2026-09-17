@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "crypto";
-import { currentSession, COOKIE, SAGA_DEADLINE_MS, CURRENCY } from "@/lib/session";
+import { currentSession, SAGA_DEADLINE_MS, CURRENCY } from "@/lib/session";
 import { tx } from "@/lib/db";
 import { emit, recordStep } from "@/lib/events";
 import { readState } from "@/lib/state";
+import { withSession } from "@/lib/respond";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -111,20 +112,12 @@ export async function POST(req: Request) {
     });
 
     const state = await readState(session.id);
-    const res = NextResponse.json(
-      {
-        ...state,
-        accepted: { transferId: outcome.transferId, replayed: outcome.replayed },
-      },
+    const res = withSession(
+      { ...state, accepted: { transferId: outcome.transferId, replayed: outcome.replayed } },
+      session.id,
       { status: 202 }
     );
     res.headers.set("Idempotency-Replayed", String(outcome.replayed));
-    res.cookies.set(COOKIE, session.id, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 60 * 60 * 24,
-    });
     return res;
   } catch (e) {
     if (e instanceof HttpError) {
