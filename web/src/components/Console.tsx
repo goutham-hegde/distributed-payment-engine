@@ -421,7 +421,7 @@ export default function Console() {
           <p className={`inv-detail${brokenS2 ? " bad" : ""}`}>
             {state.invariants.quiescent
               ? "The system is at rest, so every check is meaningful."
-              : "I4 and S1 read — while a payment is in flight: a saga in RESERVED is correct now and a violation ten minutes from now."}
+              : "I4, S1 and S2 read — while a payment is in flight: a saga in RESERVED is correct now and a violation ten minutes from now."}
           </p>
 
           <h4 style={{ marginTop: 18 }}>

@@ -142,10 +142,13 @@ export async function invariants(sessionId: string): Promise<InvariantReport> {
     },
     {
       id: "S2",
-      holds: n(agg.orphan_charges) === 0,
+      // Gated like I4 and S1: between the charge and the commit, an approved charge with no
+      // completed payment behind it is simply a payment in flight.
+      holds: quiescent ? n(agg.orphan_charges) === 0 : null,
       title: "Every approved charge belongs to a completed payment",
-      detail:
-        n(agg.orphan_charges) === 0
+      detail: !quiescent
+        ? "Only meaningful once the system is at rest."
+        : n(agg.orphan_charges) === 0
           ? "No charge was kept for a payment that did not complete."
           : `${agg.orphan_charges} approved charge(s) with no completed payment behind them - somebody was refunded out of our own books while the card network kept the money.`,
     },

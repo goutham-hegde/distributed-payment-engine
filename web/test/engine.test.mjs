@@ -137,6 +137,28 @@ describe("the happy path", () => {
       assert.equal(holds, true, `happy path: ${id} must pass once at rest`);
     }
   });
+
+  test("no check calls a healthy payment wrong while it is still in flight", async () => {
+    // Between the charge and the commit, an approved charge has no completed payment behind it.
+    // That is S2's violation at rest and a correct state in flight - so, like I4 and S1, S2 may
+    // only answer once the system is quiet. It used to answer anyway, and the console flashed
+    // "S2 is failing" across every ordinary payment.
+    const call = await world();
+    await send(call);
+    let s = null;
+    let sawInFlight = false;
+    for (let i = 0; i < 60; i++) {
+      s = (await call("/api/tick", { method: "POST" })).body;
+      if (s.invariants.quiescent) break;
+      sawInFlight = true;
+      for (const [id, holds] of Object.entries(checks(s))) {
+        assert.notEqual(holds, false, `in flight (${s.transfers[0].sagaStatus}): ${id} read as violated`);
+      }
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    assert.ok(sawInFlight, "the payment must be observed in flight, or this test proved nothing");
+    assert.equal(s.transfers[0].sagaStatus, "COMPLETED");
+  });
 });
 
 describe("idempotency", () => {
